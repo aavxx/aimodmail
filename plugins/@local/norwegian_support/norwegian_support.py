@@ -237,6 +237,26 @@ class NorwegianSupport(commands.Cog):
     async def cog_load(self) -> None:
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
+        self.bot.loop.create_task(self._load_verbose())
+
+    async def _load_verbose(self) -> None:
+        """Restore the diagnostics toggle.
+
+        Held in the partition rather than memory: a plugin reload builds a new
+        cog instance and a restart loses the old one, so an in-memory flag
+        silently reverts to off exactly when someone is mid-diagnosis.
+        """
+        await self.bot.wait_for_connected()
+        try:
+            doc = await self.db.find_one({"_type": TYPE_META, "key": "verbose"})
+        except Exception:
+            logger.error("Could not read the verbose flag; defaulting to off.", exc_info=True)
+            return
+        self._verbose = bool(doc and doc.get("value"))
+        if self._verbose:
+            logger.info(
+                "Verbose diagnostics are ON (restored). Turn off with %snas verbose off.", self.bot.prefix
+            )
 
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
@@ -753,11 +773,16 @@ class NorwegianSupport(commands.Cog):
         return True
 
     def _greeting_embed(self) -> discord.Embed:
-        """Opening greeting. Same styling as the assistant's own replies."""
+        """Opening greeting.
+
+        Deliberately styled apart from the assistant's replies. Discord groups
+        consecutive messages from the same author, so a greeting sharing the
+        reply's colour, title and footer reads as one block of text rather than
+        two messages. main_color plus no title or footer keeps them distinct.
+        """
         return self._embed(
             description=GREETING_TEXT,
-            color=self.bot.mod_color,
-            footer='Automated assistant • reply with "agent" to reach a human',
+            color=self.bot.main_color,
         )
 
     def _ai_embed(self, reply: str) -> discord.Embed:
@@ -865,6 +890,15 @@ class NorwegianSupport(commands.Cog):
         else:
             ai_state = f"ready — `{GROQ_MODEL}`"
         embed.add_field(name="AI pre-screen", value=ai_state, inline=False)
+        embed.add_field(
+            name="Verbose diagnostics",
+            value=(
+                "`on` — deferrals log the message and Groq's raw response at INFO"
+                if self._verbose
+                else "`off` — defer reasons only appear at DEBUG"
+            ),
+            inline=False,
+        )
 
         # The privacy notice promises ticket messages are deleted after 7 days.
         # That claim is only true while Modmail's own log expiry is configured.
@@ -893,21 +927,38 @@ class NorwegianSupport(commands.Cog):
         """
         self._verbose = (not self._verbose) if enabled is None else enabled
 
-        note = (
-            "Deferrals will now log the user's message and Groq's raw response "
-            "at INFO.\n\nThis writes ticket message content to the bot log; turn "
-            "it off once you are done diagnosing."
-            if self._verbose
-            else "Diagnostics are back to DEBUG level."
+        await self.db.update_one(
+            {"_type": TYPE_META, "key": "verbose"},
+            {"$set": {"value": self._verbose}},
+            upsert=True,
         )
+
+        if self._verbose:
+            # Write a line immediately so the log itself confirms the toggle
+            # took, rather than waiting on the next deferral to find out.
+            logger.info(
+                "Verbose diagnostics ENABLED by %s. This line confirms they reach the log.", ctx.author
+            )
+            note = (
+                "Deferrals will now log the user's message and Groq's verbatim "
+                "response at INFO.\n\nA confirmation line has just been written to "
+                "the log — if you cannot see it, the log level itself is the "
+                "problem, not this toggle.\n\nThis writes ticket message content "
+                "to the bot log, which is not on the 7-day deletion path. Turn it "
+                f"off with `{self.bot.prefix}nas verbose off` once you are done."
+            )
+        else:
+            logger.info("Verbose diagnostics disabled by %s.", ctx.author)
+            note = "Diagnostics are back to DEBUG level."
+
         await ctx.send(
             embed=self._embed(
                 title=f"Verbose diagnostics {'on' if self._verbose else 'off'}",
                 description=note,
                 color=None if self._verbose else self.bot.error_color,
+                footer="Setting is stored, and survives reloads and restarts",
             )
         )
-        logger.info("Verbose diagnostics %s by %s.", "enabled" if self._verbose else "disabled", ctx.author)
 
     @nas.command(name="consent")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
