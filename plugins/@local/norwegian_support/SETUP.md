@@ -137,14 +137,39 @@ allowed to answer from. It is instructed to hand off anything not covered, so:
 - **A wrong entry becomes a wrong answer, stated confidently, to a real user.**
 - A missing entry costs nothing: that question escalates to a human.
 
-The seeded content is a plausible starting point written from general knowledge
-of how Roblox airline groups operate. **It has not been checked against how
-Norwegian Air Shuttle actually runs.** Review every line before going live, and
-delete anything you are not certain of rather than leaving a guess in place.
+The current content was supplied by the group. Keep it that way — when
+something is unknown, delete the entry rather than guessing, and the question
+will simply escalate to a human.
+
+Two known gaps, both deliberate:
+
+- **Rank names are not in the reference.** Public answers are allowed to include
+  them, but nobody has supplied them, so the model is explicitly told to hand
+  off rather than guess when asked to name the ranks. Add them to unlock that
+  answer.
+- **No flight hour is ever stated.** The reference gives only the pattern
+  (`XX:00` open, `XX:20` lock, `XX:25` boarding, `XX:35` departure) and points
+  at the departures page for real times.
 
 The assistant is additionally instructed to defer on anything case-by-case
-(bans, appeals, applications, individual accounts), anything involving money,
-and anything where the user seems upset.
+(individual bans, appeal outcomes, application outcomes, accounts), on reports
+of a specific failed purchase, and where the user seems upset.
+
+Note what is deliberately *not* deferred: the **no-refunds policy** is answered
+plainly rather than escalated, and handing someone the **appeals link** counts
+as a complete answer. Both were escalation cases in an earlier draft; stating a
+policy the user will not like is still a complete answer.
+
+### Links
+
+The three links are written as `[display.domain](https://real.vercel.url)` and
+the model is instructed to reproduce them verbatim, never as bare URLs and never
+invented. Discord renders markdown links in embed descriptions, so the user sees
+the clean domain.
+
+The link domains are the post-rebrand Vueling ones while the bot still
+identifies as Norwegian Air Shuttle. That mismatch is intentional for now and
+resolves with the branding pass.
 
 ### Escalation phrases
 
