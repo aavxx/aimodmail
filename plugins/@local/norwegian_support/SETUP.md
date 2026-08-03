@@ -219,6 +219,44 @@ Each entry is a case-insensitive regex matched on word boundaries, so `agent`
 does not fire on "management" and `human` does not fire on "humanity". Add
 phrases freely; keep the `\b` anchors.
 
+## Local changes to Modmail core
+
+This plugin is self-contained with one exception. **Re-apply it after any
+upstream Modmail merge** — a merge that takes upstream's version of `bot.py`
+will drop it silently, and the only symptom is a traceback in the log.
+
+Find it with:
+
+```
+grep -n "LOCAL PATCH" bot.py
+```
+
+### `bot.py` — `on_message`, pin-notice delete
+
+`Thread.setup()` pins the genesis message (`core/thread.py`, in
+`send_genesis_message`), which makes Discord post a *"<bot> pinned a message to
+this channel"* notice. `on_message` deletes that notice to keep the channel
+clean, but upstream does it unguarded:
+
+```python
+if message.type == discord.MessageType.pins_add and message.author == self.user:
+    await message.delete()
+```
+
+If the notice is already gone the delete raises `NotFound` out of `on_message`,
+which discord.py logs as an unhandled exception and which aborts the rest of the
+handler. Already-deleted is the outcome we wanted anyway. The patch catches
+`NotFound` (debug, nothing to do) and `Forbidden` (warning — missing Manage
+Messages, worth knowing once but not worth a traceback per thread).
+
+This is not caused by the plugin: it never pins, deletes, or touches thread
+channels. But because handoff is now the main thing that creates threads, the
+traceback reliably appears about a second after an "AI deferred" log line, which
+makes it look related. It is not.
+
+`bot.py` is not black-clean upstream, so do not run the formatter over it to fix
+this — that produces a large unrelated diff and makes future merges worse.
+
 ## Storage
 
 `bot.api.get_plugin_partition(self)` returns a single collection, not a

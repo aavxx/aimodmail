@@ -1444,7 +1444,23 @@ class ModmailBot(commands.Bot):
     async def on_message(self, message):
         await self.wait_for_connected()
         if message.type == discord.MessageType.pins_add and message.author == self.user:
-            await message.delete()
+            # LOCAL PATCH (norwegian_support) — keep on upstream merges.
+            # This deletes the "<bot> pinned a message" notice produced when
+            # Thread.setup() pins the genesis message. The delete was unguarded,
+            # so a notice that was already gone raised NotFound out of on_message
+            # and aborted the rest of the handler. Already-deleted is the desired
+            # end state, and missing Manage Messages is not worth a traceback per
+            # thread, so both are swallowed. See plugins/@local/norwegian_support/
+            # SETUP.md, "Local changes to Modmail core".
+            try:
+                await message.delete()
+            except discord.NotFound:
+                logger.debug("Pin notice was already gone; nothing to delete.")
+            except discord.Forbidden:
+                logger.warning(
+                    "Missing permission to delete the pin notice in %s.",
+                    message.channel,
+                )
 
         if (
             (f"<@{self.user.id}" in message.content or f"<@!{self.user.id}" in message.content)
