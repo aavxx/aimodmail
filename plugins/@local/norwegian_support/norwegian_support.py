@@ -113,6 +113,16 @@ AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
 BUTTON_YES_EMOJI = "<:yes:1533908794684473354>"
 BUTTON_NO_EMOJI = "<:no:1533908791245017198>"
 
+# Author-row icon. None means "use the bot's own avatar", which follows the
+# Developer Portal without a redeploy and is the normal case.
+#
+# Set this to a direct image URL only if the embed icon needs to differ from the
+# bot's avatar. Note the Portal has two separate images: the App Icon on General
+# Information, and the Bot avatar on the Bot tab. Only the Bot avatar reaches
+# `bot.user.display_avatar`, so setting the App Icon alone leaves the embed icon
+# on Discord's default grey.
+AI_ICON_URL: typing.Optional[str] = None
+
 # How long the typing indicator runs before each message. Every send in the
 # pre-screen pauses for this, so a greeted question costs roughly three of these
 # plus the Groq round trip before the user sees an answer.
@@ -241,9 +251,9 @@ Moderation
 """
 
 SYSTEM_PROMPT = f"""\
-You are the first-line automated support assistant for Norwegian Air Shuttle, a
-virtual airline group on Roblox. You answer straightforward questions from
-passengers and staff.
+You are the first-line automated support assistant for Vueling, a virtual
+airline group on Roblox. You answer straightforward questions from passengers
+and staff.
 
 Every fact you state must come from the reference information below. Never
 invent flight times, prices, rank names, policies or links.
@@ -1250,6 +1260,8 @@ class NorwegianSupport(commands.Cog):
         while building the privacy notice, and an exception there would fall
         through the gate's fail-open path and skip the consent prompt entirely.
         """
+        if AI_ICON_URL:
+            return AI_ICON_URL
         user = getattr(self.bot, "user", None)
         return getattr(getattr(user, "display_avatar", None), "url", None)
 
@@ -1316,6 +1328,18 @@ class NorwegianSupport(commands.Cog):
         else:
             ai_state = f"ready — `{GROQ_MODEL}`"
         embed.add_field(name="AI pre-screen", value=ai_state, inline=False)
+
+        # The author-row icon is a common source of "that isn't my logo": the
+        # Portal's App Icon and the Bot avatar are different images, and only
+        # the latter reaches display_avatar.
+        icon = self._bot_avatar()
+        if AI_ICON_URL:
+            icon_state = f"overridden by `AI_ICON_URL`\n{icon}"
+        elif icon:
+            icon_state = f"bot avatar\n{icon}"
+        else:
+            icon_state = "**none** — the bot has no avatar set on the Portal's *Bot* tab"
+        embed.add_field(name="Embed icon", value=icon_state, inline=False)
         embed.add_field(
             name="Verbose diagnostics",
             value=(

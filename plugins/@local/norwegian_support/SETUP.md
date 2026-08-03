@@ -168,9 +168,7 @@ the model is instructed to reproduce them verbatim, never as bare URLs and never
 invented. Discord renders markdown links in embed descriptions, so the user sees
 the clean domain.
 
-The link domains are the post-rebrand Vueling ones while the bot still
-identifies as Norwegian Air Shuttle. That mismatch is intentional for now and
-resolves with the branding pass.
+The link domains and the assistant's identity are both Vueling now.
 
 ### Diagnosing a deferral
 
@@ -286,11 +284,28 @@ Ticket references are now `VLG-XXXXXX`. The stored field is still called
 `nas_ref` for compatibility with existing documents; renaming it needs a data
 migration.
 
-**One gap to close before going live:** `SYSTEM_PROMPT` still opens with *"You
-are the first-line automated support assistant for Norwegian Air Shuttle"*, so
-the model can name that airline inside an embed titled "Vueling AI". Changing it
-is a one-word edit, but it is the bot's identity, which was explicitly held back,
-so it has not been touched. Say the word.
+**Still naming the old airline**, both user-visible:
+
+- The **privacy notice** (`_privacy_embed`) is headed "Norwegian Air Shuttle —
+  Support Privacy Notice" and names that team as who can read the data. Changing
+  it edits a consent document people have already accepted, so it is a decision
+  about whether to bump `POLICY_VERSION` and re-prompt everyone, not a rename.
+- The `thread_creation_response` **config value** suggested above. Changing this
+  file does nothing on its own — re-run the `?config set` on the live bot.
+
+### Embed icon
+
+The author-row icon comes from `bot.user.display_avatar`, so it follows the
+Developer Portal without a redeploy. `?nas status` prints the URL it resolves to.
+
+If it is not the logo you expect, check *which* Portal image you set: **App Icon**
+on General Information and **Bot avatar** on the Bot tab are separate images, and
+only the Bot avatar reaches `display_avatar`. Setting the App Icon alone leaves
+the embed on Discord's default grey.
+
+To point the icon at something other than the bot's avatar, set `AI_ICON_URL` to
+a direct image URL. Discord must be able to fetch it, so it needs to be hosted
+somewhere public — an attachment in a Discord channel works.
 
 ### Escalation phrases
 
