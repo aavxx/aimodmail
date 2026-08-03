@@ -26,6 +26,7 @@ and ticket log retention must not read `Never`.
 | Command | Permission | Purpose |
 |---|---|---|
 | `?nas status` | Administrator | Wiring, storage counts, config sanity |
+| `?nas verbose` | Administrator | Log why the AI deferred (see below) |
 | `?nas consent @user` | Supporter | Show a stored consent record |
 | `?nas revoke @user` | Supporter | Withdraw consent; re-prompts next ticket |
 | `?nas ticket NAS-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
@@ -170,6 +171,46 @@ the clean domain.
 The link domains are the post-rebrand Vueling ones while the bot still
 identifies as Norwegian Air Shuttle. That mismatch is intentional for now and
 resolves with the branding pass.
+
+### Diagnosing a deferral
+
+When the assistant hands off, the log line only says it deferred. The user's
+message and Groq's verbatim `{resolved, reply}` response are logged alongside
+it at DEBUG.
+
+Modmail applies `log_level` once at startup, so `?config set log_level debug`
+needs a full restart and turns on discord.py's own debug firehose too. To avoid
+both:
+
+```
+?nas verbose on
+```
+
+That promotes only these two lines to INFO, takes effect immediately, and
+survives until toggled off or the bot restarts.
+
+**It writes ticket message content into the bot log.** That content is covered
+by the privacy notice but the log is not on the 7-day deletion path, so turn it
+off once you are done:
+
+```
+?nas verbose off
+```
+
+### The greeting
+
+`GREETING_TEXT` is sent once at the start of a new pre-screen conversation,
+before the first message is processed — including before the escalation check,
+so someone opening with "agent" is still greeted before being handed over. It
+does not repeat for later messages in the same conversation.
+
+A conversation ends when a human takes over: the handoff stamps `handed_off_at`
+on the transcript, so the next time that user writes in they are greeted afresh.
+A conversation the assistant resolved stays open, so follow-up questions do not
+re-greet; it lapses naturally when the transcript expires after 7 days.
+
+The greeting text says "Vueling" while the rest of the bot still says Norwegian
+Air Shuttle. That is the supplied copy and is expected until the rebrand pass.
 
 ### Escalation phrases
 

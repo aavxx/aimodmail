@@ -72,6 +72,16 @@ GROQ_TIMEOUT_SECONDS = 20
 # Turns of prior context sent back to Groq. Caps token spend on long chats.
 AI_HISTORY_LIMIT = 12
 
+# Sent once when a user opens a new pre-screen conversation, ahead of their
+# first message being processed. Not repeated for later messages in the same
+# conversation.
+GREETING_TEXT = (
+    "Hola! I'm Vueling's virtual assistant. I'm new and still learning but "
+    "there are a lot of things I can do for you.\n\n"
+    "How can I help you? Please, try to be as brief as possible so I can "
+    "understand you \N{SMILING FACE WITH SMILING EYES}"
+)
+
 # Escalation phrases, matched on word boundaries so "management" does not trip
 # "agent" and "humanity" does not trip "human". Extend freely; each entry is a
 # full regex checked case-insensitively against the user's message.
@@ -108,7 +118,7 @@ Flights
   or check the Discord server's events.
 
 Fly Grande (priority boarding)
-- Fly Grande is priority boarding, purchased in-game for 25 Robux.
+- Fly Grande is priority boarding, purchased in-game for 15 Robux.
 - It is a one-time purchase and applies to a single flight.
 
 Payments
@@ -218,6 +228,7 @@ class NorwegianSupport(commands.Cog):
         self._ready = asyncio.Event()
         self._groq_client = None
         self._user_salt: typing.Optional[str] = None
+        self._verbose = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -359,6 +370,9 @@ class NorwegianSupport(commands.Cog):
             # no thread is needed.
             if await self._ai_prescreen(message):
                 return
+
+            # A human is taking over, so the pre-screen conversation is done.
+            await self._close_transcript(message.author.id)
 
             # ---------------------------------------------------------- seam
             # Stage 5 (handoff summary and ticket reference) attaches here.
@@ -580,6 +594,15 @@ class NorwegianSupport(commands.Cog):
                 return found.group(0)
         return None
 
+    def _diag(self, msg: str, *args) -> None:
+        """Diagnostic line: debug normally, info while `?nas verbose` is on.
+
+        Modmail applies log_level once at startup, so turning on global debug
+        needs a restart and brings discord.py's own debug noise with it. The
+        toggle promotes just these lines instead.
+        """
+        logger.info(msg, *args) if self._verbose else logger.debug(msg, *args)
+
     async def _open_transcript(self, user_id: int) -> typing.Optional[dict]:
         """The user's in-progress pre-screen, if one has not been handed off."""
         return await self.db.find_one(
@@ -621,7 +644,22 @@ class NorwegianSupport(commands.Cog):
             upsert=True,
         )
 
-    async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[bool, str]:
+    async def _close_transcript(self, user_id: int) -> None:
+        """Mark the pre-screen conversation finished once a human takes over.
+
+        Without this the transcript stays open forever: the next conversation
+        would skip its greeting and replay stale history back to Groq.
+        """
+        await self.db.update_one(
+            {
+                "_type": TYPE_TRANSCRIPT,
+                "user_id_hash": await self._user_hash(user_id),
+                "handed_off_at": None,
+            },
+            {"$set": {"handed_off_at": datetime.now(timezone.utc)}},
+        )
+
+    async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[bool, str, str]:
         """Ask Groq to answer or defer. Raises on any failure."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for entry in history[-AI_HISTORY_LIMIT:]:
@@ -639,7 +677,8 @@ class NorwegianSupport(commands.Cog):
             max_tokens=600,
         )
 
-        payload = json.loads(completion.choices[0].message.content)
+        raw = completion.choices[0].message.content
+        payload = json.loads(raw)
         resolved = payload.get("resolved")
         reply = payload.get("reply")
 
@@ -647,7 +686,7 @@ class NorwegianSupport(commands.Cog):
         if not isinstance(resolved, bool) or not isinstance(reply, str) or not reply.strip():
             raise ValueError(f"unusable Groq payload: {payload!r}")
 
-        return resolved, reply.strip()
+        return resolved, reply.strip(), raw
 
     async def _ai_prescreen(self, message: discord.Message) -> bool:
         """Try to resolve the message without a human.
@@ -659,6 +698,18 @@ class NorwegianSupport(commands.Cog):
         user = message.author
         content = (message.content or "").strip()
 
+        # No open transcript means this is the start of a new conversation.
+        transcript = await self._open_transcript(user.id)
+
+        # The greeting goes out before anything is decided about the message,
+        # including escalation, so opening with "agent" still gets greeted first.
+        if transcript is None:
+            try:
+                await message.channel.send(embed=self._greeting_embed())
+            except discord.HTTPException:
+                # Not worth abandoning the request over; carry on and answer.
+                logger.error("Failed sending greeting to %s (%s).", user, user.id, exc_info=True)
+
         matched = self._escalation_match(content)
         if matched:
             logger.info("Escalation phrase %r from %s (%s); handing off.", matched, user, user.id)
@@ -669,12 +720,11 @@ class NorwegianSupport(commands.Cog):
             await self._append_transcript(user.id, content, resolved=False)
             return False
 
-        transcript = await self._open_transcript(user.id)
         history = (transcript or {}).get("messages", [])
 
         try:
             async with safe_typing(message.channel):
-                resolved, reply = await asyncio.wait_for(
+                resolved, reply, raw = await asyncio.wait_for(
                     self._groq_answer(history, content),
                     timeout=GROQ_TIMEOUT_SECONDS,
                 )
@@ -687,6 +737,10 @@ class NorwegianSupport(commands.Cog):
 
         if not resolved:
             logger.info("AI deferred for %s (%s); handing off.", user, user.id)
+            # Why it deferred is invisible from the line above, so the message
+            # that prompted it and the model's verbatim answer go out together.
+            self._diag("Deferred message from %s (%s) was: %r", user, user.id, content)
+            self._diag("Groq raw response for %s (%s): %s", user, user.id, raw)
             return False
 
         try:
@@ -697,6 +751,14 @@ class NorwegianSupport(commands.Cog):
 
         logger.info("AI resolved the request from %s (%s).", user, user.id)
         return True
+
+    def _greeting_embed(self) -> discord.Embed:
+        """Opening greeting. Same styling as the assistant's own replies."""
+        return self._embed(
+            description=GREETING_TEXT,
+            color=self.bot.mod_color,
+            footer='Automated assistant • reply with "agent" to reach a human',
+        )
 
     def _ai_embed(self, reply: str) -> discord.Embed:
         """The assistant's own reply. Custom; Modmail has no slot for this."""
@@ -821,6 +883,31 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
         await ctx.send(embed=embed)
+
+    @nas.command(name="verbose")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def nas_verbose(self, ctx, enabled: bool = None):
+        """Promote this plugin's diagnostics to INFO without a bot restart.
+
+        Logs the message that caused a defer and Groq's verbatim response.
+        """
+        self._verbose = (not self._verbose) if enabled is None else enabled
+
+        note = (
+            "Deferrals will now log the user's message and Groq's raw response "
+            "at INFO.\n\nThis writes ticket message content to the bot log; turn "
+            "it off once you are done diagnosing."
+            if self._verbose
+            else "Diagnostics are back to DEBUG level."
+        )
+        await ctx.send(
+            embed=self._embed(
+                title=f"Verbose diagnostics {'on' if self._verbose else 'off'}",
+                description=note,
+                color=None if self._verbose else self.bot.error_color,
+            )
+        )
+        logger.info("Verbose diagnostics %s by %s.", "enabled" if self._verbose else "disabled", ctx.author)
 
     @nas.command(name="consent")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
