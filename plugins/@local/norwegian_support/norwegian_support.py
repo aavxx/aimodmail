@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 import isodate
-from discord.ext import commands
+from discord.ext import commands, tasks
 from pymongo import ReturnDocument
 
 from core import checks
@@ -44,7 +44,38 @@ logger = getLogger(__name__)
 POLICY_VERSION = 1
 
 # Human-facing ticket reference prefix, mapped to Modmail's own log key.
-TICKET_PREFIX = "NAS"
+TICKET_PREFIX = "VLG"
+
+# Reference body alphabet. No O/0 or I/1, so a code read aloud or retyped from
+# memory cannot land on the wrong ticket.
+TICKET_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+TICKET_BODY_LENGTH = 6
+
+# Asked of Groq when handing over, so staff open the thread already knowing what
+# it is about. A failure here must not block the handoff, so it falls back.
+SUMMARY_PROMPT = """\
+Summarise this support conversation for the staff member about to take it over.
+Two or three sentences, plain and factual: what the user is asking for, anything
+they have already been told, and what still needs doing. Address the staff
+member, not the user. Do not invent detail that is not in the conversation.
+"""
+
+SUMMARY_FALLBACK = (
+    "This conversation could not be resolved automatically and was transferred. "
+    "No automatic summary is available, so please read the messages above."
+)
+
+# Sent to the user once their thread exists. {reference} is substituted.
+HANDOFF_REFERENCE_TEXT = (
+    "You're now connected to our support team, and someone will be with you as "
+    "soon as they can.\n\nYour ticket reference is **{reference}** — quote it if "
+    "you need to follow this up later."
+)
+
+# How often expired pre-screen transcripts are swept. The TTL index is the
+# primary mechanism; this is a backstop for deployments whose TTL monitor is
+# disabled or lagging.
+CLEANUP_INTERVAL_HOURS = 6
 
 # Retention for stage-4 AI transcripts. Enforced by a MongoDB TTL index on
 # `expires_at`; documents without that field (consents, ticket mappings) are
@@ -210,12 +241,22 @@ You are the first-line automated support assistant for Norwegian Air Shuttle, a
 virtual airline group on Roblox. You answer straightforward questions from
 passengers and staff.
 
-Answer ONLY from the reference information below. If the answer is not clearly
-contained in it, you MUST NOT guess: set resolved to false and let a human take
-over. Never invent flight times, prices, rank names, policies, or links.
+Every fact you state must come from the reference information below. Never
+invent flight times, prices, rank names, policies or links.
 
-Set resolved to false, with a brief reply, for any of these:
-- the question is not covered by the reference information
+That is a rule about facts, not about phrasing. You are expected to reword the
+reference, and to combine two or three points from different parts of it, to
+answer naturally. The reference will not contain a ready-made answer to every
+question, and it does not need to: if the facts you need are in there, you can
+answer. Handing over to a human is for when a fact is genuinely missing, not for
+when the wording does not line up.
+
+Set resolved to TRUE whenever the reference gives you what you need. Being brief
+is fine, and you do not have to cover everything. Stating a policy the user will
+not like is still a complete answer.
+
+Set resolved to FALSE, with a brief reply, only for these:
+- answering would need a fact that is simply not in the reference
 - it concerns a specific individual's account, punishment, appeal outcome, or
   application outcome, or any other case-by-case judgement. Pointing someone to
   the appeals page is a complete answer and does not count as judging a case.
@@ -223,12 +264,22 @@ Set resolved to false, with a brief reply, for any of these:
   receiving what they paid for. The refund policy as a general question is
   covered above and should be answered plainly instead of handed off.
 - the user seems upset, or has asked the same thing twice without being helped
-- you are not confident the answer is correct
 
-Set resolved to true only when you have fully answered a general question from
-the reference information and no human follow-up is needed. Stating a policy
-that the reference information gives you, including one the user will not like,
-is a complete answer.
+"I would have to make a fact up" is the test for false. Being unsure how best to
+word something is not.
+
+Worked examples, resolved TRUE:
+- "how do I join a flight?" — combine the group membership requirement with the
+  departures page and the timing pattern.
+- "what time is the next flight?" — give the XX:00 / XX:20 / XX:25 / XX:35
+  pattern and the departures link, without naming an hour.
+- "can I get a refund?" — state the no-refunds policy plainly.
+- "how do I appeal a ban?" — give the appeals link.
+- "what do I wear?" — say uniform is staff-only information.
+
+Worked examples, resolved FALSE:
+- "what are the ranks called?" — the names are not in the reference.
+- "why was my application rejected?" — a case-by-case outcome.
 
 Links: when the reference information provides a link, reproduce it exactly as
 written, in the same [display.domain](https://full.url) markdown form. Never
@@ -297,6 +348,8 @@ class NorwegianSupport(commands.Cog):
         self._groq_client = None
         self._user_salt: typing.Optional[str] = None
         self._verbose = False
+        # user_id -> summary, handed to on_thread_ready once the channel exists.
+        self._pending_handoff: typing.Dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -306,6 +359,7 @@ class NorwegianSupport(commands.Cog):
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
+        self.cleanup_transcripts.start()
 
     async def _load_verbose(self) -> None:
         """Restore the diagnostics toggle.
@@ -328,6 +382,33 @@ class NorwegianSupport(commands.Cog):
 
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
+        self.cleanup_transcripts.cancel()
+
+    @tasks.loop(hours=CLEANUP_INTERVAL_HOURS)
+    async def cleanup_transcripts(self) -> None:
+        """Sweep expired pre-screen transcripts.
+
+        The TTL index on `expires_at` is the primary mechanism. This is a
+        backstop: TTL is a background monitor that some deployments disable or
+        run behind, and a retention promise made in a privacy notice should not
+        depend on a setting nobody here controls.
+        """
+        try:
+            result = await self.db.delete_many(
+                {
+                    "_type": TYPE_TRANSCRIPT,
+                    "expires_at": {"$lte": datetime.now(timezone.utc)},
+                }
+            )
+        except Exception:
+            logger.error("Transcript cleanup failed.", exc_info=True)
+            return
+        if result.deleted_count:
+            logger.info("Deleted %s expired AI transcript(s).", result.deleted_count)
+
+    @cleanup_transcripts.before_loop
+    async def _before_cleanup(self) -> None:
+        await self.bot.wait_for_connected()
 
     def _install_dm_hook(self) -> None:
         """Wrap bot.process_dm_modmail so the plugin sees DMs before Modmail.
@@ -459,15 +540,14 @@ class NorwegianSupport(commands.Cog):
             if await self._ai_prescreen(message):
                 return
 
-            # A human is taking over, so the pre-screen conversation is done.
+            # Summarise while the transcript is still open, then close it: a
+            # human is taking over and the pre-screen conversation is done.
+            await self._prepare_handoff(message)
             await self._close_transcript(message.author.id)
 
-            # ---------------------------------------------------------- seam
-            # Stage 5 (handoff summary and ticket reference) attaches here.
-            # Until then an unresolved conversation goes to stock Modmail,
-            # which creates the thread exactly as it always did.
-            # ---------------------------------------------------------------
-
+            # Modmail creates the thread from here, exactly as it always did.
+            # on_thread_ready posts the summary and issues the reference once
+            # the channel exists. Nothing after this point is intercepted.
             return await passthrough(message)
 
         except Exception:
@@ -952,12 +1032,154 @@ class NorwegianSupport(commands.Cog):
 
     def _ai_embed(self, reply: str) -> discord.Embed:
         """A model-generated reply. Custom; Modmail has no slot for this."""
-        return self._embed(
+        embed = self._embed(
             title=AI_TITLE,
             description=reply,
             color=self.bot.mod_color,
             footer=AI_FOOTER,
         )
+        # Picks up whatever avatar is set in the Developer Portal, so the icon
+        # follows the bot's account without being redeployed.
+        icon = getattr(getattr(self.bot.user, "display_avatar", None), "url", None)
+        embed.set_author(name=AI_TITLE, icon_url=icon)
+        return embed
+
+    # ------------------------------------------------------------------
+    # Handoff (stage 5)
+    # ------------------------------------------------------------------
+
+    async def _summarise(self, history: list) -> str:
+        """Two or three sentences for the staff member picking this up.
+
+        Never raises: a failed summary must not stop the handoff, so the
+        fallback text goes in instead and staff read the thread themselves.
+        """
+        turns = [
+            f"{entry.get('role', 'user')}: {entry.get('content', '')}"
+            for entry in history[-AI_HISTORY_LIMIT:]
+            if entry.get("content")
+        ]
+        if not turns:
+            return SUMMARY_FALLBACK
+
+        client = self._groq()
+        if client is None:
+            return SUMMARY_FALLBACK
+
+        try:
+            completion = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[
+                        {"role": "system", "content": SUMMARY_PROMPT},
+                        {"role": "user", "content": "\n".join(turns)},
+                    ],
+                    temperature=0.2,
+                    max_tokens=300,
+                ),
+                timeout=GROQ_TIMEOUT_SECONDS,
+            )
+            summary = (completion.choices[0].message.content or "").strip()
+        except Exception:
+            logger.error("Handoff summary failed; using the fallback.", exc_info=True)
+            return SUMMARY_FALLBACK
+
+        return summary or SUMMARY_FALLBACK
+
+    async def _new_ticket_reference(self) -> str:
+        """A VLG-XXXXXX code, unique against the partition."""
+        for _ in range(10):
+            body = "".join(secrets.choice(TICKET_ALPHABET) for _ in range(TICKET_BODY_LENGTH))
+            reference = f"{TICKET_PREFIX}-{body}"
+            if await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference}) is None:
+                return reference
+        # 32^6 codes makes this essentially unreachable, but never hand back a
+        # reference that might already belong to another ticket.
+        raise RuntimeError("could not allocate an unused ticket reference")
+
+    async def _prepare_handoff(self, message: discord.Message) -> None:
+        """Summarise before Modmail creates the thread.
+
+        The summary is stashed for on_thread_ready rather than posted here,
+        because the channel does not exist yet.
+        """
+        user = message.author
+        transcript = await self._open_transcript(user.id)
+        history = (transcript or {}).get("messages", [])
+        try:
+            self._pending_handoff[user.id] = await self._summarise(history)
+        except Exception:
+            logger.error("Preparing the handoff summary failed.", exc_info=True)
+            self._pending_handoff[user.id] = SUMMARY_FALLBACK
+
+    @commands.Cog.listener()
+    async def on_thread_ready(self, thread, creator, category, initial_message):
+        """Post the summary and hand the user their reference.
+
+        Modmail dispatches this once the channel, genesis message and staff
+        mirroring are all in place, so everything below is additive.
+        """
+        recipient = getattr(thread, "recipient", None)
+        if recipient is None:
+            return
+
+        summary = self._pending_handoff.pop(recipient.id, None)
+        if summary is None:
+            # A thread Modmail opened without going through the pre-screen,
+            # such as ?contact. Not ours to annotate.
+            return
+
+        try:
+            reference = await self._new_ticket_reference()
+        except Exception:
+            logger.error("Could not allocate a ticket reference.", exc_info=True)
+            reference = None
+
+        # Modmail's own log key is the durable identifier; the reference is the
+        # readable handle staff and users can actually say out loud.
+        log_key = None
+        try:
+            log = await self.bot.api.get_log(thread.channel.id)
+            log_key = (log or {}).get("key")
+        except Exception:
+            logger.error("Could not read the log key for %s.", thread.channel, exc_info=True)
+
+        if reference is not None:
+            try:
+                await self.db.insert_one(
+                    {
+                        "_type": TYPE_TICKET,
+                        "nas_ref": reference,
+                        "log_key": log_key,
+                        "user_id": recipient.id,
+                        "channel_id": thread.channel.id,
+                        "created_at": datetime.now(timezone.utc),
+                    }
+                )
+            except Exception:
+                logger.error("Could not store ticket mapping %s.", reference, exc_info=True)
+
+        embed = self._embed(
+            title="Assistant summary",
+            description=summary,
+            color=self.bot.main_color,
+            footer=f"Reference {reference}" if reference else "Reference unavailable",
+        )
+        try:
+            await thread.channel.send(embed=embed)
+        except discord.HTTPException:
+            logger.error("Could not post the handoff summary to %s.", thread.channel, exc_info=True)
+
+        if reference is not None:
+            try:
+                await self._send_with_typing(
+                    await recipient.create_dm(),
+                    self._plain_embed(HANDOFF_REFERENCE_TEXT.format(reference=reference)),
+                )
+            except discord.HTTPException:
+                logger.error("Could not send the reference to %s.", recipient, exc_info=True)
+
+        logger.info("Handed %s (%s) to a human as %s.", recipient, recipient.id, reference)
 
     # ------------------------------------------------------------------
     # Embed helpers
@@ -1199,7 +1421,7 @@ class NorwegianSupport(commands.Cog):
     @nas.command(name="ticket")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def nas_ticket(self, ctx, reference: str):
-        """Look up a NAS-XXXXXX reference and its Modmail log."""
+        """Look up a VLG-XXXXXX reference and its Modmail log."""
         doc = await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference.upper()})
         if doc is None:
             return await ctx.send(

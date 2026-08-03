@@ -29,7 +29,7 @@ and ticket log retention must not read `Never`.
 | `?nas verbose` | Administrator | Log why the AI deferred (see below) |
 | `?nas consent @user` | Supporter | Show a stored consent record |
 | `?nas revoke @user` | Supporter | Withdraw consent; re-prompts next ticket |
-| `?nas ticket NAS-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
+| `?nas ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
 
 `?nas revoke` exists because the privacy notice tells users they can withdraw
 acceptance by asking the support team. Keep it working.
@@ -265,8 +265,13 @@ re-greet; it lapses naturally when the transcript expires after 7 days.
 
 Three surfaces say Vueling by explicit instruction: the greeting, the embed
 title (`Vueling AI`), and the caveat footer. Everything else is deliberately
-untouched pending the full rebrand pass — bot identity, the `NAS-XXXXXX` ticket
-prefix, the repo name.
+untouched pending the full rebrand pass — bot identity, the repo name, the
+`?nas` command group, and the `NorwegianSupport` cog class (whose name *is* the
+partition name, so renaming it orphans every stored document).
+
+Ticket references are now `VLG-XXXXXX`. The stored field is still called
+`nas_ref` for compatibility with existing documents; renaming it needs a data
+migration.
 
 **One gap to close before going live:** `SYSTEM_PROMPT` still opens with *"You
 are the first-line automated support assistant for Norwegian Air Shuttle"*, so
@@ -280,6 +285,23 @@ so it has not been touched. Say the word.
 Each entry is a case-insensitive regex matched on word boundaries, so `agent`
 does not fire on "management" and `human` does not fire on "humanity". Add
 phrases freely; keep the `\b` anchors.
+
+### Handoff
+
+On handoff the plugin summarises the conversation with one more Groq call,
+then lets Modmail create the thread exactly as before. `on_thread_ready` — the
+event Modmail dispatches once the channel, genesis message and staff mirroring
+are all in place — posts the summary as the thread's first plugin message,
+allocates a `VLG-XXXXXX` reference, stores it against Modmail's own log key, and
+DMs the reference to the user.
+
+Nothing here blocks the handoff. A failed summary falls back to generic text, a
+failed reference allocation still posts the summary, and a thread opened outside
+the pre-screen (`?contact`, for instance) is left alone entirely.
+
+Modmail's log key stays the durable identifier; `VLG-XXXXXX` is the readable
+handle, drawn from an alphabet with no `O/0` or `I/1` so a code read aloud
+cannot land on the wrong ticket.
 
 ## Local changes to Modmail core
 
@@ -329,7 +351,7 @@ MongoDB and are separated by a `_type` field:
 |----------------|------------------------------------------------------------|-----------|
 | `consent`      | `user_id`, `accepted_at`, `policy_version`                   | until withdrawn |
 | `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `handed_off_at` | 7 days |
-| `ticket`       | `nas_ref`, `log_key`, `user_id`, `created_at`                | kept      |
+| `ticket`       | `nas_ref`, `log_key`, `user_id`, `channel_id`, `created_at`   | kept      |
 | `meta`         | `key`, `value` — currently the user-ID hashing salt          | permanent |
 
 ### The hashing salt
@@ -346,9 +368,17 @@ The website cannot go from a transcript back to a user ID. To find one user's
 transcripts it must compute `HMAC-SHA256(salt, user_id)` itself using the stored
 salt, and query on that.
 
-Retention is enforced by a MongoDB TTL index on `expires_at` with
-`expireAfterSeconds: 0`. Only `ai_transcript` documents carry that field, so
-consents and ticket mappings are never touched by the TTL monitor.
+Retention is enforced two ways. The MongoDB TTL index on `expires_at`
+(`expireAfterSeconds: 0`) is primary; a `cleanup_transcripts` task sweeps the
+same documents every 6 hours as a backstop, because TTL is a background monitor
+some deployments disable or run behind, and a retention promise made in a
+privacy notice should not depend on a setting nobody here controls.
+
+Only `ai_transcript` documents carry `expires_at`, so consents and ticket
+mappings are never touched by either mechanism.
+
+The `nas_ref` field keeps its name for compatibility with existing documents
+even though references are now `VLG-`. Renaming it needs a data migration.
 
 The staff website reads this collection directly. Query by `_type`; there is no
 Supabase copy and nothing dual-writes.
