@@ -1,13 +1,12 @@
 """
 Norwegian Air Shuttle (Roblox) support plugin for Modmail.
 
-Stage 2 — plugin structure only.
+Stages 2-3 — plugin structure and consent gate.
 
-This module currently installs the DM interception seam and the plugin's
-storage partition, then hands every DM straight back to Modmail. Behaviour is
-intentionally identical to stock Modmail while this stage is being verified;
-the consent gate (stage 3), AI pre-screen (stage 4) and handoff (stage 5) slot
-into `_gate` at the marked seam.
+A new conversation is gated on a privacy notice before Modmail creates a
+thread. Once consent is on record the DM is handed straight to Modmail, so
+behaviour from that point is stock. The AI pre-screen (stage 4) and handoff
+(stage 5) slot into `_gate` at the marked seam.
 """
 
 import asyncio
@@ -15,10 +14,12 @@ import typing
 from datetime import datetime, timezone
 
 import discord
+import isodate
 from discord.ext import commands
 
 from core import checks
-from core.models import PermissionLevel, getLogger
+from core.models import DMDisabled, PermissionLevel, getLogger
+from core.utils import AcceptButton, DenyButton
 
 logger = getLogger(__name__)
 
@@ -39,6 +40,39 @@ TRANSCRIPT_RETENTION_DAYS = 7
 TYPE_CONSENT = "consent"
 TYPE_TRANSCRIPT = "ai_transcript"
 TYPE_TICKET = "ticket"
+
+# How long the privacy notice waits for a button press. Deliberately much longer
+# than Modmail's own 30s confirm view: this is something the user has to read.
+CONSENT_TIMEOUT_SECONDS = 300
+
+
+class ConsentView(discord.ui.View):
+    """Accept/decline view for the privacy notice.
+
+    Shaped like Modmail's own ConfirmThreadCreationView, but that class hardcodes
+    timeout=30 in __init__ with no parameter to override, which is far too short
+    to read a privacy notice. The buttons themselves are Modmail's.
+    """
+
+    def __init__(self, timeout: float):
+        super().__init__(timeout=timeout)
+        self.value = None
+
+
+class _LabelledAcceptButton(AcceptButton):
+    """Modmail's AcceptButton with a text label alongside the emoji."""
+
+    def __init__(self, custom_id: str, emoji: str, label: str):
+        super().__init__(custom_id, emoji)
+        self.label = label
+
+
+class _LabelledDenyButton(DenyButton):
+    """Modmail's DenyButton with a text label alongside the emoji."""
+
+    def __init__(self, custom_id: str, emoji: str, label: str):
+        super().__init__(custom_id, emoji)
+        self.label = label
 
 
 class NorwegianSupport(commands.Cog):
@@ -169,10 +203,30 @@ class NorwegianSupport(commands.Cog):
             if await self.bot.threads.find(recipient=message.author) is not None:
                 return await passthrough(message)
 
+            # Modmail's own refusals are checked before the consent notice, so we
+            # never ask someone to accept a privacy policy for support that is
+            # then declined anyway. Modmail still owns each of these responses.
+            if self.bot.config["dm_disabled"] in (DMDisabled.NEW_THREADS, DMDisabled.ALL_THREADS):
+                return await passthrough(message)
+
+            if await self.bot.get_thread_cooldown(message.author):
+                return await passthrough(message)
+
+            min_chars = self.bot.config.get("thread_min_characters") or 0
+            try:
+                min_chars = int(min_chars)
+            except (TypeError, ValueError):
+                min_chars = 0
+            if min_chars > 0 and len((message.content or "").strip()) < min_chars:
+                return await passthrough(message)
+
+            # Stage 3: consent gate.
+            if not await self._ensure_consent(message):
+                return
+
             # ---------------------------------------------------------- seam
-            # Stage 3 (consent gate), stage 4 (AI pre-screen) and stage 5
-            # (handoff) attach here. Until then every new conversation is
-            # handled by stock Modmail exactly as before.
+            # Stage 4 (AI pre-screen) and stage 5 (handoff) attach here. Until
+            # then a consented conversation goes straight to stock Modmail.
             # ---------------------------------------------------------------
 
             return await passthrough(message)
@@ -183,6 +237,159 @@ class NorwegianSupport(commands.Cog):
                 return await passthrough(message)
             except Exception:
                 logger.error("Fallback to Modmail also failed.", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Consent
+    # ------------------------------------------------------------------
+
+    async def _get_consent(self, user_id: int) -> typing.Optional[dict]:
+        return await self.db.find_one({"_type": TYPE_CONSENT, "user_id": user_id})
+
+    async def _store_consent(self, user_id: int) -> None:
+        await self.db.update_one(
+            {"_type": TYPE_CONSENT, "user_id": user_id},
+            {
+                "$set": {
+                    "accepted_at": datetime.now(timezone.utc),
+                    "policy_version": POLICY_VERSION,
+                }
+            },
+            upsert=True,
+        )
+
+    async def _delete_consent(self, user_id: int) -> int:
+        result = await self.db.delete_one({"_type": TYPE_CONSENT, "user_id": user_id})
+        return result.deleted_count
+
+    def _privacy_embed(self, *, renewal: bool) -> discord.Embed:
+        """The privacy notice. Custom because Modmail has no config slot for it."""
+        if renewal:
+            intro = (
+                "Our privacy notice has been updated since you last accepted it. "
+                "Please review it again before we continue."
+            )
+        else:
+            intro = "Before we open a support ticket, please read how we handle your " "information."
+
+        embed = self._embed(
+            title="Norwegian Air Shuttle — Support Privacy Notice",
+            description=intro,
+            footer=f"Policy version {POLICY_VERSION}",
+        )
+        embed.add_field(
+            name="What we store",
+            value=(
+                "• Your Discord user ID\n"
+                "• The messages you send while your ticket is open\n"
+                "• The time you accepted this notice"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="How long we keep it",
+            value=(
+                "Your ticket messages are deleted automatically **7 days** after the "
+                "ticket is closed. Conversations with our automated assistant are "
+                "deleted **7 days** after they happen.\n"
+                "Your acceptance of this notice (user ID and timestamp only) is kept "
+                "until you withdraw it, so we do not have to ask you again."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Who can read it",
+            value=(
+                "The Norwegian Air Shuttle support team, and airline executives " "reviewing ticket quality."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Your choice",
+            value=(
+                "Accepting lets us open your ticket. Declining means we cannot "
+                "continue, but you can start again at any time by messaging us. "
+                "To withdraw your acceptance later, ask any member of the support team."
+            ),
+            inline=False,
+        )
+        return embed
+
+    async def _ensure_consent(self, message: discord.Message) -> bool:
+        """Gate a new conversation on the privacy notice.
+
+        Returns True when the conversation may continue. Prompts at most once per
+        conversation, since the gate only runs when the user has no open thread.
+        """
+        user = message.author
+        record = await self._get_consent(user.id)
+
+        if record is not None and record.get("policy_version", 0) >= POLICY_VERSION:
+            return True
+
+        renewal = record is not None
+        view = ConsentView(timeout=CONSENT_TIMEOUT_SECONDS)
+        view.add_item(
+            _LabelledAcceptButton(
+                "nas-consent-accept",
+                self.bot.config["confirm_thread_creation_accept"],
+                "Accept",
+            )
+        )
+        view.add_item(
+            _LabelledDenyButton(
+                "nas-consent-deny",
+                self.bot.config["confirm_thread_creation_deny"],
+                "Decline",
+            )
+        )
+
+        try:
+            prompt = await message.channel.send(embed=self._privacy_embed(renewal=renewal), view=view)
+        except discord.HTTPException:
+            # Cannot show the notice at all. Fail open rather than strand the
+            # user in silence; Modmail handles the conversation as it always did.
+            logger.error("Failed sending privacy notice to %s; passing through.", user, exc_info=True)
+            return True
+
+        await view.wait()
+
+        if view.value is None:
+            # Timed out. Mirrors Modmail's own confirm-timeout wording.
+            try:
+                await prompt.edit(view=None)
+            except discord.HTTPException:
+                logger.debug("Could not clear consent buttons after timeout.", exc_info=True)
+            await message.channel.send(
+                embed=self._embed(
+                    title=self.bot.config["thread_cancelled"],
+                    description="Timed out",
+                    color=self.bot.error_color,
+                )
+            )
+            logger.info("Consent prompt timed out for %s (%s).", user, user.id)
+            return False
+
+        if view.value is False:
+            if renewal:
+                # Declining an updated notice withdraws the earlier acceptance.
+                await self._delete_consent(user.id)
+            await message.channel.send(
+                embed=self._embed(
+                    title=self.bot.config["thread_cancelled"],
+                    description=(
+                        "We cannot open a support ticket without your acceptance of "
+                        "the privacy notice, so this request has been cancelled.\n\n"
+                        "If you change your mind, just message us again."
+                    ),
+                    color=self.bot.error_color,
+                )
+            )
+            logger.info("Consent declined by %s (%s).", user, user.id)
+            return False
+
+        await self._store_consent(user.id)
+        logger.info("Consent accepted by %s (%s), policy version %s.", user, user.id, POLICY_VERSION)
+        return True
 
     # ------------------------------------------------------------------
     # Embed helpers
@@ -272,7 +479,83 @@ class NorwegianSupport(commands.Cog):
             ),
             inline=False,
         )
+
+        # The privacy notice promises ticket messages are deleted after 7 days.
+        # That claim is only true while Modmail's own log expiry is configured.
+        expiry = self.bot.config.get("log_expiration")
+        embed.add_field(
+            name="Ticket log retention",
+            value=(
+                f"`{isodate.duration_isoformat(expiry)}` — the privacy notice's " "deletion promise holds"
+                if expiry and expiry != isodate.Duration()
+                else (
+                    "`Never` — **the privacy notice promises deletion after 7 days "
+                    "and this makes that false.** Set `log_expiration` to `P7D` and "
+                    "restart the bot."
+                )
+            ),
+            inline=False,
+        )
         await ctx.send(embed=embed)
+
+    @nas.command(name="consent")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def nas_consent(self, ctx, user: discord.User):
+        """Show a user's stored consent record."""
+        record = await self._get_consent(user.id)
+        if record is None:
+            return await ctx.send(
+                embed=self._embed(
+                    description=f"No consent on record for {user.mention}.",
+                    color=self.bot.error_color,
+                )
+            )
+
+        stored_version = record.get("policy_version", 0)
+        embed = self._embed(
+            title="Consent on record",
+            description=f"{user.mention} (`{user.id}`)",
+            footer=f"current policy version {POLICY_VERSION}",
+        )
+        embed.add_field(
+            name="Policy version",
+            value=(
+                f"{stored_version}"
+                if stored_version >= POLICY_VERSION
+                else f"{stored_version} — **outdated**, will be re-prompted"
+            ),
+            inline=True,
+        )
+        accepted = record.get("accepted_at")
+        if isinstance(accepted, datetime):
+            embed.add_field(
+                name="Accepted",
+                value=discord.utils.format_dt(accepted.replace(tzinfo=timezone.utc), "F"),
+                inline=True,
+            )
+        await ctx.send(embed=embed)
+
+    @nas.command(name="revoke")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def nas_revoke(self, ctx, user: discord.User):
+        """Withdraw a user's consent. They are re-prompted on their next ticket."""
+        deleted = await self._delete_consent(user.id)
+        if not deleted:
+            return await ctx.send(
+                embed=self._embed(
+                    description=f"No consent on record for {user.mention}.",
+                    color=self.bot.error_color,
+                )
+            )
+        await ctx.send(
+            embed=self._embed(
+                description=(
+                    f"Consent withdrawn for {user.mention}. They will see the privacy "
+                    "notice again the next time they open a ticket."
+                ),
+            )
+        )
+        logger.info("Consent withdrawn for %s (%s) by %s.", user, user.id, ctx.author)
 
     @nas.command(name="ticket")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
