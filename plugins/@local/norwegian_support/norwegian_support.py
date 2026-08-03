@@ -1,25 +1,41 @@
 """
 Norwegian Air Shuttle (Roblox) support plugin for Modmail.
 
-Stages 2-3 — plugin structure and consent gate.
+Stages 2-4 — plugin structure, consent gate and AI pre-screen.
 
-A new conversation is gated on a privacy notice before Modmail creates a
-thread. Once consent is on record the DM is handed straight to Modmail, so
-behaviour from that point is stock. The AI pre-screen (stage 4) and handoff
-(stage 5) slot into `_gate` at the marked seam.
+A new conversation is gated on a privacy notice, then pre-screened by Groq.
+Questions the assistant can answer from the FAQ below are answered without a
+thread ever being created; everything else falls through to Modmail, which
+creates the thread exactly as it always did. Every failure path ends in that
+fallthrough, so a user is never left without a response.
+
+The handoff summary and ticket reference (stage 5) slot into `_gate` at the
+marked seam.
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
 import typing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 import isodate
 from discord.ext import commands
+from pymongo import ReturnDocument
 
 from core import checks
 from core.models import DMDisabled, PermissionLevel, getLogger
-from core.utils import AcceptButton, DenyButton
+from core.utils import AcceptButton, DenyButton, safe_typing
+
+try:
+    from groq import AsyncGroq
+except ImportError:  # pragma: no cover - dependency install failed
+    AsyncGroq = None
 
 logger = getLogger(__name__)
 
@@ -41,9 +57,97 @@ TYPE_CONSENT = "consent"
 TYPE_TRANSCRIPT = "ai_transcript"
 TYPE_TICKET = "ticket"
 
+TYPE_META = "meta"
+
 # How long the privacy notice waits for a button press. Deliberately much longer
 # than Modmail's own 30s confirm view: this is something the user has to read.
 CONSENT_TIMEOUT_SECONDS = 300
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# The gate runs inside Modmail's per-user DM queue, so a hung request would stall
+# that user's messages. Bounded twice: once by the client, once by wait_for.
+GROQ_TIMEOUT_SECONDS = 20
+
+# Turns of prior context sent back to Groq. Caps token spend on long chats.
+AI_HISTORY_LIMIT = 12
+
+# Escalation phrases, matched on word boundaries so "management" does not trip
+# "agent" and "humanity" does not trip "human". Extend freely; each entry is a
+# full regex checked case-insensitively against the user's message.
+ESCALATION_PATTERNS = [
+    r"\bagents?\b",
+    r"\bhumans?\b",
+    r"\brepresentatives?\b",
+    r"\breal (?:person|people)\b",
+    r"\b(?:talk|speak|chat)\s+(?:to|with)\s+(?:someone|somebody|a\s+person|staff|support|an?\s+\w+)\b",
+    r"\b(?:live|actual|real)\s+(?:agent|support|person)\b",
+    r"\bescalate\b",
+]
+
+_ESCALATION_RE = [re.compile(p, re.IGNORECASE) for p in ESCALATION_PATTERNS]
+
+# Everything the assistant is allowed to answer from. REVIEW AND EDIT THIS: the
+# model is instructed to hand off anything not covered here, so wrong entries
+# become wrong answers given confidently, and missing entries simply escalate.
+FAQ_KNOWLEDGE = """\
+Norwegian Air Shuttle is a virtual airline group operating on Roblox. It runs
+scheduled passenger flights, staff training, and a ranked staff structure.
+
+Flights
+- Flights are announced in the group's Discord announcement channels and in the
+  Roblox group wall. There is no separate booking system; passengers join the
+  flight game when the flight goes live.
+- Passengers do not need to be group members to fly, but members get priority
+  boarding at some events.
+- Flight times are posted per event. There is no fixed daily timetable.
+
+Staff and ranks
+- Staff applications open periodically and are announced in Discord. Applying
+  requires meeting the minimum age and account-age requirements stated in the
+  application post.
+- Promotions come from attending training sessions and passing assessments.
+  Ranks are not sold and cannot be requested directly.
+- Cabin crew, pilots, and ground staff each have their own training paths.
+
+Conduct and moderation
+- Rule breaking in flights or Discord is handled by the moderation team.
+- Ban appeals are handled by the moderation team only, never by the assistant.
+
+Uniform
+- Uniform is issued through the group's uniform system. Members must wear the
+  uniform matching their current rank while on duty.
+"""
+
+SYSTEM_PROMPT = f"""\
+You are the first-line automated support assistant for Norwegian Air Shuttle, a
+virtual airline group on Roblox. You answer straightforward questions from
+passengers and staff.
+
+Answer ONLY from the reference information below. If the answer is not clearly
+contained in it, you MUST NOT guess: set resolved to false and let a human take
+over. Never invent flight times, prices, ranks, policies, or names.
+
+Set resolved to false, with a brief reply, for any of these:
+- the question is not covered by the reference information
+- it concerns a specific individual's account, ban, appeal, application outcome,
+  or any other case-by-case decision
+- it involves a complaint, a payment or refund, or anything with real money
+- the user seems upset, or has asked the same thing twice without being helped
+- you are not confident the answer is correct
+
+Set resolved to true only when you have fully answered a general question from
+the reference information and no human follow-up is needed.
+
+Keep replies under 900 characters, friendly and plain. Do not claim to be human.
+
+Reference information:
+{FAQ_KNOWLEDGE}
+
+Respond with a single json object with exactly these keys:
+  "resolved": boolean
+  "reply": string
+"""
 
 
 class ConsentView(discord.ui.View):
@@ -87,6 +191,8 @@ class NorwegianSupport(commands.Cog):
         # Populated when the DM seam is installed; None means not installed.
         self._original_process_dm: typing.Optional[typing.Callable] = None
         self._ready = asyncio.Event()
+        self._groq_client = None
+        self._user_salt: typing.Optional[str] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -224,9 +330,15 @@ class NorwegianSupport(commands.Cog):
             if not await self._ensure_consent(message):
                 return
 
+            # Stage 4: AI pre-screen. True means the user has their answer and
+            # no thread is needed.
+            if await self._ai_prescreen(message):
+                return
+
             # ---------------------------------------------------------- seam
-            # Stage 4 (AI pre-screen) and stage 5 (handoff) attach here. Until
-            # then a consented conversation goes straight to stock Modmail.
+            # Stage 5 (handoff summary and ticket reference) attaches here.
+            # Until then an unresolved conversation goes to stock Modmail,
+            # which creates the thread exactly as it always did.
             # ---------------------------------------------------------------
 
             return await passthrough(message)
@@ -392,6 +504,185 @@ class NorwegianSupport(commands.Cog):
         return True
 
     # ------------------------------------------------------------------
+    # AI pre-screen
+    # ------------------------------------------------------------------
+
+    async def _salt(self) -> str:
+        """Fetch (or create once) the salt used to pseudonymise user IDs.
+
+        A bare SHA-256 of a Discord snowflake is trivially reversible by
+        enumeration, so the hash is keyed. The salt lives in the partition so it
+        survives restarts; regenerating it orphans every existing transcript.
+        """
+        if self._user_salt is not None:
+            return self._user_salt
+
+        doc = await self.db.find_one_and_update(
+            {"_type": TYPE_META, "key": "user_id_salt"},
+            {"$setOnInsert": {"value": secrets.token_hex(32)}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        self._user_salt = doc["value"]
+        return self._user_salt
+
+    async def _user_hash(self, user_id: int) -> str:
+        salt = await self._salt()
+        return hmac.new(salt.encode(), str(user_id).encode(), hashlib.sha256).hexdigest()
+
+    def _groq(self):
+        """Lazily build the Groq client. None when unusable."""
+        if self._groq_client is not None:
+            return self._groq_client
+
+        if AsyncGroq is None:
+            logger.error("groq package is not installed; AI pre-screen disabled.")
+            return None
+
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            logger.error("GROQ_API_KEY is not set; AI pre-screen disabled.")
+            return None
+
+        self._groq_client = AsyncGroq(api_key=api_key, timeout=GROQ_TIMEOUT_SECONDS)
+        return self._groq_client
+
+    @staticmethod
+    def _escalation_match(text: str) -> typing.Optional[str]:
+        for pattern in _ESCALATION_RE:
+            found = pattern.search(text)
+            if found:
+                return found.group(0)
+        return None
+
+    async def _open_transcript(self, user_id: int) -> typing.Optional[dict]:
+        """The user's in-progress pre-screen, if one has not been handed off."""
+        return await self.db.find_one(
+            {
+                "_type": TYPE_TRANSCRIPT,
+                "user_id_hash": await self._user_hash(user_id),
+                "handed_off_at": None,
+            }
+        )
+
+    async def _append_transcript(
+        self,
+        user_id: int,
+        user_text: str,
+        assistant_text: typing.Optional[str] = None,
+        resolved: typing.Optional[bool] = None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        entries = [{"role": "user", "content": user_text, "at": now}]
+        if assistant_text is not None:
+            entries.append({"role": "assistant", "content": assistant_text, "at": now})
+
+        await self.db.update_one(
+            {
+                "_type": TYPE_TRANSCRIPT,
+                "user_id_hash": await self._user_hash(user_id),
+                "handed_off_at": None,
+            },
+            {
+                "$push": {"messages": {"$each": entries}},
+                "$set": {"resolved": resolved},
+                "$setOnInsert": {
+                    "created_at": now,
+                    # TTL index on this field expires the transcript 7 days
+                    # after it started. Only transcripts carry it.
+                    "expires_at": now + timedelta(days=TRANSCRIPT_RETENTION_DAYS),
+                },
+            },
+            upsert=True,
+        )
+
+    async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[bool, str]:
+        """Ask Groq to answer or defer. Raises on any failure."""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for entry in history[-AI_HISTORY_LIMIT:]:
+            role = entry.get("role")
+            content = entry.get("content")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_text})
+
+        completion = await self._groq().chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.2,
+            max_tokens=600,
+        )
+
+        payload = json.loads(completion.choices[0].message.content)
+        resolved = payload.get("resolved")
+        reply = payload.get("reply")
+
+        # A malformed response must not be treated as a confident answer.
+        if not isinstance(resolved, bool) or not isinstance(reply, str) or not reply.strip():
+            raise ValueError(f"unusable Groq payload: {payload!r}")
+
+        return resolved, reply.strip()
+
+    async def _ai_prescreen(self, message: discord.Message) -> bool:
+        """Try to resolve the message without a human.
+
+        Returns True when the user has been answered and no thread is needed.
+        Returns False to fall through to handoff. Never raises: every failure
+        path ends in a handoff so the user always gets a response.
+        """
+        user = message.author
+        content = (message.content or "").strip()
+
+        matched = self._escalation_match(content)
+        if matched:
+            logger.info("Escalation phrase %r from %s (%s); handing off.", matched, user, user.id)
+            await self._append_transcript(user.id, content, resolved=False)
+            return False
+
+        if self._groq() is None:
+            await self._append_transcript(user.id, content, resolved=False)
+            return False
+
+        transcript = await self._open_transcript(user.id)
+        history = (transcript or {}).get("messages", [])
+
+        try:
+            async with safe_typing(message.channel):
+                resolved, reply = await asyncio.wait_for(
+                    self._groq_answer(history, content),
+                    timeout=GROQ_TIMEOUT_SECONDS,
+                )
+        except Exception:
+            logger.error("Groq pre-screen failed for %s (%s); handing off.", user, user.id, exc_info=True)
+            await self._append_transcript(user.id, content, resolved=False)
+            return False
+
+        await self._append_transcript(user.id, content, reply, resolved)
+
+        if not resolved:
+            logger.info("AI deferred for %s (%s); handing off.", user, user.id)
+            return False
+
+        try:
+            await message.channel.send(embed=self._ai_embed(reply))
+        except discord.HTTPException:
+            logger.error("Failed delivering AI reply to %s; handing off.", user, exc_info=True)
+            return False
+
+        logger.info("AI resolved the request from %s (%s).", user, user.id)
+        return True
+
+    def _ai_embed(self, reply: str) -> discord.Embed:
+        """The assistant's own reply. Custom; Modmail has no slot for this."""
+        return self._embed(
+            title="Norwegian Air Shuttle Support",
+            description=reply,
+            color=self.bot.mod_color,
+            footer='Automated assistant • reply with "agent" to reach a human',
+        )
+
+    # ------------------------------------------------------------------
     # Embed helpers
     # ------------------------------------------------------------------
 
@@ -480,6 +771,14 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
 
+        if AsyncGroq is None:
+            ai_state = "**groq package missing** — every request escalates"
+        elif not os.getenv("GROQ_API_KEY"):
+            ai_state = "**GROQ_API_KEY not set** — every request escalates"
+        else:
+            ai_state = f"ready — `{GROQ_MODEL}`"
+        embed.add_field(name="AI pre-screen", value=ai_state, inline=False)
+
         # The privacy notice promises ticket messages are deleted after 7 days.
         # That claim is only true while Modmail's own log expiry is configured.
         expiry = self.bot.config.get("log_expiration")
@@ -540,18 +839,30 @@ class NorwegianSupport(commands.Cog):
     async def nas_revoke(self, ctx, user: discord.User):
         """Withdraw a user's consent. They are re-prompted on their next ticket."""
         deleted = await self._delete_consent(user.id)
-        if not deleted:
+
+        # Withdrawal has to take the pre-screen conversations with it, otherwise
+        # data collected under that consent outlives it.
+        transcripts = await self.db.delete_many(
+            {"_type": TYPE_TRANSCRIPT, "user_id_hash": await self._user_hash(user.id)}
+        )
+
+        if not deleted and not transcripts.deleted_count:
             return await ctx.send(
                 embed=self._embed(
-                    description=f"No consent on record for {user.mention}.",
+                    description=f"Nothing on record for {user.mention}.",
                     color=self.bot.error_color,
                 )
             )
+
         await ctx.send(
             embed=self._embed(
                 description=(
-                    f"Consent withdrawn for {user.mention}. They will see the privacy "
-                    "notice again the next time they open a ticket."
+                    f"Consent withdrawn for {user.mention} and "
+                    f"{transcripts.deleted_count} assistant conversation(s) deleted. "
+                    "They will see the privacy notice again the next time they "
+                    "open a ticket.\n\n"
+                    "Ticket transcripts with a human agent are Modmail's own logs "
+                    "and are not touched by this; use `?logs` to review them."
                 ),
             )
         )

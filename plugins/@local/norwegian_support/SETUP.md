@@ -117,11 +117,41 @@ restyles the plugin's embeds too.
 
 ## Environment
 
-Stage 4 needs a Groq API key in `.env` alongside the existing Modmail values:
+The AI pre-screen needs a Groq API key in `.env` alongside the existing Modmail
+values:
 
 ```
 GROQ_API_KEY=gsk_...
 ```
+
+`core/config.py` calls `load_dotenv()` at import, so `.env` is enough — no
+export needed. `?nas status` reports whether the key and the `groq` package are
+both present. Without either, every request simply escalates to a human; nothing
+breaks.
+
+## The FAQ — read this before going live
+
+`FAQ_KNOWLEDGE` in `norwegian_support.py` is the **only** thing the assistant is
+allowed to answer from. It is instructed to hand off anything not covered, so:
+
+- **A wrong entry becomes a wrong answer, stated confidently, to a real user.**
+- A missing entry costs nothing: that question escalates to a human.
+
+The seeded content is a plausible starting point written from general knowledge
+of how Roblox airline groups operate. **It has not been checked against how
+Norwegian Air Shuttle actually runs.** Review every line before going live, and
+delete anything you are not certain of rather than leaving a guess in place.
+
+The assistant is additionally instructed to defer on anything case-by-case
+(bans, appeals, applications, individual accounts), anything involving money,
+and anything where the user seems upset.
+
+### Escalation phrases
+
+`ESCALATION_PATTERNS` short-circuits to a human before Groq is called at all.
+Each entry is a case-insensitive regex matched on word boundaries, so `agent`
+does not fire on "management" and `human` does not fire on "humanity". Add
+phrases freely; keep the `\b` anchors.
 
 ## Storage
 
@@ -132,8 +162,23 @@ MongoDB and are separated by a `_type` field:
 | `_type`        | Fields                                                     | Retention |
 |----------------|------------------------------------------------------------|-----------|
 | `consent`      | `user_id`, `accepted_at`, `policy_version`                   | until withdrawn |
-| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at` | 7 days |
+| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `handed_off_at` | 7 days |
 | `ticket`       | `nas_ref`, `log_key`, `user_id`, `created_at`                | kept      |
+| `meta`         | `key`, `value` — currently the user-ID hashing salt          | permanent |
+
+### The hashing salt
+
+`ai_transcript.user_id_hash` is `HMAC-SHA256(salt, user_id)`, not a bare hash: a
+plain SHA-256 of a Discord snowflake is trivially reversible by enumeration. The
+salt is generated once and stored as the `meta` document.
+
+**Deleting or regenerating that document orphans every existing transcript** —
+the hashes stop matching and the data can no longer be tied to a user, including
+for deletion requests. Back it up with the rest of the database.
+
+The website cannot go from a transcript back to a user ID. To find one user's
+transcripts it must compute `HMAC-SHA256(salt, user_id)` itself using the stored
+salt, and query on that.
 
 Retention is enforced by a MongoDB TTL index on `expires_at` with
 `expireAfterSeconds: 0`. Only `ai_transcript` documents carry that field, so
