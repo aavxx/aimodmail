@@ -72,15 +72,76 @@ GROQ_TIMEOUT_SECONDS = 20
 # Turns of prior context sent back to Groq. Caps token spend on long chats.
 AI_HISTORY_LIMIT = 12
 
-# Sent once when a user opens a new pre-screen conversation, ahead of their
-# first message being processed. Not repeated for later messages in the same
-# conversation.
-GREETING_TEXT = (
+# Assistant identity on model-generated replies. The footer is deliberately not
+# applied to plugin-authored copy (greeting, handoff prompts): it is a caveat
+# about model output, so putting it on fixed text would misattribute it.
+AI_TITLE = "Vueling AI"
+AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
+
+# How long the typing indicator runs before each message. Every send in the
+# pre-screen pauses for this, so a greeted question costs roughly three of these
+# plus the Groq round trip before the user sees an answer.
+TYPING_DELAY_SECONDS = 2.5
+
+# Sent once when a user opens a new pre-screen conversation, ahead of their first
+# message being processed. Two separate messages, each with its own typing pause.
+GREETING_PARTS = (
     "Hola! I'm Vueling's virtual assistant. I'm new and still learning but "
-    "there are a lot of things I can do for you.\n\n"
+    "there are a lot of things I can do for you.",
     "How can I help you? Please, try to be as brief as possible so I can "
-    "understand you \N{SMILING FACE WITH SMILING EYES}"
+    "understand you \N{SMILING FACE WITH SMILING EYES}",
 )
+
+# Asked when the user opens with nothing to act on, and the greeting has already
+# been sent earlier in the conversation.
+CONTENTLESS_PROMPT = "What can I help you with today? \N{SMILING FACE WITH SMILING EYES}"
+
+# Words that carry no request on their own. A message made up entirely of these
+# is a hello, not a question, and must not be escalated as unanswerable.
+GREETING_WORDS = {
+    "hi",
+    "hii",
+    "hiii",
+    "hiya",
+    "hello",
+    "helo",
+    "hey",
+    "heyy",
+    "heya",
+    "hai",
+    "hola",
+    "yo",
+    "sup",
+    "howdy",
+    "greetings",
+    "good",
+    "morning",
+    "afternoon",
+    "evening",
+    "day",
+    "there",
+    "everyone",
+    "all",
+    "team",
+    "please",
+    "thanks",
+    "hallo",
+    "salut",
+    "ola",
+}
+
+# Handoff confirmation. Fixed copy: this is the plugin speaking, not the model.
+HANDOFF_CONFIRM_TEXT = "Looks like I can't help you with that. Do you want me to connect you with an agent?"
+HANDOFF_ACCEPTED_TEXT = "Okay, I will get you right over to someone to help you further."
+HANDOFF_GOODBYE_TEXT = "Bye for now! \N{SMILING FACE WITH SMILING EYES}"
+HANDOFF_DECLINED_TEXT = (
+    "No problem at all! Is there anything else I can help you with? " "\N{SMILING FACE WITH SMILING EYES}"
+)
+
+# Unanswered confirmations escalate. The user either asked for a human outright
+# or hit something the assistant could not resolve, so silence after "shall I
+# connect you?" is worse than a ticket nobody follows up.
+HANDOFF_CONFIRM_TIMEOUT_SECONDS = 120
 
 # Escalation phrases, matched on word boundaries so "management" does not trip
 # "agent" and "humanity" does not trip "human". Extend freely; each entry is a
@@ -174,14 +235,21 @@ written, in the same [display.domain](https://full.url) markdown form. Never
 show a bare URL, never alter the display text or the target, and never invent a
 link that is not in the reference information.
 
-Keep replies under 900 characters, friendly and plain. Do not claim to be human.
+Tone: warm and kind, like a helpful person who is glad to see them. Keep it
+plain and easy to read, under 900 characters. A little emoji is welcome, general
+friendly ones such as \N{SMILING FACE WITH SMILING EYES}. Never use aircraft,
+travel, luggage or destination emoji. Do not claim to be human.
 
 Reference information:
 {FAQ_KNOWLEDGE}
 
 Respond with a single json object with exactly these keys:
   "resolved": boolean
-  "reply": string
+  "reply": either a string, or an array of two strings
+
+Use an array of two strings only when the answer genuinely reads better split
+across two messages, for example a direct answer followed by a related pointer.
+A single string is the normal case; do not split for the sake of it.
 """
 
 
@@ -606,6 +674,82 @@ class NorwegianSupport(commands.Cog):
         self._groq_client = AsyncGroq(api_key=api_key, timeout=GROQ_TIMEOUT_SECONDS)
         return self._groq_client
 
+    async def _send_with_typing(
+        self,
+        channel,
+        embed: discord.Embed,
+        view: typing.Optional[discord.ui.View] = None,
+    ):
+        """Send one message behind a typing indicator.
+
+        safe_typing is Modmail's own helper and already swallows failures from
+        the typing endpoint, so a typing outage cannot stop the message going
+        out. The pause is what makes consecutive messages read as separate
+        turns rather than one wall of text.
+        """
+        async with safe_typing(channel):
+            await asyncio.sleep(TYPING_DELAY_SECONDS)
+        return await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
+
+    async def _send_greeting(self, channel) -> None:
+        for part in GREETING_PARTS:
+            await self._send_with_typing(channel, self._plain_embed(part))
+
+    @staticmethod
+    def _is_contentless(text: str) -> bool:
+        """True when the message is a hello with no request attached.
+
+        "hi" must not be escalated as an unanswerable question, but "hi when is
+        the flight" carries a real one, so only messages made up entirely of
+        greeting words count.
+        """
+        words = re.findall(r"[a-z']+", text.lower())
+        if not words:
+            # Emoji, punctuation or an attachment with no text.
+            return True
+        return all(word in GREETING_WORDS for word in words)
+
+    async def _confirm_handoff(self, message: discord.Message) -> bool:
+        """Ask before escalating.
+
+        Returns True to stay with the assistant, False to hand off. An
+        unanswered prompt escalates: see HANDOFF_CONFIRM_TIMEOUT_SECONDS.
+        """
+        user = message.author
+        view = ConsentView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
+        view.add_item(
+            _LabelledAcceptButton("nas-handoff-yes", self.bot.config["confirm_thread_creation_accept"], "Yes")
+        )
+        view.add_item(
+            _LabelledDenyButton("nas-handoff-no", self.bot.config["confirm_thread_creation_deny"], "No")
+        )
+
+        try:
+            prompt = await self._send_with_typing(
+                message.channel, self._plain_embed(HANDOFF_CONFIRM_TEXT), view=view
+            )
+        except discord.HTTPException:
+            logger.error("Could not ask %s about handoff; escalating.", user, exc_info=True)
+            return False
+
+        await view.wait()
+
+        if view.value is False:
+            await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_DECLINED_TEXT))
+            logger.info("%s (%s) declined the handoff; staying with the assistant.", user, user.id)
+            return True
+
+        if view.value is None:
+            try:
+                await prompt.edit(view=None)
+            except discord.HTTPException:
+                logger.debug("Could not clear handoff buttons after timeout.", exc_info=True)
+            logger.info("Handoff confirmation timed out for %s (%s); escalating.", user, user.id)
+
+        await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_ACCEPTED_TEXT))
+        await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_GOODBYE_TEXT))
+        return False
+
     @staticmethod
     def _escalation_match(text: str) -> typing.Optional[str]:
         for pattern in _ESCALATION_RE:
@@ -702,11 +846,20 @@ class NorwegianSupport(commands.Cog):
         resolved = payload.get("resolved")
         reply = payload.get("reply")
 
-        # A malformed response must not be treated as a confident answer.
-        if not isinstance(resolved, bool) or not isinstance(reply, str) or not reply.strip():
+        # The model may split an answer across two messages, so `reply` is
+        # accepted as either a string or a short list of them.
+        if isinstance(reply, str):
+            reply = [reply]
+        if not isinstance(reply, list):
             raise ValueError(f"unusable Groq payload: {payload!r}")
 
-        return resolved, reply.strip(), raw
+        replies = [part.strip() for part in reply if isinstance(part, str) and part.strip()]
+
+        # A malformed response must not be treated as a confident answer.
+        if not isinstance(resolved, bool) or not replies:
+            raise ValueError(f"unusable Groq payload: {payload!r}")
+
+        return resolved, replies[:2], raw
 
     async def _ai_prescreen(self, message: discord.Message) -> bool:
         """Try to resolve the message without a human.
@@ -720,22 +873,37 @@ class NorwegianSupport(commands.Cog):
 
         # No open transcript means this is the start of a new conversation.
         transcript = await self._open_transcript(user.id)
+        greeted = False
 
         # The greeting goes out before anything is decided about the message,
         # including escalation, so opening with "agent" still gets greeted first.
         if transcript is None:
             try:
-                await message.channel.send(embed=self._greeting_embed())
+                await self._send_greeting(message.channel)
+                greeted = True
             except discord.HTTPException:
                 # Not worth abandoning the request over; carry on and answer.
                 logger.error("Failed sending greeting to %s (%s).", user, user.id, exc_info=True)
 
+        # A bare "hi" is an opening, not an unanswerable question. Asking what
+        # they need is the reply; escalating a hello to a human is not.
+        if self._is_contentless(content):
+            await self._append_transcript(user.id, content, resolved=True)
+            if not greeted:
+                # Mid-conversation, so the greeting's own prompt is not in view.
+                await self._send_with_typing(message.channel, self._plain_embed(CONTENTLESS_PROMPT))
+            logger.info("Contentless opener from %s (%s); prompted instead of escalating.", user, user.id)
+            return True
+
         matched = self._escalation_match(content)
         if matched:
-            logger.info("Escalation phrase %r from %s (%s); handing off.", matched, user, user.id)
+            logger.info("Escalation phrase %r from %s (%s).", matched, user, user.id)
             await self._append_transcript(user.id, content, resolved=False)
-            return False
+            return await self._confirm_handoff(message)
 
+        # Technical failures below skip the confirmation and hand off directly.
+        # Offering to keep talking to an assistant that cannot answer would loop
+        # the user through the same failure on every message.
         if self._groq() is None:
             await self._append_transcript(user.id, content, resolved=False)
             return False
@@ -744,7 +912,7 @@ class NorwegianSupport(commands.Cog):
 
         try:
             async with safe_typing(message.channel):
-                resolved, reply, raw = await asyncio.wait_for(
+                resolved, replies, raw = await asyncio.wait_for(
                     self._groq_answer(history, content),
                     timeout=GROQ_TIMEOUT_SECONDS,
                 )
@@ -753,18 +921,19 @@ class NorwegianSupport(commands.Cog):
             await self._append_transcript(user.id, content, resolved=False)
             return False
 
-        await self._append_transcript(user.id, content, reply, resolved)
+        await self._append_transcript(user.id, content, "\n\n".join(replies), resolved)
 
         if not resolved:
-            logger.info("AI deferred for %s (%s); handing off.", user, user.id)
+            logger.info("AI deferred for %s (%s); asking about handoff.", user, user.id)
             # Why it deferred is invisible from the line above, so the message
             # that prompted it and the model's verbatim answer go out together.
             self._diag("Deferred message from %s (%s) was: %r", user, user.id, content)
             self._diag("Groq raw response for %s (%s): %s", user, user.id, raw)
-            return False
+            return await self._confirm_handoff(message)
 
         try:
-            await message.channel.send(embed=self._ai_embed(reply))
+            for reply in replies:
+                await self._send_with_typing(message.channel, self._ai_embed(reply))
         except discord.HTTPException:
             logger.error("Failed delivering AI reply to %s; handing off.", user, exc_info=True)
             return False
@@ -772,26 +941,22 @@ class NorwegianSupport(commands.Cog):
         logger.info("AI resolved the request from %s (%s).", user, user.id)
         return True
 
-    def _greeting_embed(self) -> discord.Embed:
-        """Opening greeting.
+    def _plain_embed(self, text: str) -> discord.Embed:
+        """Plugin-authored copy: greeting, prompts, handoff messages.
 
-        Deliberately styled apart from the assistant's replies. Discord groups
-        consecutive messages from the same author, so a greeting sharing the
-        reply's colour, title and footer reads as one block of text rather than
-        two messages. main_color plus no title or footer keeps them distinct.
+        No title and no footer. The "can make mistakes" caveat is a statement
+        about model output, so putting it on fixed strings the plugin controls
+        would misattribute it.
         """
-        return self._embed(
-            description=GREETING_TEXT,
-            color=self.bot.main_color,
-        )
+        return self._embed(description=text, color=self.bot.main_color)
 
     def _ai_embed(self, reply: str) -> discord.Embed:
-        """The assistant's own reply. Custom; Modmail has no slot for this."""
+        """A model-generated reply. Custom; Modmail has no slot for this."""
         return self._embed(
-            title="Norwegian Air Shuttle Support",
+            title=AI_TITLE,
             description=reply,
             color=self.bot.mod_color,
-            footer='Automated assistant • reply with "agent" to reach a human',
+            footer=AI_FOOTER,
         )
 
     # ------------------------------------------------------------------

@@ -197,20 +197,82 @@ off once you are done:
 ?nas verbose off
 ```
 
-### The greeting
+### Conversation flow
 
-`GREETING_TEXT` is sent once at the start of a new pre-screen conversation,
+Every message the assistant sends runs behind a typing indicator for
+`TYPING_DELAY_SECONDS` (2.5s), via Modmail's own `safe_typing`. That is what
+makes consecutive messages read as separate turns — Discord groups messages from
+the same author, so without the pause they run together visually no matter how
+they are styled.
+
+**Budget the latency.** A greeted question costs two greeting pauses plus one
+for the answer, on top of the Groq round trip: roughly 9–11 seconds before the
+user sees an answer. Lower `TYPING_DELAY_SECONDS` if that feels slow.
+
+`GREETING_PARTS` is two messages, sent once at the start of a new conversation,
 before the first message is processed — including before the escalation check,
-so someone opening with "agent" is still greeted before being handed over. It
-does not repeat for later messages in the same conversation.
+so someone opening with "agent" is greeted before being handed over. It does not
+repeat later in the same conversation.
+
+**Contentless openers.** A message made entirely of greeting words (`hi`,
+`hello`, `good morning`, emoji only…) is treated as an opening, not an
+unanswerable question. It never reaches Groq and is never escalated: the
+greeting's second part already asks what they need. Mid-conversation, they get
+`CONTENTLESS_PROMPT` instead. `GREETING_WORDS` drives this — a message with any
+word outside that set is a real request, so "hi when is the flight" gets the
+greeting *and* an answer.
+
+**Handoff confirmation.** When the assistant can't resolve something, or an
+escalation phrase matches, it asks `HANDOFF_CONFIRM_TEXT` with Yes/No buttons
+before creating any thread.
+
+- **Yes** → `HANDOFF_ACCEPTED_TEXT`, then `HANDOFF_GOODBYE_TEXT` as a separate
+  message, then the normal Modmail handoff.
+- **No** → `HANDOFF_DECLINED_TEXT` and the conversation carries on with the
+  assistant. The transcript stays open.
+- **No answer** → escalates after `HANDOFF_CONFIRM_TIMEOUT_SECONDS` (120s). The
+  user either asked for a human or hit something unanswerable, so silence is
+  worse than a ticket.
+
+Buttons rather than typed yes/no, matching Modmail's own confirm flows. A typed
+answer would also be re-processed as a fresh DM by the queue, which would need
+message-level interception to avoid double handling.
+
+**Technical failures skip the confirmation.** A Groq exception, timeout, bad
+payload, or missing key hands off directly — offering to keep talking to an
+assistant that cannot answer would loop the user through the same failure.
+
+### Embeds
+
+| Message | Colour | Title | Footer |
+|---|---|---|---|
+| Greeting, prompts, handoff copy | `main_color` | none | none |
+| Model-generated replies | `mod_color` | `Vueling AI` | `Vueling AI can make mistakes…` |
+
+The caveat footer is a statement about *model* output, so it goes only on text
+the model produced. Putting it on fixed plugin copy would misattribute it.
+
+The model may return `reply` as a string or as an array of two strings, and each
+element is sent as its own message. It is told to split only when an answer
+genuinely reads better in two parts.
 
 A conversation ends when a human takes over: the handoff stamps `handed_off_at`
 on the transcript, so the next time that user writes in they are greeted afresh.
 A conversation the assistant resolved stays open, so follow-up questions do not
 re-greet; it lapses naturally when the transcript expires after 7 days.
 
-The greeting text says "Vueling" while the rest of the bot still says Norwegian
-Air Shuttle. That is the supplied copy and is expected until the rebrand pass.
+### Branding, mid-rebrand
+
+Three surfaces say Vueling by explicit instruction: the greeting, the embed
+title (`Vueling AI`), and the caveat footer. Everything else is deliberately
+untouched pending the full rebrand pass — bot identity, the `NAS-XXXXXX` ticket
+prefix, the repo name.
+
+**One gap to close before going live:** `SYSTEM_PROMPT` still opens with *"You
+are the first-line automated support assistant for Norwegian Air Shuttle"*, so
+the model can name that airline inside an embed titled "Vueling AI". Changing it
+is a one-word edit, but it is the bot's identity, which was explicitly held back,
+so it has not been touched. Say the word.
 
 ### Escalation phrases
 
