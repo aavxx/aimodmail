@@ -41,7 +41,11 @@ logger = getLogger(__name__)
 
 # Bumped when the privacy notice text changes materially. A stored consent with
 # a lower version is re-prompted once (stage 3).
-POLICY_VERSION = 1
+#
+# 2: Norwegian Air Shuttle became Vueling. The organisation named as holding the
+#    data changed, not just the wording, so existing consent no longer names who
+#    actually holds it and everyone re-accepts on their next ticket.
+POLICY_VERSION = 2
 
 # Human-facing ticket reference prefix, mapped to Modmail's own log key.
 TICKET_PREFIX = "VLG"
@@ -613,14 +617,15 @@ class NorwegianSupport(commands.Cog):
         """The privacy notice. Custom because Modmail has no config slot for it."""
         if renewal:
             intro = (
-                "Our privacy notice has been updated since you last accepted it. "
-                "Please review it again before we continue."
+                "Norwegian Air Shuttle is now Vueling, so our privacy notice has been "
+                "updated since you last accepted it. Please review it again before we "
+                "continue."
             )
         else:
             intro = "Before we open a support ticket, please read how we handle your " "information."
 
         embed = self._embed(
-            title="Norwegian Air Shuttle — Support Privacy Notice",
+            title="Vueling — Support Privacy Notice",
             description=intro,
             footer=f"Policy version {POLICY_VERSION}",
         )
@@ -646,9 +651,7 @@ class NorwegianSupport(commands.Cog):
         )
         embed.add_field(
             name="Who can read it",
-            value=(
-                "The Norwegian Air Shuttle support team, and airline executives " "reviewing ticket quality."
-            ),
+            value=("The Vueling support team, and airline executives reviewing ticket quality."),
             inline=False,
         )
         embed.add_field(

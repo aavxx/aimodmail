@@ -284,14 +284,19 @@ Ticket references are now `VLG-XXXXXX`. The stored field is still called
 `nas_ref` for compatibility with existing documents; renaming it needs a data
 migration.
 
-**Still naming the old airline**, both user-visible:
+The privacy notice now names Vueling, and `POLICY_VERSION` is **2**. Everyone
+who accepted under version 1 is re-prompted on their next ticket, with the
+renewal wording explaining the rename. Declining the new notice withdraws the
+old consent, as it does for any renewal.
 
-- The **privacy notice** (`_privacy_embed`) is headed "Norwegian Air Shuttle —
-  Support Privacy Notice" and names that team as who can read the data. Changing
-  it edits a consent document people have already accepted, so it is a decision
-  about whether to bump `POLICY_VERSION` and re-prompt everyone, not a rename.
-- The `thread_creation_response` **config value** suggested above. Changing this
-  file does nothing on its own — re-run the `?config set` on the live bot.
+**Still naming the old airline**, and needing action outside this file: the
+`thread_creation_response` **config value** suggested above. Editing this file
+does nothing on its own — re-run the `?config set` on the live bot.
+
+Also still Norwegian Air Shuttle, but internal only and left for the rebrand
+pass: the module docstring, the `?nas` command group help text, the
+`norwegian_support` plugin/folder name, and the `NorwegianSupport` cog class
+(whose name is the storage partition, so it needs a data migration).
 
 ### Embed icon
 
