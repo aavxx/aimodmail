@@ -244,13 +244,26 @@ assistant that cannot answer would loop the user through the same failure.
 
 ### Embeds
 
+Every embed the plugin builds carries the **Vueling AI author row** — name plus
+the bot's own avatar, read from `bot.user.display_avatar` so it follows whatever
+is set in the Developer Portal without a redeploy.
+
 | Message | Colour | Title | Footer |
 |---|---|---|---|
-| Greeting, prompts, handoff copy | `main_color` | none | none |
-| Model-generated replies | `mod_color` | `Vueling AI` | `Vueling AI can make mistakes…` |
+| Greeting, prompts, handoff copy, consent notice | `main_color` | none | none |
+| Model-generated replies | `mod_color` | none | `Vueling AI can make mistakes…`, no icon |
+
+Model replies carry no title: the author row already names the assistant, and
+both together says it twice. The footer is plain text — an icon beside a
+disclaimer reads as branding rather than a caveat.
 
 The caveat footer is a statement about *model* output, so it goes only on text
 the model produced. Putting it on fixed plugin copy would misattribute it.
+
+Handoff Yes/No buttons are guild emoji with no labels
+(`BUTTON_YES_EMOJI` / `BUTTON_NO_EMOJI`). The consent notice keeps its **text
+labels**: an emoji-only choice is fine for "shall I fetch a human", not for
+accepting a privacy policy.
 
 The model may return `reply` as a string or as an array of two strings, and each
 element is sent as its own message. It is told to split only when an answer

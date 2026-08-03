@@ -103,11 +103,15 @@ GROQ_TIMEOUT_SECONDS = 20
 # Turns of prior context sent back to Groq. Caps token spend on long chats.
 AI_HISTORY_LIMIT = 12
 
-# Assistant identity on model-generated replies. The footer is deliberately not
-# applied to plugin-authored copy (greeting, handoff prompts): it is a caveat
-# about model output, so putting it on fixed text would misattribute it.
+# Assistant identity. The author row goes on every embed the plugin builds; the
+# footer caveat does not, because it is a statement about model output and would
+# misattribute fixed plugin copy.
 AI_TITLE = "Vueling AI"
 AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
+
+# Handoff confirmation buttons: guild emoji, no label.
+BUTTON_YES_EMOJI = "<:yes:1533908794684473354>"
+BUTTON_NO_EMOJI = "<:no:1533908791245017198>"
 
 # How long the typing indicator runs before each message. Every send in the
 # pre-screen pauses for this, so a greeted question costs roughly three of these
@@ -291,6 +295,20 @@ plain and easy to read, under 900 characters. A little emoji is welcome, general
 friendly ones such as \N{SMILING FACE WITH SMILING EYES}. Never use aircraft,
 travel, luggage or destination emoji. Do not claim to be human.
 
+Watch for answers that land bluntly. A short reply, a flat "no", a restriction,
+or anything that tells the user what they cannot have reads as cold on its own,
+however accurate it is. In those cases use the two-message form: the answer
+first, then a brief warm follow-up offering more help. For example, asked about
+uniform:
+
+  ["The uniform policy is staff-only information. \N{SMILING FACE WITH SMILING EYES}",
+   "Is there anything else I can help you with? \N{SMILING FACE WITH SMILING EYES}"]
+
+The same applies to the refund policy and to anything else the user will not
+want to hear: state it plainly, without softening the policy itself, then offer
+to keep helping. An answer that is already a few warm sentences does not need
+the follow-up.
+
 Reference information:
 {FAQ_KNOWLEDGE}
 
@@ -298,9 +316,10 @@ Respond with a single json object with exactly these keys:
   "resolved": boolean
   "reply": either a string, or an array of two strings
 
-Use an array of two strings only when the answer genuinely reads better split
-across two messages, for example a direct answer followed by a related pointer.
-A single string is the normal case; do not split for the sake of it.
+Use the array form when the answer reads better as two messages: a short or
+blunt answer followed by the warm offer of further help described above, or a
+direct answer followed by a related pointer. A single string is fine when the
+reply is already conversational.
 """
 
 
@@ -796,13 +815,12 @@ class NorwegianSupport(commands.Cog):
         unanswered prompt escalates: see HANDOFF_CONFIRM_TIMEOUT_SECONDS.
         """
         user = message.author
+        # Modmail's own unlabelled buttons, carrying the guild emoji and nothing
+        # else. The consent notice keeps its text labels: an emoji-only choice is
+        # fine for "shall I fetch a human", not for accepting a privacy policy.
         view = ConsentView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
-        view.add_item(
-            _LabelledAcceptButton("nas-handoff-yes", self.bot.config["confirm_thread_creation_accept"], "Yes")
-        )
-        view.add_item(
-            _LabelledDenyButton("nas-handoff-no", self.bot.config["confirm_thread_creation_deny"], "No")
-        )
+        view.add_item(AcceptButton("nas-handoff-yes", BUTTON_YES_EMOJI))
+        view.add_item(DenyButton("nas-handoff-no", BUTTON_NO_EMOJI))
 
         try:
             prompt = await self._send_with_typing(
@@ -1031,18 +1049,18 @@ class NorwegianSupport(commands.Cog):
         return self._embed(description=text, color=self.bot.main_color)
 
     def _ai_embed(self, reply: str) -> discord.Embed:
-        """A model-generated reply. Custom; Modmail has no slot for this."""
-        embed = self._embed(
-            title=AI_TITLE,
+        """A model-generated reply. Custom; Modmail has no slot for this.
+
+        No title: the author row already names the assistant, and carrying both
+        says it twice. The footer stays plain text, since an icon beside a
+        disclaimer reads as branding rather than a caveat.
+        """
+        return self._embed(
             description=reply,
             color=self.bot.mod_color,
             footer=AI_FOOTER,
+            footer_icon=False,
         )
-        # Picks up whatever avatar is set in the Developer Portal, so the icon
-        # follows the bot's account without being redeployed.
-        icon = getattr(getattr(self.bot.user, "display_avatar", None), "url", None)
-        embed.set_author(name=AI_TITLE, icon_url=icon)
-        return embed
 
     # ------------------------------------------------------------------
     # Handoff (stage 5)
@@ -1192,12 +1210,17 @@ class NorwegianSupport(commands.Cog):
         description: typing.Optional[str] = None,
         color: typing.Optional[int] = None,
         footer: typing.Optional[str] = None,
+        footer_icon: bool = True,
     ) -> discord.Embed:
         """Build an embed in Modmail's own style.
 
         Colors come from bot.config at call time via the bot's colour
         properties, so `?config set main_color ...` takes effect without a
         reload and nothing here hardcodes a hex value.
+
+        Every embed the plugin builds carries the assistant's author row, so
+        the identity is consistent whether the text came from the model or is
+        fixed plugin copy.
         """
         embed = discord.Embed(
             color=self.bot.main_color if color is None else color,
@@ -1207,12 +1230,28 @@ class NorwegianSupport(commands.Cog):
             embed.title = title
         if self.bot.config["show_timestamp"]:
             embed.timestamp = discord.utils.utcnow()
+
+        # Icon follows whatever avatar is set in the Developer Portal, so it
+        # tracks the bot's account without a redeploy.
+        embed.set_author(name=AI_TITLE, icon_url=self._bot_avatar())
+
         if footer is not None:
             embed.set_footer(
                 text=footer,
-                icon_url=self.bot.get_guild_icon(guild=self.bot.guild, size=128),
+                icon_url=(self.bot.get_guild_icon(guild=self.bot.guild, size=128) if footer_icon else None),
             )
         return embed
+
+    def _bot_avatar(self) -> typing.Optional[str]:
+        """The bot's avatar URL, or None.
+
+        Guarded from `self.bot` outwards on purpose: `bot.user` is None until
+        login, and an embed helper must never be able to raise. This is called
+        while building the privacy notice, and an exception there would fall
+        through the gate's fail-open path and skip the consent prompt entirely.
+        """
+        user = getattr(self.bot, "user", None)
+        return getattr(getattr(user, "display_avatar", None), "url", None)
 
     # ------------------------------------------------------------------
     # Diagnostics
