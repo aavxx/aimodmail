@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import pathlib
 import re
 import secrets
 import typing
@@ -573,6 +574,7 @@ class NorwegianSupport(commands.Cog):
         self._groq_client = None
         self._user_salt: typing.Optional[str] = None
         self._verbose = False
+        self._loaded_at: typing.Optional[datetime] = None
         # user_id -> summary, handed to on_thread_ready once the channel exists.
         self._pending_handoff: typing.Dict[int, str] = {}
 
@@ -581,6 +583,7 @@ class NorwegianSupport(commands.Cog):
     # ------------------------------------------------------------------
 
     async def cog_load(self) -> None:
+        self._loaded_at = datetime.now(timezone.utc)
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
@@ -1683,6 +1686,76 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
         await ctx.send(embed=embed)
+
+    @vlg.command(name="version", aliases=["updated"])
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def vlg_version(self, ctx):
+        """What code is actually running, and whether it is the code on disk."""
+        path = pathlib.Path(__file__).resolve()
+
+        try:
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()[:12]
+            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            lines = raw.count(b"\n") + 1
+        except OSError as e:
+            return await ctx.send(
+                embed=self._embed(
+                    description=f"Could not read the plugin file: `{e}`", color=self.bot.error_color
+                )
+            )
+
+        # The comparison that actually matters. Editing or pulling the file does
+        # nothing until the plugin is reloaded, and every other field here would
+        # look healthy while stale code kept running.
+        stale = self._loaded_at is not None and modified > self._loaded_at
+
+        embed = self._embed(
+            title="Vueling support — running code",
+            description=(
+                "**The file on disk is newer than the running code.** "
+                f"Reload with `{self.bot.prefix}plugin reload @local/norwegian_support`."
+                if stale
+                else "Running code matches the file on disk."
+            ),
+            color=self.bot.error_color if stale else None,
+        )
+        embed.add_field(
+            name="File last modified",
+            value=discord.utils.format_dt(modified, "F") + "\n" + discord.utils.format_dt(modified, "R"),
+            inline=False,
+        )
+        if self._loaded_at is not None:
+            embed.add_field(
+                name="Plugin loaded",
+                value=discord.utils.format_dt(self._loaded_at, "F")
+                + "\n"
+                + discord.utils.format_dt(self._loaded_at, "R"),
+                inline=False,
+            )
+        embed.add_field(name="Content hash", value=f"`{digest}`  ({lines} lines)", inline=False)
+
+        commit = self._git_head()
+        if commit:
+            embed.add_field(name="Repo commit", value=f"`{commit}`", inline=False)
+
+        embed.set_footer(text="Hash changes whenever the file does; compare it against what was shipped.")
+        await ctx.send(embed=embed)
+
+    @staticmethod
+    def _git_head() -> typing.Optional[str]:
+        """Short commit of the checkout, best-effort and without shelling out."""
+        try:
+            root = pathlib.Path(__file__).resolve().parents[3]
+            head = (root / ".git" / "HEAD").read_text().strip()
+            if not head.startswith("ref: "):
+                return head[:8]
+            ref = (root / ".git" / head[5:]).read_text().strip()
+            return ref[:8]
+        except Exception:
+            # Packed refs, a non-git deploy, a different layout. Not worth
+            # failing the command over.
+            return None
 
     @vlg.command(name="ask")
     @checks.has_permissions(PermissionLevel.SUPPORTER)

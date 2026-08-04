@@ -26,6 +26,7 @@ and ticket log retention must not read `Never`.
 | Command | Permission | Purpose |
 |---|---|---|
 | `.vlg status` | Administrator | Wiring, storage counts, config sanity |
+| `.vlg version` | Supporter | What code is running, and whether it is current |
 | `.vlg stats` | Supporter | Deferral rate, feedback, and what to add to the FAQ |
 | `.vlg ask <question>` | Supporter | Dry-run the pre-screen, no conversation created |
 | `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
@@ -282,6 +283,18 @@ It deliberately mirrors `_ai_prescreen`'s ordering, so the route it reports is
 the route a real message takes. Greeting-only, closing phrases and escalation
 phrases are named as such rather than being pre-screened, because in a real
 conversation those never reach Groq either.
+
+### Is my change actually running?
+
+`.vlg version` answers it. The field that matters is the comparison between
+**file last modified** and **plugin loaded**: editing or pulling the file changes
+nothing until the plugin is reloaded, and every other signal looks healthy while
+stale code keeps running. If the file is newer, it says so in red and gives the
+reload command.
+
+It also prints a content hash of the running file, so a shipped change can be
+confirmed by comparing hashes rather than by guessing from behaviour, plus the
+repo commit when the checkout is a git one.
 
 ### Buttons not appearing
 
