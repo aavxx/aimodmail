@@ -254,6 +254,12 @@ STATS_STOPWORDS = {
     "your",
 }
 
+# Used if the guild emoji above cannot be sent. Discord rejects a component
+# carrying an emoji the bot has no access to, which fails the whole message, so
+# without a fallback a bad emoji id means no confirmation prompt at all.
+BUTTON_YES_FALLBACK = "\N{WHITE HEAVY CHECK MARK}"
+BUTTON_NO_FALLBACK = "\N{CROSS MARK}"
+
 # Feedback on an AI answer. `resolved` is only the model's own claim that it
 # helped; these are the sole independent signal about whether it actually did.
 FEEDBACK_UP_ID = "vlg-feedback-up"
@@ -558,6 +564,7 @@ class NorwegianSupport(commands.Cog):
         self._groq_client = None
         self._user_salt: typing.Optional[str] = None
         self._verbose = False
+        self._feedback_view: typing.Optional["FeedbackView"] = None
         # user_id -> summary, handed to on_thread_ready once the channel exists.
         self._pending_handoff: typing.Dict[int, str] = {}
 
@@ -570,7 +577,8 @@ class NorwegianSupport(commands.Cog):
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
         # Persistent, so answers stay ratable across restarts.
-        self.bot.add_view(FeedbackView(self))
+        self._feedback_view = FeedbackView(self)
+        self.bot.add_view(self._feedback_view)
         self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
@@ -595,6 +603,16 @@ class NorwegianSupport(commands.Cog):
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
         self.maintenance_sweep.cancel()
+
+        # Otherwise a reload leaves the previous view registered against a dead
+        # cog, and an unload leaves buttons that still answer to nothing. There
+        # is no public API for this, so it is best-effort.
+        if self._feedback_view is not None:
+            try:
+                self.bot._connection._view_store.remove_view(self._feedback_view)
+            except Exception:
+                logger.debug("Could not unregister the feedback view.", exc_info=True)
+            self._feedback_view = None
 
     @tasks.loop(minutes=SWEEP_INTERVAL_MINUTES)
     async def maintenance_sweep(self) -> None:
@@ -961,8 +979,29 @@ class NorwegianSupport(commands.Cog):
                 message.channel, self._plain_embed(HANDOFF_CONFIRM_TEXT), view=view
             )
         except discord.HTTPException:
-            logger.error("Could not ask %s about handoff; escalating.", user, exc_info=True)
-            return False
+            # Overwhelmingly the guild emoji: Discord 400s a component carrying
+            # one the bot cannot use, and that fails the entire message, so the
+            # user would silently get no prompt. Retry with plain unicode rather
+            # than escalating over a decoration.
+            logger.error(
+                "Handoff prompt rejected for %s, retrying without the guild emoji "
+                "(%s / %s). Check `%svlg status`.",
+                user,
+                BUTTON_YES_EMOJI,
+                BUTTON_NO_EMOJI,
+                self.bot.prefix,
+                exc_info=True,
+            )
+            view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
+            view.add_item(AcceptButton("nas-handoff-yes", BUTTON_YES_FALLBACK))
+            view.add_item(DenyButton("nas-handoff-no", BUTTON_NO_FALLBACK))
+            try:
+                prompt = await self._send_with_typing(
+                    message.channel, self._plain_embed(HANDOFF_CONFIRM_TEXT), view=view
+                )
+            except discord.HTTPException:
+                logger.error("Could not ask %s about handoff at all; escalating.", user, exc_info=True)
+                return False
 
         await view.wait()
 
@@ -1563,6 +1602,34 @@ class NorwegianSupport(commands.Cog):
         else:
             icon_state = "**none** — the bot has no avatar set on the Portal's *Bot* tab"
         embed.add_field(name="Embed icon", value=icon_state, inline=False)
+
+        # A component carrying an emoji the bot cannot use is rejected outright,
+        # taking the whole message with it, so this is the usual reason a
+        # confirmation prompt never appears.
+        emoji_lines = []
+        for label, raw in (("yes", BUTTON_YES_EMOJI), ("no", BUTTON_NO_EMOJI)):
+            match = re.search(r":(\d+)>$", raw)
+            resolved = self.bot.get_emoji(int(match.group(1))) if match else None
+            emoji_lines.append(f"`{label}` {raw} — {'usable' if resolved else '**not usable by this bot**'}")
+        embed.add_field(
+            name="Confirmation button emoji",
+            value="\n".join(emoji_lines)
+            + (
+                "\n*Unusable means the bot is not in the server that owns the emoji. "
+                "The prompt falls back to plain unicode.*"
+            ),
+            inline=False,
+        )
+
+        registered = any(isinstance(v, FeedbackView) for v in getattr(self.bot, "persistent_views", []) or [])
+        embed.add_field(
+            name="Feedback buttons",
+            value=(
+                ("registered" if registered else "**not registered**")
+                + " — only appear on answers sent after this feature shipped, never on older ones"
+            ),
+            inline=False,
+        )
         embed.add_field(
             name="Verbose diagnostics",
             value=(
