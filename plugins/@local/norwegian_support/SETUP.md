@@ -27,12 +27,13 @@ and ticket log retention must not read `Never`.
 |---|---|---|
 | `?nas status` | Administrator | Wiring, storage counts, config sanity |
 | `?nas verbose` | Administrator | Log why the AI deferred (see below) |
-| `?nas consent @user` | Supporter | Show a stored consent record |
-| `?nas revoke @user` | Supporter | Withdraw consent; re-prompts next ticket |
+| `?nas forget @user` | Supporter | Delete a user's stored assistant conversations |
 | `?nas ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
 
-`?nas revoke` exists because the privacy notice tells users they can withdraw
-acceptance by asking the support team. Keep it working.
+`?nas forget` is the only way to action an erasure request that arrives via the
+data protection page linked in the opening disclosure. There is no consent to
+withdraw any more, but the transcripts still exist until their 7 day expiry, and
+nothing else deletes them on request. `?nas revoke` still works as an alias.
 
 ## Required config
 
@@ -41,8 +42,8 @@ so they stay editable without a reload. Run these once.
 
 ### Turn off the built-in confirm step
 
-The plugin's gate replaces it. Leaving it on double-prompts the user ahead of
-the consent notice.
+The plugin's gate replaces it. Leaving it on adds a second prompt on top of the
+plugin's own flow.
 
 ```
 ?config set confirm_thread_creation no
@@ -60,19 +61,18 @@ Sent by Modmail itself once a thread is created at handoff.
 
 ### Cancellation
 
-Shown when a user declines the privacy notice, when the notice times out, or
-when thread creation is otherwise stopped.
+Shown when thread creation is stopped.
 
 ```
 ?config set thread_cancelled Support Cancelled
 ```
 
-### Log retention — required, and load-bearing
+### Log retention
 
-The privacy notice tells users their ticket messages are deleted 7 days after
-the ticket closes. **That is only true if this is set.** Modmail's default is
-`Never`, which keeps every thread log forever and would make the notice a false
-statement.
+Modmail's default is `Never`, which keeps every thread log forever. The bot no
+longer states a retention period itself — the opening disclosure links to your
+privacy policy instead — so **whatever that page says has to match this
+setting.**
 
 ```
 ?config set log_expiration P7D
@@ -193,6 +193,30 @@ off once you are done:
 
 ```
 ?nas verbose off
+```
+
+### The opening disclosure
+
+Every conversation opens with two fixed, informational messages before the
+greeting: the data-processing notice and the AI-tool notice (`DISCLOSURE_PARTS`).
+Nothing waits for input and nothing is stored per user.
+
+It repeats on **every** new conversation rather than being shown once, on the
+same open/closed boundary as the greeting — a conversation ends when a human
+takes over and `handed_off_at` is stamped.
+
+There is deliberately no accept/decline step. The disclosure states that
+processing rests on the contractual relationship, not on consent, so there is no
+decision to capture and nothing to look up or withdraw. Someone who wants to act
+on their data uses the linked data protection page; staff action it with
+`?nas forget`.
+
+Documents written by the removed consent gate are not deleted automatically.
+`?nas status` counts them under *obsolete consent records* if any remain, and
+`?nas forget` clears them per user. To drop them all at once:
+
+```js
+db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
 ```
 
 ### Conversation flow
