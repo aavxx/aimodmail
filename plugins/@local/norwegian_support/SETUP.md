@@ -176,6 +176,32 @@ same as understanding and lacking the fact, and only the second is worth a
 human's time. A legacy `{"resolved": bool}` payload is still accepted and mapped,
 so a model that falls back to the old shape is not treated as an error.
 
+### Partnerships
+
+A message mentioning partner / partnership / collab / affiliate is routed to a
+form rather than a conversation, **before** the escalation check. The five
+questions are what a human would ask anyway, so collecting them up front beats a
+ticket that opens by asking them one at a time — even when the request is phrased
+as wanting to speak to someone.
+
+The reply offers a button, the button opens a Discord modal, and the submission
+is posted to the configured staff channel. `PARTNERSHIP_GUILD_ID` and
+`PARTNERSHIP_CHANNEL_ID` are where it lands; if the bot cannot see that channel
+the user is told the submission failed and offered a human, rather than being
+thanked for something that never arrived.
+
+The button view is persistent, so a form offered overnight still opens.
+
+### The follow-up question
+
+"Is there anything else I can help you with?" is sent by the plugin after every
+answered or chat reply, not by the model. It used to be left to the model's
+discretion, which is why it appeared only sometimes. The prompt now explicitly
+tells the model **not** to write it, so it never doubles up.
+
+It is deliberately not sent after `unclear` (it would contradict the question
+just asked) or `escalate` (the agent offer follows instead).
+
 ### Wording vs facts
 
 The prompt tells the model to recognise shorthand, abbreviations, partial names,

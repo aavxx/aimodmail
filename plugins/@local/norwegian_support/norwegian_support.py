@@ -159,8 +159,8 @@ AI_TITLE = "Vueling AI"
 AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
 
 # Handoff confirmation buttons: guild emoji, no label.
-BUTTON_YES_EMOJI = "<:yes:1533908794684473354>"
-BUTTON_NO_EMOJI = "<:no:1533908791245017198>"
+BUTTON_YES_EMOJI = "<:yes:1534231866888945764>"
+BUTTON_NO_EMOJI = "<:no:1534231863319593172>"
 
 # The model picks exactly one of these per reply. A single enum rather than a
 # pair of booleans, so it cannot express a contradiction like understood-but-not
@@ -354,10 +354,63 @@ HANDOFF_DECLINED_TEXT = (
     "No problem at all! Is there anything else I can help you with? " "\N{SMILING FACE WITH SMILING EYES}"
 )
 
-# Unanswered confirmations escalate. The user either asked for a human outright
-# or hit something the assistant could not resolve, so silence after "shall I
-# connect you?" is worse than a ticket nobody follows up.
-HANDOFF_CONFIRM_TIMEOUT_SECONDS = 120
+# An unanswered confirmation does nothing. Connecting someone to an agent
+# because they walked away puts a person on a ticket nobody is sitting at, and
+# reads to the user as the bot having pressed yes for them.
+HANDOFF_CONFIRM_TIMEOUT_SECONDS = 60
+
+HANDOFF_TIMEOUT_TEXT = (
+    "It looks like you're not around at the moment, so I won't put you through to "
+    "anyone just yet. Message me whenever you're ready and we'll pick this back up. "
+    "\N{SMILING FACE WITH SMILING EYES}"
+)
+
+# Sent by the plugin after every answer, rather than left to the model, which
+# offered it only sometimes.
+FOLLOW_UP_TEXT = "Is there anything else I can help you with? \N{SMILING FACE WITH SMILING EYES}"
+
+# Partnership requests get their own form rather than a conversation, so they
+# are matched before anything else: the five questions below are what a human
+# would ask anyway, and collecting them up front is better than a ticket that
+# starts by asking them one at a time.
+PARTNERSHIP_PATTERNS = [
+    r"\bpartner(?:s|ship|ships|ing)?\b",
+    r"\bcollab(?:s|oration|orations|orate)?\b",
+    r"\baffiliat(?:e|es|ion|ions)\b",
+]
+
+_PARTNERSHIP_RE = [re.compile(p, re.IGNORECASE) for p in PARTNERSHIP_PATTERNS]
+
+PARTNERSHIP_INTRO = (
+    "Certainly, we'd be glad to hear about it! Tap the button below and fill in a "
+    "few details about your group and I'll pass it straight to the team."
+)
+PARTNERSHIP_BUTTON_ID = "vlg-partnership"
+PARTNERSHIP_BUTTON_LABEL = "Request a partnership"
+PARTNERSHIP_MODAL_TITLE = "Partnership request"
+
+# (label, paragraph?, max length). Labels are capped at 45 characters by Discord.
+PARTNERSHIP_QUESTIONS = [
+    ("Your group's name", False, 100),
+    ("Your group's invite", False, 200),
+    ("About your group", True, 1000),
+    ("What benefits do you see in this partnership?", True, 1000),
+    ("What are your expectations from us?", True, 1000),
+]
+
+PARTNERSHIP_THANKS = (
+    "Thank you! Your application has been sent to the team. Someone will get back "
+    "to you here within **2 business days** with a final answer. There's nothing "
+    "else you need to do in the meantime."
+)
+PARTNERSHIP_FAILED = (
+    "Sorry, something went wrong sending that to the team and I don't want to tell "
+    "you it arrived when it hasn't. Let me put you through to someone instead."
+)
+
+# Where submitted applications land.
+PARTNERSHIP_GUILD_ID = 1532428044822642808
+PARTNERSHIP_CHANNEL_ID = 1534233033085948074
 
 # Escalation phrases, matched on word boundaries so "management" does not trip
 # "agent" and "humanity" does not trip "human". Extend freely; each entry is a
@@ -521,17 +574,14 @@ travel, luggage or destination emoji. Do not claim to be human.
 
 Watch for answers that land bluntly. A short reply, a flat "no", a restriction,
 or anything that tells the user what they cannot have reads as cold on its own,
-however accurate it is. In those cases use the two-message form: the answer
-first, then a brief warm follow-up offering more help. For example, asked about
-uniform:
+however accurate it is. Warm the delivery: a friendly opening clause, an
+acknowledgement that it is not what they hoped for. Never soften the policy
+itself — say it plainly, then be kind about it. Asked about uniform, something
+like "That one's staff-only I'm afraid, so I can't share the details here."
 
-  ["The uniform policy is staff-only information. \N{SMILING FACE WITH SMILING EYES}",
-   "Is there anything else I can help you with? \N{SMILING FACE WITH SMILING EYES}"]
-
-The same applies to the refund policy and to anything else the user will not
-want to hear: state it plainly, without softening the policy itself, then offer
-to keep helping. An answer that is already a few warm sentences does not need
-the follow-up.
+Do NOT end your reply by asking whether there is anything else you can help
+with. That question is added automatically after every answer you give, so
+writing it yourself means the user is asked it twice in a row.
 
 Reference information:
 {FAQ_KNOWLEDGE}
@@ -545,6 +595,53 @@ blunt answer followed by the warm offer of further help described above, or a
 direct answer followed by a related pointer. A single string is fine when the
 reply is already conversational.
 """
+
+
+class PartnershipModal(discord.ui.Modal):
+    """The five questions, asked as one form instead of five turns."""
+
+    def __init__(self, cog: "NorwegianSupport"):
+        super().__init__(title=PARTNERSHIP_MODAL_TITLE, timeout=None)
+        self.cog = cog
+        self.answers: typing.List[discord.ui.TextInput] = []
+        for label, paragraph, max_length in PARTNERSHIP_QUESTIONS:
+            field = discord.ui.TextInput(
+                label=label,
+                style=discord.TextStyle.paragraph if paragraph else discord.TextStyle.short,
+                required=True,
+                max_length=max_length,
+            )
+            self.add_item(field)
+            self.answers.append(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.submit_partnership(interaction, self.answers)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error("Partnership modal failed for %s.", interaction.user, exc_info=error)
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_message(PARTNERSHIP_FAILED, ephemeral=True)
+
+
+class PartnershipButton(discord.ui.Button):
+    def __init__(self, cog: "NorwegianSupport"):
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label=PARTNERSHIP_BUTTON_LABEL,
+            custom_id=PARTNERSHIP_BUTTON_ID,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(PartnershipModal(self.cog))
+
+
+class PartnershipView(discord.ui.View):
+    """Persistent: the form has to still open the next day, and after a restart."""
+
+    def __init__(self, cog: "NorwegianSupport"):
+        super().__init__(timeout=None)
+        self.add_item(PartnershipButton(cog))
 
 
 class YesNoView(discord.ui.View):
@@ -588,6 +685,7 @@ class NorwegianSupport(commands.Cog):
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
+        self.bot.add_view(PartnershipView(self))
         self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
@@ -1032,15 +1130,94 @@ class NorwegianSupport(commands.Cog):
             return True
 
         if view.value is None:
+            # Nobody pressed anything. Connecting them anyway would look like the
+            # bot pressed yes on their behalf, and would put a person on a ticket
+            # the user has already walked away from.
             try:
                 await prompt.edit(view=None)
             except discord.HTTPException:
                 logger.debug("Could not clear handoff buttons after timeout.", exc_info=True)
-            logger.info("Handoff confirmation timed out for %s (%s); escalating.", user, user.id)
+            await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_TIMEOUT_TEXT))
+            logger.info("Handoff confirmation timed out for %s (%s); stayed put.", user, user.id)
+            return True
 
         await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_ACCEPTED_TEXT))
         await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_GOODBYE_TEXT))
         return False
+
+    @staticmethod
+    def _partnership_match(text: str) -> typing.Optional[str]:
+        for pattern in _PARTNERSHIP_RE:
+            found = pattern.search(text)
+            if found:
+                return found.group(0)
+        return None
+
+    async def _offer_partnership_form(self, message: discord.Message) -> bool:
+        """Reply, then a message carrying the form button. True if it went out."""
+        try:
+            await self._send_with_typing(message.channel, self._ai_embed(PARTNERSHIP_INTRO))
+        except discord.HTTPException:
+            logger.error("Could not introduce the partnership form.", exc_info=True)
+            return False
+        sent = await self._send_buttons(message.channel, PartnershipView(self))
+        return sent is not None
+
+    async def submit_partnership(
+        self, interaction: discord.Interaction, answers: typing.List[discord.ui.TextInput]
+    ) -> None:
+        """Post an application to the staff channel, then confirm to the user.
+
+        The user is only told it arrived if it actually did. Saying "sent" for
+        something that silently failed is worse than saying nothing.
+        """
+        user = interaction.user
+        await interaction.response.defer()
+
+        embed = self._embed(
+            title="Partnership request",
+            description=f"From {user.mention} (`{user.id}`)",
+            color=self.bot.main_color,
+        )
+        for field, (label, _, _) in zip(answers, PARTNERSHIP_QUESTIONS):
+            embed.add_field(name=label, value=truncate(str(field.value).strip() or "—", 1000), inline=False)
+
+        channel = None
+        try:
+            guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+            channel = guild.get_channel(PARTNERSHIP_CHANNEL_ID) if guild else None
+            if channel is None:
+                channel = self.bot.get_channel(PARTNERSHIP_CHANNEL_ID)
+        except Exception:
+            logger.error("Could not resolve the partnership channel.", exc_info=True)
+
+        delivered = False
+        if channel is None:
+            logger.error(
+                "Partnership channel %s in guild %s is not visible to this bot.",
+                PARTNERSHIP_CHANNEL_ID,
+                PARTNERSHIP_GUILD_ID,
+            )
+        else:
+            try:
+                await channel.send(embed=embed)
+                delivered = True
+            except discord.HTTPException:
+                logger.error("Could not post the partnership application.", exc_info=True)
+
+        dm = interaction.channel
+        if dm is None:
+            return
+
+        if not delivered:
+            with contextlib.suppress(discord.HTTPException):
+                await self._send_with_typing(dm, self._ai_embed(PARTNERSHIP_FAILED))
+            return
+
+        logger.info("Partnership application submitted by %s (%s).", user, user.id)
+        with contextlib.suppress(discord.HTTPException):
+            await self._send_with_typing(dm, self._ai_embed(PARTNERSHIP_THANKS))
+            await self._send_with_typing(dm, self._ai_embed(FOLLOW_UP_TEXT))
 
     @staticmethod
     def _escalation_match(text: str) -> typing.Optional[str]:
@@ -1271,6 +1448,19 @@ class NorwegianSupport(commands.Cog):
             logger.info("Contentless opener from %s (%s); prompted instead of escalating.", user, user.id)
             return True
 
+        # Ahead of the escalation check on purpose: "can we partner?" is a
+        # request the form answers better than a human retyping the same five
+        # questions, even when it is phrased as wanting to speak to someone.
+        partnership = self._partnership_match(content)
+        if partnership:
+            logger.info("Partnership intent %r from %s (%s).", partnership, user, user.id)
+            await self._append_transcript(user.id, content, PARTNERSHIP_INTRO, status=STATUS_ANSWERED)
+            if await self._offer_partnership_form(message):
+                return True
+            logger.error("Could not offer the partnership form to %s; handing off.", user)
+            await self._mark_handoff_reason(user.id, HANDOFF_AI_ERROR)
+            return False
+
         matched = self._escalation_match(content)
         if matched:
             logger.info("Escalation phrase %r from %s (%s).", matched, user, user.id)
@@ -1314,6 +1504,10 @@ class NorwegianSupport(commands.Cog):
 
         if status in STATUS_HANDLED:
             await self._set_unclear_streak(user.id, 0)
+            # Always, rather than leaving it to the model, which offered it only
+            # sometimes. The prompt is told not to add its own so it never doubles.
+            with contextlib.suppress(discord.HTTPException):
+                await self._send_with_typing(message.channel, self._ai_embed(FOLLOW_UP_TEXT))
             logger.info("AI handled the request from %s (%s) as %s.", user, user.id, status)
             return True
 
