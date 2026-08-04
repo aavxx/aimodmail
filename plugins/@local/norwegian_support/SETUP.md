@@ -27,6 +27,7 @@ and ticket log retention must not read `Never`.
 |---|---|---|
 | `.vlg status` | Administrator | Wiring, storage counts, config sanity |
 | `.vlg stats` | Supporter | Deferral rate, feedback, and what to add to the FAQ |
+| `.vlg ask <question>` | Supporter | Dry-run the pre-screen, no conversation created |
 | `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
 | `.vlg forget @user` | Supporter | Delete a user's stored assistant conversations |
 | `.vlg ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
@@ -241,6 +242,33 @@ Documents written by the removed consent gate are not deleted automatically.
 ```js
 db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
 ```
+
+### `.vlg ask`
+
+Runs a question through the pre-screen and prints the raw `{resolved, reply}`
+plus which route it took. Creates no conversation, no transcript, no session,
+sends the user nothing — so FAQ wording can be iterated on in one channel
+instead of a round trip through a test account's DMs.
+
+It deliberately mirrors `_ai_prescreen`'s ordering, so the route it reports is
+the route a real message takes. Greeting-only, closing phrases and escalation
+phrases are named as such rather than being pre-screened, because in a real
+conversation those never reach Groq either.
+
+### Buttons not appearing
+
+`.vlg status` answers this directly. Two independent causes:
+
+- **Confirmation Yes/No** — the guild emoji are resolved through `bot.get_emoji`
+  and reported as usable or not. Discord rejects a component carrying an emoji
+  the bot has no access to, and that fails the **entire message**, so an emoji
+  from a server the bot is not in means the prompt never appears and the user is
+  escalated silently. The prompt now retries with plain unicode when that
+  happens, so it degrades instead of vanishing.
+- **Feedback 👍/👎** — status reports whether the persistent view is registered.
+  These only ever appear on answers sent *after* the feature shipped; older
+  transcripts have no `answer_message_ids`, so a click could not be attributed to
+  them even if the buttons were there.
 
 ### `.vlg stats`
 

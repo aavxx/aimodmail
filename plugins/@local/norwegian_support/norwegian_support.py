@@ -1659,6 +1659,107 @@ class NorwegianSupport(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    @vlg.command(name="ask")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def vlg_ask(self, ctx, *, question: str):
+        """Dry-run a question through the pre-screen and show the raw result.
+
+        Touches nothing: no conversation, no transcript, no session, no
+        greeting. For iterating on the FAQ without DMing from a test account.
+        """
+        # Mirrors _ai_prescreen's order, so the route shown here is the route a
+        # real message would take. Diverging from it would make this misleading.
+        if self._is_contentless(question):
+            return await ctx.send(
+                embed=self._embed(
+                    title="Dry run — no pre-screen",
+                    description=(
+                        f"> {truncate(question, 200)}\n\n"
+                        "Treated as a greeting with no request in it. Answered with a "
+                        "prompt for what they need; never escalated, never sent to Groq."
+                    ),
+                )
+            )
+
+        closing = self._is_closing_request(question)
+        if closing:
+            return await ctx.send(
+                embed=self._embed(
+                    title="Dry run — no pre-screen",
+                    description=(
+                        f"> {truncate(question, 200)}\n\n"
+                        f"Matches a closing phrase (`{closing}`), so mid-conversation this "
+                        "would end the chat. As a first message it would fall through to "
+                        "the pre-screen instead."
+                    ),
+                )
+            )
+
+        matched = self._escalation_match(question)
+        if matched:
+            return await ctx.send(
+                embed=self._embed(
+                    title="Dry run — no pre-screen",
+                    description=(
+                        f"> {truncate(question, 200)}\n\n"
+                        f"Matches escalation phrase `{matched}`, so it goes straight to the "
+                        "handoff offer without Groq being called at all."
+                    ),
+                )
+            )
+
+        if self._groq() is None:
+            return await ctx.send(
+                embed=self._embed(
+                    description="Groq is not configured, so every question escalates. "
+                    f"See `{self.bot.prefix}vlg status`.",
+                    color=self.bot.error_color,
+                )
+            )
+
+        async with safe_typing(ctx):
+            try:
+                resolved, replies, raw = await asyncio.wait_for(
+                    self._groq_answer([], question), timeout=GROQ_TIMEOUT_SECONDS
+                )
+            except Exception as e:
+                return await ctx.send(
+                    embed=self._embed(
+                        title="Dry run — pre-screen failed",
+                        description=(
+                            f"> {truncate(question, 200)}\n\n"
+                            f"```{type(e).__name__}: {truncate(str(e), 400)}```\n"
+                            "In a real conversation this hands off immediately, with no "
+                            "confirmation prompt."
+                        ),
+                        color=self.bot.error_color,
+                    )
+                )
+
+        embed = self._embed(
+            title="Dry run — answered" if resolved else "Dry run — would hand off",
+            description=f"> {truncate(question, 200)}",
+            color=None if resolved else self.bot.error_color,
+        )
+        embed.add_field(
+            name="Outcome",
+            value=(
+                "`resolved: true` — the user gets this reply and no thread is created."
+                if resolved
+                else "`resolved: false` — the user is asked whether to connect to an agent."
+            ),
+            inline=False,
+        )
+        for index, reply in enumerate(replies, start=1):
+            embed.add_field(
+                name=f"Reply {index} of {len(replies)}" if len(replies) > 1 else "Reply",
+                value=truncate(reply, 1000),
+                inline=False,
+            )
+        embed.add_field(name="Raw", value=f"```json\n{truncate(raw, 900)}\n```", inline=False)
+        embed.set_footer(text="Nothing was stored; no conversation was started.")
+        await ctx.send(embed=embed)
+
     @vlg.command(name="stats")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def vlg_stats(self, ctx):
