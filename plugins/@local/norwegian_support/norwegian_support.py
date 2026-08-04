@@ -260,12 +260,6 @@ STATS_STOPWORDS = {
 BUTTON_YES_FALLBACK = "\N{WHITE HEAVY CHECK MARK}"
 BUTTON_NO_FALLBACK = "\N{CROSS MARK}"
 
-# Feedback on an AI answer. `resolved` is only the model's own claim that it
-# helped; these are the sole independent signal about whether it actually did.
-FEEDBACK_UP_ID = "vlg-feedback-up"
-FEEDBACK_DOWN_ID = "vlg-feedback-down"
-FEEDBACK_THANKS = "Thanks for the feedback! \N{SMILING FACE WITH SMILING EYES}"
-
 # Author-row icon. None means "use the bot's own avatar", which follows the
 # Developer Portal without a redeploy and is the normal case.
 #
@@ -510,32 +504,6 @@ reply is already conversational.
 """
 
 
-class FeedbackButton(discord.ui.Button):
-    """One half of the rating on an AI answer."""
-
-    def __init__(self, cog: "NorwegianSupport", custom_id: str, emoji: str, rating: str):
-        super().__init__(style=discord.ButtonStyle.gray, emoji=emoji, custom_id=custom_id)
-        self.cog = cog
-        self.rating = rating
-
-    async def callback(self, interaction: discord.Interaction):
-        await self.cog.record_feedback(interaction, self.rating)
-
-
-class FeedbackView(discord.ui.View):
-    """Persistent, because an answer sent overnight must still be ratable.
-
-    A timed-out view stops responding, and a bot restart drops in-memory views
-    entirely, so this uses timeout=None with fixed custom_ids and is registered
-    with bot.add_view() at load.
-    """
-
-    def __init__(self, cog: "NorwegianSupport"):
-        super().__init__(timeout=None)
-        self.add_item(FeedbackButton(cog, FEEDBACK_UP_ID, "\N{THUMBS UP SIGN}", "up"))
-        self.add_item(FeedbackButton(cog, FEEDBACK_DOWN_ID, "\N{THUMBS DOWN SIGN}", "down"))
-
-
 class YesNoView(discord.ui.View):
     """Yes/no view for the handoff confirmation.
 
@@ -564,7 +532,6 @@ class NorwegianSupport(commands.Cog):
         self._groq_client = None
         self._user_salt: typing.Optional[str] = None
         self._verbose = False
-        self._feedback_view: typing.Optional["FeedbackView"] = None
         # user_id -> summary, handed to on_thread_ready once the channel exists.
         self._pending_handoff: typing.Dict[int, str] = {}
 
@@ -576,9 +543,6 @@ class NorwegianSupport(commands.Cog):
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
-        # Persistent, so answers stay ratable across restarts.
-        self._feedback_view = FeedbackView(self)
-        self.bot.add_view(self._feedback_view)
         self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
@@ -603,16 +567,6 @@ class NorwegianSupport(commands.Cog):
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
         self.maintenance_sweep.cancel()
-
-        # Otherwise a reload leaves the previous view registered against a dead
-        # cog, and an unload leaves buttons that still answer to nothing. There
-        # is no public API for this, so it is best-effort.
-        if self._feedback_view is not None:
-            try:
-                self.bot._connection._view_store.remove_view(self._feedback_view)
-            except Exception:
-                logger.debug("Could not unregister the feedback view.", exc_info=True)
-            self._feedback_view = None
 
     @tasks.loop(minutes=SWEEP_INTERVAL_MINUTES)
     async def maintenance_sweep(self) -> None:
@@ -912,6 +866,26 @@ class NorwegianSupport(commands.Cog):
             await asyncio.sleep(TYPING_DELAY_SECONDS)
         return await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
 
+    async def _send_buttons(self, channel, view: discord.ui.View):
+        """Send a message carrying only the buttons. None if it could not go out.
+
+        Discord has historically refused a message with components and no
+        content or embed, and I could not verify which way this account's API
+        behaves from here, so an empty send falls back to a zero-width space
+        rather than losing the buttons. The space renders as nothing.
+        """
+        async with safe_typing(channel):
+            await asyncio.sleep(TYPING_DELAY_SECONDS)
+        try:
+            return await channel.send(view=view)
+        except discord.HTTPException:
+            logger.debug("Components-only message refused; retrying with a spacer.", exc_info=True)
+        try:
+            return await channel.send(content="​", view=view)
+        except discord.HTTPException:
+            logger.debug("Buttons could not be sent at all.", exc_info=True)
+            return None
+
     async def _send_conversation_opening(self, channel) -> None:
         """Disclosure then greeting, at the start of every conversation.
 
@@ -974,34 +948,36 @@ class NorwegianSupport(commands.Cog):
         view.add_item(AcceptButton("nas-handoff-yes", BUTTON_YES_EMOJI))
         view.add_item(DenyButton("nas-handoff-no", BUTTON_NO_EMOJI))
 
+        # The statement and the buttons are two separate messages.
         try:
-            prompt = await self._send_with_typing(
-                message.channel, self._plain_embed(HANDOFF_CONFIRM_TEXT), view=view
-            )
+            await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_CONFIRM_TEXT))
         except discord.HTTPException:
-            # Overwhelmingly the guild emoji: Discord 400s a component carrying
-            # one the bot cannot use, and that fails the entire message, so the
-            # user would silently get no prompt. Retry with plain unicode rather
-            # than escalating over a decoration.
+            logger.error("Could not tell %s the assistant is stuck; escalating.", user, exc_info=True)
+            return False
+
+        prompt = await self._send_buttons(message.channel, view)
+
+        if prompt is None:
+            # Overwhelmingly the guild emoji: Discord rejects a component
+            # carrying one the bot cannot use, and that fails the whole message,
+            # so the user would silently get no buttons at all. Retry with plain
+            # unicode rather than escalating over a decoration.
             logger.error(
-                "Handoff prompt rejected for %s, retrying without the guild emoji "
-                "(%s / %s). Check `%svlg status`.",
+                "Handoff buttons rejected for %s, retrying with unicode instead of %s / %s. "
+                "Check `%svlg status`.",
                 user,
                 BUTTON_YES_EMOJI,
                 BUTTON_NO_EMOJI,
                 self.bot.prefix,
-                exc_info=True,
             )
             view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
             view.add_item(AcceptButton("nas-handoff-yes", BUTTON_YES_FALLBACK))
             view.add_item(DenyButton("nas-handoff-no", BUTTON_NO_FALLBACK))
-            try:
-                prompt = await self._send_with_typing(
-                    message.channel, self._plain_embed(HANDOFF_CONFIRM_TEXT), view=view
-                )
-            except discord.HTTPException:
-                logger.error("Could not ask %s about handoff at all; escalating.", user, exc_info=True)
-                return False
+            prompt = await self._send_buttons(message.channel, view)
+
+        if prompt is None:
+            logger.error("Could not send handoff buttons to %s at all; escalating.", user)
+            return False
 
         await view.wait()
 
@@ -1066,7 +1042,9 @@ class NorwegianSupport(commands.Cog):
         now = datetime.now(timezone.utc)
         entries = [{"role": "user", "content": user_text, "at": now}]
         if assistant_text is not None:
-            entries.append({"role": "assistant", "content": assistant_text, "at": now})
+            # `resolved` is kept per turn as well as on the document, because the
+            # replay has to rebuild the exact json this turn was produced as.
+            entries.append({"role": "assistant", "content": assistant_text, "at": now, "resolved": resolved})
 
         await self.db.update_one(
             self._open_filter(await self._user_hash(user_id)),
@@ -1106,55 +1084,6 @@ class NorwegianSupport(commands.Cog):
             {"$set": {"handoff_reason": reason}},
         )
 
-    async def _record_answer_message(self, user_id: int, message_id: int) -> None:
-        """Remember which messages carry a rating, so a click can find them.
-
-        The button click knows only the message it is attached to, so the id is
-        stored on the transcript rather than encoded in the custom_id. That
-        keeps the buttons static, which is what lets the view be persistent.
-        """
-        await self.db.update_one(
-            self._open_filter(await self._user_hash(user_id)),
-            {"$push": {"answer_message_ids": message_id}},
-        )
-
-    async def record_feedback(self, interaction: discord.Interaction, rating: str) -> None:
-        """Store a thumbs up/down against the answer it was given on."""
-        message_id = interaction.message.id if interaction.message else None
-
-        transcript = None
-        if message_id is not None:
-            transcript = await self.db.find_one({"_type": TYPE_TRANSCRIPT, "answer_message_ids": message_id})
-
-        if transcript is None:
-            # The transcript expired out from under the buttons. Acknowledge
-            # rather than leaving the click hanging.
-            logger.info("Feedback %r on message %s had no transcript.", rating, message_id)
-            with contextlib.suppress(discord.HTTPException):
-                await interaction.response.edit_message(view=None)
-            return
-
-        now = datetime.now(timezone.utc)
-        # Pull first, so changing your mind replaces the rating rather than
-        # stacking a second one for the same answer.
-        await self.db.update_one(
-            {"_id": transcript["_id"]},
-            {"$pull": {"feedback": {"message_id": message_id}}},
-        )
-        await self.db.update_one(
-            {"_id": transcript["_id"]},
-            {"$push": {"feedback": {"message_id": message_id, "rating": rating, "at": now}}},
-        )
-
-        logger.info("Feedback %r recorded on message %s.", rating, message_id)
-
-        try:
-            # Removing the view also stops repeat votes on the same answer.
-            await interaction.response.edit_message(view=None)
-            await interaction.followup.send(FEEDBACK_THANKS, ephemeral=True)
-        except discord.HTTPException:
-            logger.debug("Could not acknowledge feedback.", exc_info=True)
-
     async def _close_transcript(self, user_id: int, *, handed_off: bool) -> None:
         """End the pre-screen conversation.
 
@@ -1173,14 +1102,50 @@ class NorwegianSupport(commands.Cog):
         await self.db.update_one(self._open_filter(await self._user_hash(user_id)), {"$set": changes})
         await self.db.delete_one({"_type": TYPE_SESSION, "user_id": user_id})
 
+    @staticmethod
+    def _replay(history: list) -> list:
+        """Turn stored transcript entries back into a well-formed exchange.
+
+        Two things have to be repaired, and both only ever affected the live
+        path, which is why a dry run with no history answered better than a real
+        conversation did.
+
+        The assistant is required to emit a json object, but its replies are
+        stored as the plain text inside them. Replaying that bare text shows the
+        model its own previous turns breaking the output contract it is being
+        held to, which degrades both format and answer quality on every turn
+        after the first. Assistant turns are therefore rebuilt into the shape
+        they were originally produced in.
+
+        A user turn is also appended on paths where no answer follows: a
+        contentless hello, an escalation phrase, a Groq failure. Left in, those
+        stack consecutive user messages with no assistant turn between them.
+        Unanswered user turns are dropped from the replay for that reason; they
+        remain in the transcript for summaries and stats.
+        """
+        turns = []
+        for entry in history:
+            role, content = entry.get("role"), entry.get("content")
+            if role not in ("user", "assistant") or not content:
+                continue
+            if role == "assistant":
+                content = json.dumps({"resolved": bool(entry.get("resolved", True)), "reply": content})
+            turns.append({"role": role, "content": content})
+
+        paired = []
+        for index, turn in enumerate(turns):
+            if turn["role"] == "user":
+                following = turns[index + 1] if index + 1 < len(turns) else None
+                if following is None or following["role"] != "assistant":
+                    continue
+            paired.append(turn)
+
+        return paired[-AI_HISTORY_LIMIT:]
+
     async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[bool, str, str]:
         """Ask Groq to answer or defer. Raises on any failure."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for entry in history[-AI_HISTORY_LIMIT:]:
-            role = entry.get("role")
-            content = entry.get("content")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+        messages.extend(self._replay(history))
         messages.append({"role": "user", "content": user_text})
 
         completion = await self._groq().chat.completions.create(
@@ -1297,11 +1262,7 @@ class NorwegianSupport(commands.Cog):
 
         try:
             for reply in replies:
-                answer = await self._send_with_typing(
-                    message.channel, self._ai_embed(reply), view=FeedbackView(self)
-                )
-                if answer is not None:
-                    await self._record_answer_message(user.id, answer.id)
+                await self._send_with_typing(message.channel, self._ai_embed(reply))
         except discord.HTTPException:
             logger.error("Failed delivering AI reply to %s; handing off.", user, exc_info=True)
             return False
@@ -1621,15 +1582,6 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
 
-        registered = any(isinstance(v, FeedbackView) for v in getattr(self.bot, "persistent_views", []) or [])
-        embed.add_field(
-            name="Feedback buttons",
-            value=(
-                ("registered" if registered else "**not registered**")
-                + " — only appear on answers sent after this feature shipped, never on older ones"
-            ),
-            inline=False,
-        )
         embed.add_field(
             name="Verbose diagnostics",
             value=(
@@ -1795,14 +1747,6 @@ class NorwegianSupport(commands.Cog):
         deferral_rate = (len(deferred) / len(finished) * 100) if finished else 0.0
         handoff_rate = (len(handed_off) / len(finished) * 100) if finished else 0.0
 
-        up = down = 0
-        for t in transcripts:
-            for entry in t.get("feedback") or []:
-                if entry.get("rating") == "up":
-                    up += 1
-                elif entry.get("rating") == "down":
-                    down += 1
-
         embed = self._embed(
             title="Vueling AI — stats",
             description=(
@@ -1836,16 +1780,6 @@ class NorwegianSupport(commands.Cog):
                 ),
                 inline=False,
             )
-
-        embed.add_field(
-            name="Answer feedback",
-            value=(
-                f"\N{THUMBS UP SIGN} {up}  \N{THUMBS DOWN SIGN} {down}"
-                + (f"  ({up / (up + down) * 100:.0f}% positive)" if up + down else "  (none yet)")
-                + "\n*The only check on the assistant's own claim that it helped.*"
-            ),
-            inline=False,
-        )
 
         questions = [self._last_user_message(t) for t in deferred]
         questions = [q for q in questions if q]

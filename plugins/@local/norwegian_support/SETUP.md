@@ -297,21 +297,26 @@ than guessed at.
 This prints user questions verbatim to whatever channel it is run in, so it is
 Supporter-gated, same exposure as reading a ticket.
 
-### Answer feedback
+### Conversation history
 
-Every model-generated answer carries 👍/👎. Ratings are stored on the transcript
-as `feedback: [{message_id, rating, at}]`, keyed to the specific answer they were
-given on, so one conversation can hold different ratings for different replies.
-Re-voting replaces rather than stacks.
+The live gate replays the transcript into every Groq call; `.vlg ask` passes an
+empty history. That was the *only* difference between them, and it made real
+conversations answer worse than dry runs after the first turn:
 
-This is the only independent signal about answer quality. `resolved` is the
-model's own claim that it helped, which nothing else verifies — a satisfied user
-and one who gave up look identical without this.
+- The model must emit `{resolved, reply}`, but replies were stored as the plain
+  text inside that object and replayed as bare prose. The model saw its own
+  previous turns breaking the contract it was being held to.
+- A user turn is appended on paths where no answer follows — a contentless
+  hello, an escalation phrase, a Groq failure — which stacked consecutive user
+  messages with no assistant turn between them.
 
-The view is **persistent** (`timeout=None`, fixed custom_ids, registered with
-`bot.add_view()` at load), because an answer sent overnight has to still be
-ratable in the morning and across restarts. Buttons only ever appear on model
-answers, never on the disclosure, greeting or closing copy.
+`_replay()` rebuilds assistant turns into their original json shape and drops
+unanswered user turns, so the exchange the model sees strictly alternates and
+every assistant turn is valid against the schema. The dropped turns stay in the
+transcript for summaries and stats; only the replay is filtered.
+
+A test asserts a first live message produces a byte-identical payload to
+`.vlg ask`, so the two cannot silently diverge again.
 
 ### Ending a conversation
 
