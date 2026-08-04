@@ -30,10 +30,11 @@ and ticket log retention must not read `Never`.
 | `?nas forget @user` | Supporter | Delete a user's stored assistant conversations |
 | `?nas ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
 
-`?nas forget` is the only way to action an erasure request that arrives via the
-data protection page linked in the opening disclosure. There is no consent to
-withdraw any more, but the transcripts still exist until their 7 day expiry, and
-nothing else deletes them on request. `?nas revoke` still works as an alias.
+`?nas forget` is the only way to action an erasure request. There is no consent
+to withdraw any more, and the disclosure now links only to the privacy policy, so
+requests will arrive by whatever route that page describes — but the transcripts
+still exist until their 7 day expiry and nothing else deletes them on request.
+`?nas revoke` still works as an alias.
 
 ## Required config
 
@@ -202,14 +203,14 @@ greeting: the data-processing notice and the AI-tool notice (`DISCLOSURE_PARTS`)
 Nothing waits for input and nothing is stored per user.
 
 It repeats on **every** new conversation rather than being shown once, on the
-same open/closed boundary as the greeting — a conversation ends when a human
-takes over and `handed_off_at` is stamped.
+same open/closed boundary as the greeting. See *Ending a conversation* below for
+the three ways one ends.
 
 There is deliberately no accept/decline step. The disclosure states that
 processing rests on the contractual relationship, not on consent, so there is no
-decision to capture and nothing to look up or withdraw. Someone who wants to act
-on their data uses the linked data protection page; staff action it with
-`?nas forget`.
+decision to capture and nothing to look up or withdraw. Data rights are exercised
+through the linked privacy policy rather than in chat; staff action an erasure
+with `?nas forget`.
 
 Documents written by the removed consent gate are not deleted automatically.
 `?nas status` counts them under *obsolete consent records* if any remain, and
