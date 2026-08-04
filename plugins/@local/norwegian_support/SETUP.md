@@ -15,7 +15,7 @@ Reload after editing during development:
 Verify wiring, storage and config with:
 
 ```
-?nas status
+.vlg status
 ```
 
 The DM hook must read `installed`, `confirm_thread_creation` must read `off`,
@@ -25,16 +25,18 @@ and ticket log retention must not read `Never`.
 
 | Command | Permission | Purpose |
 |---|---|---|
-| `?nas status` | Administrator | Wiring, storage counts, config sanity |
-| `?nas verbose` | Administrator | Log why the AI deferred (see below) |
-| `?nas forget @user` | Supporter | Delete a user's stored assistant conversations |
-| `?nas ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
+| `.vlg status` | Administrator | Wiring, storage counts, config sanity |
+| `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
+| `.vlg forget @user` | Supporter | Delete a user's stored assistant conversations |
+| `.vlg ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
 
-`?nas forget` is the only way to action an erasure request. There is no consent
+The group is `.vlg` (`?nas` still works as an alias, so nothing breaks mid-rollout).
+
+`.vlg forget` is the only way to action an erasure request. There is no consent
 to withdraw any more, and the disclosure now links only to the privacy policy, so
 requests will arrive by whatever route that page describes — but the transcripts
 still exist until their 7 day expiry and nothing else deletes them on request.
-`?nas revoke` still works as an alias.
+`.vlg revoke` still works as an alias.
 
 ## Required config
 
@@ -83,7 +85,7 @@ setting.**
 during its first run if `log_expiration` is unset, and never restarts within
 that process — so setting this on a running bot has no effect until a restart.
 
-Confirm it took with `?nas status`, which reports the effective retention.
+Confirm it took with `.vlg status`, which reports the effective retention.
 
 ### DM receipt emoji
 
@@ -127,7 +129,7 @@ GROQ_API_KEY=gsk_...
 ```
 
 `core/config.py` calls `load_dotenv()` at import, so `.env` is enough — no
-export needed. `?nas status` reports whether the key and the `groq` package are
+export needed. `.vlg status` reports whether the key and the `groq` package are
 both present. Without either, every request simply escalates to a human; nothing
 breaks.
 
@@ -201,7 +203,7 @@ needs a full restart and turns on discord.py's own debug firehose too. To avoid
 both:
 
 ```
-?nas verbose on
+.vlg verbose on
 ```
 
 That promotes only these two lines to INFO, takes effect immediately, and
@@ -212,7 +214,7 @@ by the privacy notice but the log is not on the 7-day deletion path, so turn it
 off once you are done:
 
 ```
-?nas verbose off
+.vlg verbose off
 ```
 
 ### The opening disclosure
@@ -229,15 +231,31 @@ There is deliberately no accept/decline step. The disclosure states that
 processing rests on the contractual relationship, not on consent, so there is no
 decision to capture and nothing to look up or withdraw. Data rights are exercised
 through the linked privacy policy rather than in chat; staff action an erasure
-with `?nas forget`.
+with `.vlg forget`.
 
 Documents written by the removed consent gate are not deleted automatically.
-`?nas status` counts them under *obsolete consent records* if any remain, and
-`?nas forget` clears them per user. To drop them all at once:
+`.vlg status` counts them under *obsolete consent records* if any remain, and
+`.vlg forget` clears them per user. To drop them all at once:
 
 ```js
 db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
 ```
+
+### Answer feedback
+
+Every model-generated answer carries 👍/👎. Ratings are stored on the transcript
+as `feedback: [{message_id, rating, at}]`, keyed to the specific answer they were
+given on, so one conversation can hold different ratings for different replies.
+Re-voting replaces rather than stacks.
+
+This is the only independent signal about answer quality. `resolved` is the
+model's own claim that it helped, which nothing else verifies — a satisfied user
+and one who gave up look identical without this.
+
+The view is **persistent** (`timeout=None`, fixed custom_ids, registered with
+`bot.add_view()` at load), because an answer sent overnight has to still be
+ratable in the morning and across restarts. Buttons only ever appear on model
+answers, never on the disclosure, greeting or closing copy.
 
 ### Ending a conversation
 
@@ -348,7 +366,7 @@ re-greet; it lapses naturally when the transcript expires after 7 days.
 Three surfaces say Vueling by explicit instruction: the greeting, the embed
 title (`Vueling AI`), and the caveat footer. Everything else is deliberately
 untouched pending the full rebrand pass — bot identity, the repo name, the
-`?nas` command group, and the `NorwegianSupport` cog class (whose name *is* the
+`.vlg` command group, and the `NorwegianSupport` cog class (whose name *is* the
 partition name, so renaming it orphans every stored document).
 
 Ticket references are now `VLG-XXXXXX`. The stored field is still called
@@ -365,14 +383,14 @@ old consent, as it does for any renewal.
 does nothing on its own — re-run the `?config set` on the live bot.
 
 Also still Norwegian Air Shuttle, but internal only and left for the rebrand
-pass: the module docstring, the `?nas` command group help text, the
+pass: the module docstring, the `.vlg` command group help text, the
 `norwegian_support` plugin/folder name, and the `NorwegianSupport` cog class
 (whose name is the storage partition, so it needs a data migration).
 
 ### Embed icon
 
 The author-row icon comes from `bot.user.display_avatar`, so it follows the
-Developer Portal without a redeploy. `?nas status` prints the URL it resolves to.
+Developer Portal without a redeploy. `.vlg status` prints the URL it resolves to.
 
 If it is not the logo you expect, check *which* Portal image you set: **App Icon**
 on General Information and **Bot avatar** on the Bot tab are separate images, and

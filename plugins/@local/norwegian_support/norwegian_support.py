@@ -13,6 +13,7 @@ marked seam.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -137,7 +138,7 @@ TYPE_META = "meta"
 TYPE_SESSION = "session"
 
 # No longer written. Documents from the removed consent gate may still exist;
-# `?nas forget` clears them alongside a user's transcripts.
+# `.vlg forget` clears them alongside a user's transcripts.
 TYPE_LEGACY_CONSENT = "consent"
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -158,6 +159,12 @@ AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
 # Handoff confirmation buttons: guild emoji, no label.
 BUTTON_YES_EMOJI = "<:yes:1533908794684473354>"
 BUTTON_NO_EMOJI = "<:no:1533908791245017198>"
+
+# Feedback on an AI answer. `resolved` is only the model's own claim that it
+# helped; these are the sole independent signal about whether it actually did.
+FEEDBACK_UP_ID = "vlg-feedback-up"
+FEEDBACK_DOWN_ID = "vlg-feedback-down"
+FEEDBACK_THANKS = "Thanks for the feedback! \N{SMILING FACE WITH SMILING EYES}"
 
 # Author-row icon. None means "use the bot's own avatar", which follows the
 # Developer Portal without a redeploy and is the normal case.
@@ -403,6 +410,32 @@ reply is already conversational.
 """
 
 
+class FeedbackButton(discord.ui.Button):
+    """One half of the rating on an AI answer."""
+
+    def __init__(self, cog: "NorwegianSupport", custom_id: str, emoji: str, rating: str):
+        super().__init__(style=discord.ButtonStyle.gray, emoji=emoji, custom_id=custom_id)
+        self.cog = cog
+        self.rating = rating
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.cog.record_feedback(interaction, self.rating)
+
+
+class FeedbackView(discord.ui.View):
+    """Persistent, because an answer sent overnight must still be ratable.
+
+    A timed-out view stops responding, and a bot restart drops in-memory views
+    entirely, so this uses timeout=None with fixed custom_ids and is registered
+    with bot.add_view() at load.
+    """
+
+    def __init__(self, cog: "NorwegianSupport"):
+        super().__init__(timeout=None)
+        self.add_item(FeedbackButton(cog, FEEDBACK_UP_ID, "\N{THUMBS UP SIGN}", "up"))
+        self.add_item(FeedbackButton(cog, FEEDBACK_DOWN_ID, "\N{THUMBS DOWN SIGN}", "down"))
+
+
 class YesNoView(discord.ui.View):
     """Yes/no view for the handoff confirmation.
 
@@ -442,6 +475,8 @@ class NorwegianSupport(commands.Cog):
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
+        # Persistent, so answers stay ratable across restarts.
+        self.bot.add_view(FeedbackView(self))
         self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
@@ -460,7 +495,7 @@ class NorwegianSupport(commands.Cog):
         self._verbose = bool(doc and doc.get("value"))
         if self._verbose:
             logger.info(
-                "Verbose diagnostics are ON (restored). Turn off with %snas verbose off.", self.bot.prefix
+                "Verbose diagnostics are ON (restored). Turn off with %svlg verbose off.", self.bot.prefix
             )
 
     async def cog_unload(self) -> None:
@@ -862,7 +897,7 @@ class NorwegianSupport(commands.Cog):
         return None
 
     def _diag(self, msg: str, *args) -> None:
-        """Diagnostic line: debug normally, info while `?nas verbose` is on.
+        """Diagnostic line: debug normally, info while `.vlg verbose` is on.
 
         Modmail applies log_level once at startup, so turning on global debug
         needs a restart and brings discord.py's own debug noise with it. The
@@ -925,6 +960,55 @@ class NorwegianSupport(commands.Cog):
             },
             upsert=True,
         )
+
+    async def _record_answer_message(self, user_id: int, message_id: int) -> None:
+        """Remember which messages carry a rating, so a click can find them.
+
+        The button click knows only the message it is attached to, so the id is
+        stored on the transcript rather than encoded in the custom_id. That
+        keeps the buttons static, which is what lets the view be persistent.
+        """
+        await self.db.update_one(
+            self._open_filter(await self._user_hash(user_id)),
+            {"$push": {"answer_message_ids": message_id}},
+        )
+
+    async def record_feedback(self, interaction: discord.Interaction, rating: str) -> None:
+        """Store a thumbs up/down against the answer it was given on."""
+        message_id = interaction.message.id if interaction.message else None
+
+        transcript = None
+        if message_id is not None:
+            transcript = await self.db.find_one({"_type": TYPE_TRANSCRIPT, "answer_message_ids": message_id})
+
+        if transcript is None:
+            # The transcript expired out from under the buttons. Acknowledge
+            # rather than leaving the click hanging.
+            logger.info("Feedback %r on message %s had no transcript.", rating, message_id)
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.edit_message(view=None)
+            return
+
+        now = datetime.now(timezone.utc)
+        # Pull first, so changing your mind replaces the rating rather than
+        # stacking a second one for the same answer.
+        await self.db.update_one(
+            {"_id": transcript["_id"]},
+            {"$pull": {"feedback": {"message_id": message_id}}},
+        )
+        await self.db.update_one(
+            {"_id": transcript["_id"]},
+            {"$push": {"feedback": {"message_id": message_id, "rating": rating, "at": now}}},
+        )
+
+        logger.info("Feedback %r recorded on message %s.", rating, message_id)
+
+        try:
+            # Removing the view also stops repeat votes on the same answer.
+            await interaction.response.edit_message(view=None)
+            await interaction.followup.send(FEEDBACK_THANKS, ephemeral=True)
+        except discord.HTTPException:
+            logger.debug("Could not acknowledge feedback.", exc_info=True)
 
     async def _close_transcript(self, user_id: int, *, handed_off: bool) -> None:
         """End the pre-screen conversation.
@@ -1064,7 +1148,11 @@ class NorwegianSupport(commands.Cog):
 
         try:
             for reply in replies:
-                await self._send_with_typing(message.channel, self._ai_embed(reply))
+                answer = await self._send_with_typing(
+                    message.channel, self._ai_embed(reply), view=FeedbackView(self)
+                )
+                if answer is not None:
+                    await self._record_answer_message(user.id, answer.id)
         except discord.HTTPException:
             logger.error("Failed delivering AI reply to %s; handing off.", user, exc_info=True)
             return False
@@ -1292,15 +1380,15 @@ class NorwegianSupport(commands.Cog):
     # Diagnostics
     # ------------------------------------------------------------------
 
-    @commands.group(name="nas", invoke_without_command=True)
+    @commands.group(name="vlg", aliases=["nas"], invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def nas(self, ctx):
-        """Norwegian Air Shuttle support plugin."""
+    async def vlg(self, ctx):
+        """Vueling support plugin."""
         await ctx.send_help(ctx.command)
 
-    @nas.command(name="status")
+    @vlg.command(name="status")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def nas_status(self, ctx):
+    async def vlg_status(self, ctx):
         """Show plugin wiring, storage and config state."""
         hooked = getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False)
 
@@ -1319,7 +1407,7 @@ class NorwegianSupport(commands.Cog):
         except Exception as e:
             storage = f"unreachable: `{e}`"
 
-        embed = self._embed(title="Norwegian support — status")
+        embed = self._embed(title="Vueling support — status")
         embed.add_field(
             name="DM hook",
             value="installed" if hooked else "**not installed**",
@@ -1394,9 +1482,9 @@ class NorwegianSupport(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @nas.command(name="verbose")
+    @vlg.command(name="verbose")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def nas_verbose(self, ctx, enabled: bool = None):
+    async def vlg_verbose(self, ctx, enabled: bool = None):
         """Promote this plugin's diagnostics to INFO without a bot restart.
 
         Logs the message that caused a defer and Groq's verbatim response.
@@ -1421,7 +1509,7 @@ class NorwegianSupport(commands.Cog):
                 "the log — if you cannot see it, the log level itself is the "
                 "problem, not this toggle.\n\nThis writes ticket message content "
                 "to the bot log, which is not on the 7-day deletion path. Turn it "
-                f"off with `{self.bot.prefix}nas verbose off` once you are done."
+                f"off with `{self.bot.prefix}vlg verbose off` once you are done."
             )
         else:
             logger.info("Verbose diagnostics disabled by %s.", ctx.author)
@@ -1436,9 +1524,9 @@ class NorwegianSupport(commands.Cog):
             )
         )
 
-    @nas.command(name="forget", aliases=["revoke"])
+    @vlg.command(name="forget", aliases=["revoke"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def nas_forget(self, ctx, user: discord.User):
+    async def vlg_forget(self, ctx, user: discord.User):
         """Delete a user's stored assistant conversations.
 
         For acting on an erasure request from the data protection page. There is
@@ -1470,9 +1558,9 @@ class NorwegianSupport(commands.Cog):
         await ctx.send(embed=self._embed(description=note))
         logger.info("Erased stored data for %s (%s) at the request of %s.", user, user.id, ctx.author)
 
-    @nas.command(name="ticket")
+    @vlg.command(name="ticket")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def nas_ticket(self, ctx, reference: str):
+    async def vlg_ticket(self, ctx, reference: str):
         """Look up a VLG-XXXXXX reference and its Modmail log."""
         doc = await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference.upper()})
         if doc is None:
