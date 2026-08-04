@@ -30,7 +30,7 @@ from pymongo import ReturnDocument
 
 from core import checks
 from core.models import DMDisabled, PermissionLevel, getLogger
-from core.utils import AcceptButton, DenyButton, safe_typing
+from core.utils import AcceptButton, DenyButton, safe_typing, truncate
 
 try:
     from groq import AsyncGroq
@@ -159,6 +159,100 @@ AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
 # Handoff confirmation buttons: guild emoji, no label.
 BUTTON_YES_EMOJI = "<:yes:1533908794684473354>"
 BUTTON_NO_EMOJI = "<:no:1533908791245017198>"
+
+# Why a conversation reached a human. Only AI_DEFERRED means the assistant
+# understood the question and could not answer it, which is the number worth
+# watching; the others are the user's choice or an outage.
+HANDOFF_AI_DEFERRED = "ai_deferred"
+HANDOFF_ASKED_FOR_HUMAN = "asked_for_human"
+HANDOFF_AI_UNAVAILABLE = "ai_unavailable"
+HANDOFF_AI_ERROR = "ai_error"
+
+HANDOFF_REASON_LABELS = {
+    HANDOFF_AI_DEFERRED: "assistant could not answer",
+    HANDOFF_ASKED_FOR_HUMAN: "user asked for a human",
+    HANDOFF_AI_UNAVAILABLE: "assistant not configured",
+    HANDOFF_AI_ERROR: "Groq call failed",
+}
+
+# Stripped before ranking terms in deferred questions. Topic words are what
+# tell you which FAQ entry to write; these never do.
+STATS_STOPWORDS = {
+    "a",
+    "about",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "get",
+    "got",
+    "had",
+    "has",
+    "have",
+    "help",
+    "hi",
+    "hello",
+    "how",
+    "i",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "just",
+    "know",
+    "like",
+    "me",
+    "my",
+    "need",
+    "not",
+    "of",
+    "on",
+    "one",
+    "or",
+    "please",
+    "so",
+    "some",
+    "thanks",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "they",
+    "this",
+    "to",
+    "up",
+    "want",
+    "was",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+}
 
 # Feedback on an AI answer. `resolved` is only the model's own claim that it
 # helped; these are the sole independent signal about whether it actually did.
@@ -961,6 +1055,18 @@ class NorwegianSupport(commands.Cog):
             upsert=True,
         )
 
+    async def _mark_handoff_reason(self, user_id: int, reason: str) -> None:
+        """Record why a conversation is about to reach a human.
+
+        Without this every handoff looks identical in storage, and a deferral
+        rate would silently fold in people who asked for an agent outright and
+        conversations that only escalated because Groq was unreachable.
+        """
+        await self.db.update_one(
+            self._open_filter(await self._user_hash(user_id)),
+            {"$set": {"handoff_reason": reason}},
+        )
+
     async def _record_answer_message(self, user_id: int, message_id: int) -> None:
         """Remember which messages carry a rating, so a click can find them.
 
@@ -1114,6 +1220,7 @@ class NorwegianSupport(commands.Cog):
         if matched:
             logger.info("Escalation phrase %r from %s (%s).", matched, user, user.id)
             await self._append_transcript(user.id, content, resolved=False)
+            await self._mark_handoff_reason(user.id, HANDOFF_ASKED_FOR_HUMAN)
             return await self._confirm_handoff(message)
 
         # Technical failures below skip the confirmation and hand off directly.
@@ -1121,6 +1228,7 @@ class NorwegianSupport(commands.Cog):
         # the user through the same failure on every message.
         if self._groq() is None:
             await self._append_transcript(user.id, content, resolved=False)
+            await self._mark_handoff_reason(user.id, HANDOFF_AI_UNAVAILABLE)
             return False
 
         history = (transcript or {}).get("messages", [])
@@ -1134,6 +1242,7 @@ class NorwegianSupport(commands.Cog):
         except Exception:
             logger.error("Groq pre-screen failed for %s (%s); handing off.", user, user.id, exc_info=True)
             await self._append_transcript(user.id, content, resolved=False)
+            await self._mark_handoff_reason(user.id, HANDOFF_AI_ERROR)
             return False
 
         await self._append_transcript(user.id, content, "\n\n".join(replies), resolved)
@@ -1144,6 +1253,7 @@ class NorwegianSupport(commands.Cog):
             # that prompted it and the model's verbatim answer go out together.
             self._diag("Deferred message from %s (%s) was: %r", user, user.id, content)
             self._diag("Groq raw response for %s (%s): %s", user, user.id, raw)
+            await self._mark_handoff_reason(user.id, HANDOFF_AI_DEFERRED)
             return await self._confirm_handoff(message)
 
         try:
@@ -1481,6 +1591,149 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
         await ctx.send(embed=embed)
+
+    @vlg.command(name="stats")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def vlg_stats(self, ctx):
+        """How the assistant is doing, and what it keeps failing to answer."""
+        try:
+            transcripts = await self.db.find({"_type": TYPE_TRANSCRIPT}).to_list(length=2000)
+        except Exception as e:
+            return await ctx.send(
+                embed=self._embed(
+                    description=f"Could not read transcripts: `{e}`", color=self.bot.error_color
+                )
+            )
+
+        if not transcripts:
+            return await ctx.send(
+                embed=self._embed(
+                    title="Vueling AI — stats",
+                    description=(
+                        "No conversations on record yet.\n\nTranscripts are deleted after "
+                        f"{TRANSCRIPT_RETENTION_DAYS} days, so this is always a rolling window."
+                    ),
+                )
+            )
+
+        total = len(transcripts)
+        still_open = sum(1 for t in transcripts if t.get("closed_at") is None)
+        handed_off = [t for t in transcripts if t.get("handed_off_at") is not None]
+        finished = [t for t in transcripts if t.get("closed_at") is not None]
+
+        # Only genuine deferrals belong in the headline rate. A user typing
+        # "agent" is a routing preference, not a failure to answer.
+        deferred = [t for t in handed_off if t.get("handoff_reason") == HANDOFF_AI_DEFERRED]
+        deferral_rate = (len(deferred) / len(finished) * 100) if finished else 0.0
+        handoff_rate = (len(handed_off) / len(finished) * 100) if finished else 0.0
+
+        up = down = 0
+        for t in transcripts:
+            for entry in t.get("feedback") or []:
+                if entry.get("rating") == "up":
+                    up += 1
+                elif entry.get("rating") == "down":
+                    down += 1
+
+        embed = self._embed(
+            title="Vueling AI — stats",
+            description=(
+                f"**{total}** conversation(s) on record, **{still_open}** still open.\n"
+                f"Transcripts are deleted after {TRANSCRIPT_RETENTION_DAYS} days, so this is "
+                "a rolling window, not all time."
+            ),
+        )
+        embed.add_field(
+            name="Reached a human",
+            value=(
+                f"**{handoff_rate:.0f}%** of finished conversations ({len(handed_off)}/{len(finished)})\n"
+                f"of which **{deferral_rate:.0f}%** were the assistant genuinely unable to answer"
+                if finished
+                else "no finished conversations yet"
+            ),
+            inline=False,
+        )
+
+        reasons = {}
+        for t in handed_off:
+            reasons[t.get("handoff_reason") or "unrecorded"] = (
+                reasons.get(t.get("handoff_reason") or "unrecorded", 0) + 1
+            )
+        if reasons:
+            embed.add_field(
+                name="Why it handed off",
+                value="\n".join(
+                    f"`{count}` {HANDOFF_REASON_LABELS.get(reason, reason)}"
+                    for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1])
+                ),
+                inline=False,
+            )
+
+        embed.add_field(
+            name="Answer feedback",
+            value=(
+                f"\N{THUMBS UP SIGN} {up}  \N{THUMBS DOWN SIGN} {down}"
+                + (f"  ({up / (up + down) * 100:.0f}% positive)" if up + down else "  (none yet)")
+                + "\n*The only check on the assistant's own claim that it helped.*"
+            ),
+            inline=False,
+        )
+
+        questions = [self._last_user_message(t) for t in deferred]
+        questions = [q for q in questions if q]
+
+        if questions:
+            repeats = {}
+            for q in questions:
+                key = " ".join(re.findall(r"[\w']+", q.lower()))
+                repeats[key] = repeats.get(key, 0) + 1
+            repeated = [(k, c) for k, c in repeats.items() if c > 1]
+            repeated.sort(key=lambda kv: -kv[1])
+            if repeated:
+                embed.add_field(
+                    name="Asked more than once",
+                    value="\n".join(f"`{c}x` {truncate(k, 80)}" for k, c in repeated[:5]),
+                    inline=False,
+                )
+
+            # Most questions are phrased uniquely, so term frequency is what
+            # actually points at the missing FAQ entry.
+            terms = {}
+            for q in questions:
+                for word in set(re.findall(r"[a-z']{3,}", q.lower())):
+                    if word not in STATS_STOPWORDS:
+                        terms[word] = terms.get(word, 0) + 1
+            ranked = sorted(terms.items(), key=lambda kv: -kv[1])[:12]
+            if ranked:
+                embed.add_field(
+                    name="Common terms in unanswered questions",
+                    value=" ".join(f"`{w}`×{c}" for w, c in ranked),
+                    inline=False,
+                )
+
+            embed.add_field(
+                name="Most recent unanswered",
+                value="\n".join(f"• {truncate(q, 90)}" for q in questions[-5:]),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Unanswered questions",
+                value="None recorded. Either nothing has been deferred, or those "
+                "conversations predate handoff reasons being stored.",
+                inline=False,
+            )
+
+        embed.set_footer(text="Add FAQ entries for what shows up here; each one removes a handoff.")
+        await ctx.send(embed=embed)
+
+    @staticmethod
+    def _last_user_message(transcript: dict) -> typing.Optional[str]:
+        """The question that ended up going to a human."""
+        for entry in reversed(transcript.get("messages") or []):
+            if entry.get("role") == "user" and entry.get("content"):
+                return entry["content"]
+        return None
 
     @vlg.command(name="verbose")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)

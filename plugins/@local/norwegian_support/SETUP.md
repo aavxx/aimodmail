@@ -26,6 +26,7 @@ and ticket log retention must not read `Never`.
 | Command | Permission | Purpose |
 |---|---|---|
 | `.vlg status` | Administrator | Wiring, storage counts, config sanity |
+| `.vlg stats` | Supporter | Deferral rate, feedback, and what to add to the FAQ |
 | `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
 | `.vlg forget @user` | Supporter | Delete a user's stored assistant conversations |
 | `.vlg ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
@@ -240,6 +241,33 @@ Documents written by the removed consent gate are not deleted automatically.
 ```js
 db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
 ```
+
+### `.vlg stats`
+
+The loop-closer: it tells you which FAQ entries to write next.
+
+- **Handoff rate** — how many finished conversations reached a human.
+- **Deferral rate** — the subset where the assistant genuinely could not answer.
+  These are separated on purpose: someone typing "agent" is a routing preference,
+  and a Groq outage is an incident. Neither is an FAQ gap, and folding them into
+  one number would make it useless as a quality signal.
+- **Why it handed off** — the breakdown by cause.
+- **Answer feedback** — 👍/👎 totals, the only check on the model's own claim.
+- **Common terms in unanswered questions** — most questions are worded uniquely,
+  so term frequency is what actually points at the missing entry. Repeats are
+  listed separately when they occur, and the most recent unanswered questions are
+  shown verbatim.
+
+Everything is a **rolling window**: transcripts are deleted after 7 days, so this
+is never all-time. The embed says so, because a stats screen that silently means
+"last week" is worse than no stats.
+
+Conversations that predate this feature show as `unrecorded` under *Why it handed
+off* — they were never tagged, so they are excluded from the deferral rate rather
+than guessed at.
+
+This prints user questions verbatim to whatever channel it is run in, so it is
+Supporter-gated, same exposure as reading a ticket.
 
 ### Answer feedback
 
