@@ -40,14 +40,13 @@ logger = getLogger(__name__)
 
 # Shown at the start of every conversation, before the greeting. Informational
 # only: processing is on the basis of the contractual relationship, not consent,
-# so there is nothing to accept and nothing stored per user. The rights link is
-# how someone acts on their data, in place of an in-chat opt out.
+# so there is nothing to accept and nothing stored per user. Data rights are
+# exercised through the linked privacy policy, not in chat.
 DISCLOSURE_PARTS = (
     "Vueling will process your data to provide you with the services you have "
     "requested and improve your experience with Vueling, based on the execution "
-    "of a contractual relationship. You can exercise your data protection rights "
-    "[here](https://vuelingrbx.vercel.app/dataprotection). For more information, "
-    "see our [privacy policy](https://vuelingrbx.vercel.app/privacy).",
+    "of a contractual relationship. For more information, see our "
+    "[privacy policy](https://vuelingrbx.vercel.app/privacy).",
     "This chatbot uses an Artificial Intelligence tool to identify the most "
     "relevant answers to frequently asked questions.",
 )
@@ -81,14 +80,46 @@ HANDOFF_REFERENCE_TEXT = (
     "you need to follow this up later."
 )
 
-# How often expired pre-screen transcripts are swept. The TTL index is the
-# primary mechanism; this is a backstop for deployments whose TTL monitor is
-# disabled or lagging.
-CLEANUP_INTERVAL_HOURS = 6
+# One loop does both jobs. The retention sweep only needs to be occasional, but
+# the inactivity checks below need finer resolution than a 1 hour warning, and an
+# indexed delete_many running 5-minutely costs nothing, so this stays a single
+# timer rather than two.
+SWEEP_INTERVAL_MINUTES = 5
 
-# Retention for stage-4 AI transcripts. Enforced by a MongoDB TTL index on
-# `expires_at`; documents without that field (consents, ticket mappings) are
-# ignored by the TTL monitor and kept indefinitely.
+# Inactivity in the pre-screen conversation only. Modmail's own thread_auto_close
+# governs open tickets and is untouched by any of this.
+INACTIVITY_WARNING_AFTER = timedelta(hours=1)
+INACTIVITY_CLOSE_AFTER = timedelta(hours=3)
+
+INACTIVITY_WARNING_TEXT = (
+    "Are you still there? I'll close this chat shortly if you don't need anything "
+    "else — just send a message and I'll keep helping. \N{SMILING FACE WITH SMILING EYES}"
+)
+
+# Three separate messages when a conversation ends, however it ended.
+CLOSING_PARTS = (
+    "Thanks for chatting with me today, I hope I was able to help! " "\N{SMILING FACE WITH SMILING EYES}",
+    "Bye for now! \N{SMILING FACE WITH SMILING EYES}",
+    "You have been disconnected from Vueling AI. Whenever you need us again, just "
+    "send a message here and a new conversation will start.",
+)
+
+# Phrases that end the conversation, checked only once it is already open so a
+# conversation cannot be closed by its own first message. Word-boundary anchored.
+CLOSING_PATTERNS = [
+    r"^\s*(?:no|nope|nah|no\s+thanks?|no\s+thank\s+you)\s*[.!]*\s*$",
+    r"\bthat'?s\s+(?:all|it|everything)\b",
+    r"\bnothing\s+(?:else|more)\b",
+    r"\b(?:close|end|finish|stop)\s+(?:the\s+|this\s+)?(?:chat|conversation|ticket)\b",
+    r"\b(?:i'?m|im|we'?re)\s+(?:all\s+)?done\b",
+    r"^\s*(?:bye|goodbye|byebye|cya|see\s+you)\b",
+]
+
+_CLOSING_RE = [re.compile(p, re.IGNORECASE) for p in CLOSING_PATTERNS]
+
+# Retention for AI pre-screen transcripts. Enforced by a MongoDB TTL index on
+# `expires_at`; documents without that field (sessions, ticket mappings) are
+# ignored by the TTL monitor and kept until something else removes them.
 TRANSCRIPT_RETENTION_DAYS = 7
 
 # Discriminators. get_plugin_partition() hands back a single collection
@@ -97,6 +128,13 @@ TYPE_TRANSCRIPT = "ai_transcript"
 TYPE_TICKET = "ticket"
 
 TYPE_META = "meta"
+
+# Tracks an open pre-screen conversation so the inactivity sweep can reach the
+# user. Holds the raw user id, because a transcript is keyed by a one-way hash
+# and you cannot DM a hash. It carries no message content, and is deleted the
+# moment the conversation closes, so the identifiable part is scoped to
+# conversations that are actually open.
+TYPE_SESSION = "session"
 
 # No longer written. Documents from the removed consent gate may still exist;
 # `?nas forget` clears them alongside a user's transcripts.
@@ -380,7 +418,7 @@ class NorwegianSupport(commands.Cog):
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
-        self.cleanup_transcripts.start()
+        self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
         """Restore the diagnostics toggle.
@@ -403,31 +441,97 @@ class NorwegianSupport(commands.Cog):
 
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
-        self.cleanup_transcripts.cancel()
+        self.maintenance_sweep.cancel()
 
-    @tasks.loop(hours=CLEANUP_INTERVAL_HOURS)
-    async def cleanup_transcripts(self) -> None:
-        """Sweep expired pre-screen transcripts.
+    @tasks.loop(minutes=SWEEP_INTERVAL_MINUTES)
+    async def maintenance_sweep(self) -> None:
+        """Retention cleanup and pre-screen inactivity, on one timer.
+
+        Retention only needs to be occasional, but the inactivity warning is on
+        the hour, so this runs at the finer of the two intervals. Neither job may
+        stop the other from running.
+        """
+        try:
+            await self._expire_transcripts()
+        except Exception:
+            logger.error("Transcript expiry sweep failed.", exc_info=True)
+        try:
+            await self._sweep_inactive_conversations()
+        except Exception:
+            logger.error("Inactivity sweep failed.", exc_info=True)
+
+    async def _expire_transcripts(self) -> None:
+        """Delete transcripts past their retention window.
 
         The TTL index on `expires_at` is the primary mechanism. This is a
         backstop: TTL is a background monitor that some deployments disable or
         run behind, and the retention the linked privacy policy promises should
         not depend on a setting nobody here controls.
         """
-        try:
-            result = await self.db.delete_many(
-                {
-                    "_type": TYPE_TRANSCRIPT,
-                    "expires_at": {"$lte": datetime.now(timezone.utc)},
-                }
-            )
-        except Exception:
-            logger.error("Transcript cleanup failed.", exc_info=True)
-            return
+        result = await self.db.delete_many(
+            {"_type": TYPE_TRANSCRIPT, "expires_at": {"$lte": datetime.now(timezone.utc)}}
+        )
         if result.deleted_count:
             logger.info("Deleted %s expired AI transcript(s).", result.deleted_count)
 
-    @cleanup_transcripts.before_loop
+    async def _sweep_inactive_conversations(self) -> None:
+        """Warn, then close, pre-screen conversations that have gone quiet.
+
+        Only the plugin's own pre-screen stage. An open Modmail thread is past
+        this point entirely and is governed by Modmail's `thread_auto_close`.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Closing is handled before warning, so a conversation idle past both
+        # thresholds closes rather than being warned and closed a tick later.
+        stale = await self.db.find(
+            {"_type": TYPE_SESSION, "last_activity_at": {"$lte": now - INACTIVITY_CLOSE_AFTER}}
+        ).to_list(length=200)
+        for session in stale:
+            user_id = session["user_id"]
+            channel = await self._dm_channel(user_id)
+            if channel is None:
+                # Cannot reach them, but the conversation must still end or it
+                # would be swept again on every tick forever.
+                await self._close_transcript(user_id, handed_off=False)
+                continue
+            await self._close_conversation(user_id, channel, reason="inactivity")
+
+        quiet = await self.db.find(
+            {
+                "_type": TYPE_SESSION,
+                "warned_at": None,
+                "last_activity_at": {"$lte": now - INACTIVITY_WARNING_AFTER},
+            }
+        ).to_list(length=200)
+        for session in quiet:
+            user_id = session["user_id"]
+            # Stamped before sending, so a send that fails does not re-warn on
+            # every tick for the next two hours.
+            await self.db.update_one(
+                {"_type": TYPE_SESSION, "user_id": user_id},
+                {"$set": {"warned_at": now}},
+            )
+            channel = await self._dm_channel(user_id)
+            if channel is None:
+                continue
+            try:
+                await self._send_with_typing(channel, self._plain_embed(INACTIVITY_WARNING_TEXT))
+            except discord.HTTPException:
+                logger.error("Could not warn %s about inactivity.", user_id, exc_info=True)
+            else:
+                logger.info("Warned %s that their conversation will close.", user_id)
+
+    async def _dm_channel(self, user_id: int):
+        """The user's DM channel, or None if they cannot be reached."""
+        try:
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            return await user.create_dm()
+        except Exception:
+            logger.error("Could not open a DM channel with %s.", user_id, exc_info=True)
+            return None
+
+    @maintenance_sweep.before_loop
     async def _before_cleanup(self) -> None:
         await self.bot.wait_for_connected()
 
@@ -495,6 +599,7 @@ class NorwegianSupport(commands.Cog):
         try:
             await self.db.create_index([("_type", 1), ("user_id", 1)])
             await self.db.create_index([("_type", 1), ("user_id_hash", 1)])
+            await self.db.create_index([("_type", 1), ("last_activity_at", 1)])
             await self.db.create_index(
                 [("nas_ref", 1)],
                 unique=True,
@@ -561,7 +666,7 @@ class NorwegianSupport(commands.Cog):
             # Summarise while the transcript is still open, then close it: a
             # human is taking over and the pre-screen conversation is done.
             await self._prepare_handoff(message)
-            await self._close_transcript(message.author.id)
+            await self._close_transcript(message.author.id, handed_off=True)
 
             # Modmail creates the thread from here, exactly as it always did.
             # on_thread_ready posts the summary and issues the reference once
@@ -663,6 +768,27 @@ class NorwegianSupport(commands.Cog):
             return True
         return all(word in GREETING_WORDS for word in words)
 
+    @staticmethod
+    def _is_closing_request(text: str) -> typing.Optional[str]:
+        for pattern in _CLOSING_RE:
+            found = pattern.search(text)
+            if found:
+                return found.group(0)
+        return None
+
+    async def _close_conversation(self, user_id: int, channel, *, reason: str) -> None:
+        """Send the three closing messages, then end the conversation."""
+        try:
+            for part in CLOSING_PARTS:
+                await self._send_with_typing(channel, self._plain_embed(part))
+        except discord.HTTPException:
+            # Closing still has to happen, or the user is stuck in a conversation
+            # the assistant believes is over.
+            logger.error("Could not deliver the closing messages to %s.", user_id, exc_info=True)
+
+        await self._close_transcript(user_id, handed_off=False)
+        logger.info("Closed the pre-screen conversation with %s (%s).", user_id, reason)
+
     async def _confirm_handoff(self, message: discord.Message) -> bool:
         """Ask before escalating.
 
@@ -720,15 +846,23 @@ class NorwegianSupport(commands.Cog):
         """
         logger.info(msg, *args) if self._verbose else logger.debug(msg, *args)
 
+    def _open_filter(self, user_hash: str) -> dict:
+        """Matches a pre-screen conversation that is still running.
+
+        Both fields must be unset. `handed_off_at` alone would leave documents
+        written before automatic closing existed looking open forever, and
+        `closed_at` alone would do the same to older handed-off ones.
+        """
+        return {
+            "_type": TYPE_TRANSCRIPT,
+            "user_id_hash": user_hash,
+            "handed_off_at": None,
+            "closed_at": None,
+        }
+
     async def _open_transcript(self, user_id: int) -> typing.Optional[dict]:
-        """The user's in-progress pre-screen, if one has not been handed off."""
-        return await self.db.find_one(
-            {
-                "_type": TYPE_TRANSCRIPT,
-                "user_id_hash": await self._user_hash(user_id),
-                "handed_off_at": None,
-            }
-        )
+        """The user's in-progress pre-screen, if it has not ended."""
+        return await self.db.find_one(self._open_filter(await self._user_hash(user_id)))
 
     async def _append_transcript(
         self,
@@ -743,11 +877,7 @@ class NorwegianSupport(commands.Cog):
             entries.append({"role": "assistant", "content": assistant_text, "at": now})
 
         await self.db.update_one(
-            {
-                "_type": TYPE_TRANSCRIPT,
-                "user_id_hash": await self._user_hash(user_id),
-                "handed_off_at": None,
-            },
+            self._open_filter(await self._user_hash(user_id)),
             {
                 "$push": {"messages": {"$each": entries}},
                 "$set": {"resolved": resolved},
@@ -761,20 +891,34 @@ class NorwegianSupport(commands.Cog):
             upsert=True,
         )
 
-    async def _close_transcript(self, user_id: int) -> None:
-        """Mark the pre-screen conversation finished once a human takes over.
+        # Activity clock for the inactivity sweep. Any reply clears a pending
+        # warning, so a user who comes back gets the full hour again.
+        await self.db.update_one(
+            {"_type": TYPE_SESSION, "user_id": user_id},
+            {
+                "$set": {"last_activity_at": now, "warned_at": None},
+                "$setOnInsert": {"started_at": now},
+            },
+            upsert=True,
+        )
+
+    async def _close_transcript(self, user_id: int, *, handed_off: bool) -> None:
+        """End the pre-screen conversation.
 
         Without this the transcript stays open forever: the next conversation
-        would skip its greeting and replay stale history back to Groq.
+        would skip its disclosure and replay stale history back to Groq.
+
+        `handed_off_at` is still stamped separately when a human took over, so
+        "was this escalated" stays answerable rather than being flattened into
+        "this ended".
         """
-        await self.db.update_one(
-            {
-                "_type": TYPE_TRANSCRIPT,
-                "user_id_hash": await self._user_hash(user_id),
-                "handed_off_at": None,
-            },
-            {"$set": {"handed_off_at": datetime.now(timezone.utc)}},
-        )
+        now = datetime.now(timezone.utc)
+        changes = {"closed_at": now}
+        if handed_off:
+            changes["handed_off_at"] = now
+
+        await self.db.update_one(self._open_filter(await self._user_hash(user_id)), {"$set": changes})
+        await self.db.delete_one({"_type": TYPE_SESSION, "user_id": user_id})
 
     async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[bool, str, str]:
         """Ask Groq to answer or defer. Raises on any failure."""
@@ -838,6 +982,15 @@ class NorwegianSupport(commands.Cog):
             except discord.HTTPException:
                 # Not worth abandoning the request over; carry on and answer.
                 logger.error("Failed opening conversation with %s (%s).", user, user.id, exc_info=True)
+
+        # Only once a conversation is already running: "bye" as an opening line
+        # is not a request to close something that has not started.
+        if transcript is not None:
+            closing = self._is_closing_request(content)
+            if closing:
+                await self._append_transcript(user.id, content, resolved=True)
+                await self._close_conversation(user.id, message.channel, reason=f"user said {closing!r}")
+                return True
 
         # A bare "hi" is an opening, not an unanswerable question. Asking what
         # they need is the reply; escalating a hello to a human is not.
@@ -1131,6 +1284,7 @@ class NorwegianSupport(commands.Cog):
             counts = {
                 "transcripts": await self.db.count_documents({"_type": TYPE_TRANSCRIPT}),
                 "tickets": await self.db.count_documents({"_type": TYPE_TICKET}),
+                "open conversations": await self.db.count_documents({"_type": TYPE_SESSION}),
             }
             # Written by the removed consent gate. Non-zero means personal data
             # is being kept that nothing reads any more.

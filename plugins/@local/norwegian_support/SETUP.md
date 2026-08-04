@@ -219,6 +219,33 @@ Documents written by the removed consent gate are not deleted automatically.
 db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
 ```
 
+### Ending a conversation
+
+A pre-screen conversation ends in one of three ways. All of them send the same
+three messages (`CLOSING_PARTS`) — a warm sign-off, "Bye for now!", and a
+disconnect notice explaining that messaging again starts a new one — then stamp
+`closed_at`, delete the session, and let the next message begin fresh with the
+disclosure.
+
+1. **Handoff.** Also stamps `handed_off_at`, so "did this become a ticket" stays
+   answerable rather than being flattened into "this ended".
+2. **The user asks to stop.** `CLOSING_PATTERNS` covers a bare "no", "that's
+   all", "nothing else", "close the chat", "I'm done", "bye". Checked only once a
+   conversation is already open, so a first message of "no" cannot close
+   something that has not started.
+3. **Inactivity.** Warned at `INACTIVITY_WARNING_AFTER` (1 hour), closed at
+   `INACTIVITY_CLOSE_AFTER` (3 hours). Any reply resets the clock and clears a
+   pending warning, so someone who comes back gets the full hour again.
+
+**This is the plugin's own pre-screen stage only.** Modmail's `thread_auto_close`
+governs open tickets and is untouched — once a thread exists the plugin does not
+intercept anything.
+
+`maintenance_sweep` runs every `SWEEP_INTERVAL_MINUTES` (5) and does both the
+inactivity checks and the transcript retention sweep. One timer rather than two:
+the retention delete is indexed and costs nothing at this cadence, and the
+inactivity warning needs finer resolution than the 6-hourly loop it replaced.
+
 ### Conversation flow
 
 Every message the assistant sends runs behind a typing indicator for
@@ -407,9 +434,19 @@ MongoDB and are separated by a `_type` field:
 | `_type`        | Fields                                                     | Retention |
 |----------------|------------------------------------------------------------|-----------|
 | `consent`      | `user_id`, `accepted_at`, `policy_version`                   | until withdrawn |
-| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `handed_off_at` | 7 days |
+| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `closed_at`, `handed_off_at` | 7 days |
+| `session`      | `user_id`, `started_at`, `last_activity_at`, `warned_at`      | until the conversation closes |
 | `ticket`       | `nas_ref`, `log_key`, `user_id`, `channel_id`, `created_at`   | kept      |
 | `meta`         | `key`, `value` — currently the user-ID hashing salt          | permanent |
+
+### Why `session` holds a raw user id
+
+Transcripts are keyed by a one-way hash, and you cannot DM a hash. The inactivity
+sweep has to reach the user, so the open conversation is tracked in a separate
+`session` document holding the raw id — but **no message content**, and it is
+deleted the moment the conversation closes. The identifiable part is therefore
+scoped to conversations that are currently open, while what was actually said
+stays under the hash.
 
 ### The hashing salt
 
