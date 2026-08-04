@@ -147,6 +147,34 @@ The current content was supplied by the group. Keep it that way — when
 something is unknown, delete the entry rather than guessing, and the question
 will simply escalate to a human.
 
+### The four states
+
+Every model reply carries one `status`, replacing the old answer-or-give-up
+boolean:
+
+| status | what happens |
+|---|---|
+| `answered` | Reply sent, conversation continues, no thread. |
+| `chat` | Thanks, greetings, small talk. Answered warmly, no airline fact involved, no agent offered. |
+| `unclear` | It did not understand. The reply asks them to rephrase. Only after `MAX_CONSECUTIVE_UNCLEAR` (2) in a row is an agent offered. |
+| `escalate` | It understood and needs a person. |
+
+**The model's reply is always sent, including on `escalate`.** Previously the
+plugin discarded it and sent a canned "Looks like I can't help you with that",
+so even a genuinely useful attempt never reached the user — which is what made
+the assistant read as giving up instantly. Now the attempt goes out first and the
+agent offer follows it, shortened to "Would you like me to connect you with a
+member of our team?" since the reply already explains itself.
+
+The prompt also requires it to try: answer whatever part of a question is
+covered before saying what it cannot do, ask for a clarification if that would
+unlock an answer, and never write a reply that is only "I can't help".
+
+`unclear` is deliberately separate from `escalate`. Not understanding is not the
+same as understanding and lacking the fact, and only the second is worth a
+human's time. A legacy `{"resolved": bool}` payload is still accepted and mapped,
+so a model that falls back to the old shape is not treated as an error.
+
 ### Wording vs facts
 
 The prompt tells the model to recognise shorthand, abbreviations, partial names,

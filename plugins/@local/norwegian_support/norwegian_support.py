@@ -160,6 +160,23 @@ AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
 BUTTON_YES_EMOJI = "<:yes:1533908794684473354>"
 BUTTON_NO_EMOJI = "<:no:1533908791245017198>"
 
+# The model picks exactly one of these per reply. A single enum rather than a
+# pair of booleans, so it cannot express a contradiction like understood-but-not
+# understood, and so "I did not follow you" stops being the same outcome as
+# "I followed you and cannot help".
+STATUS_ANSWERED = "answered"
+STATUS_CHAT = "chat"
+STATUS_UNCLEAR = "unclear"
+STATUS_ESCALATE = "escalate"
+STATUSES = {STATUS_ANSWERED, STATUS_CHAT, STATUS_UNCLEAR, STATUS_ESCALATE}
+
+# Statuses where the assistant handled the turn itself.
+STATUS_HANDLED = {STATUS_ANSWERED, STATUS_CHAT}
+
+# Asking someone to rephrase forever is its own dead end, so after this many
+# consecutive unclear turns the conversation offers a human instead.
+MAX_CONSECUTIVE_UNCLEAR = 2
+
 # Why a conversation reached a human. Only AI_DEFERRED means the assistant
 # understood the question and could not answer it, which is the number worth
 # watching; the others are the user's choice or an outage.
@@ -167,12 +184,14 @@ HANDOFF_AI_DEFERRED = "ai_deferred"
 HANDOFF_ASKED_FOR_HUMAN = "asked_for_human"
 HANDOFF_AI_UNAVAILABLE = "ai_unavailable"
 HANDOFF_AI_ERROR = "ai_error"
+HANDOFF_AI_UNCLEAR = "ai_unclear"
 
 HANDOFF_REASON_LABELS = {
     HANDOFF_AI_DEFERRED: "assistant could not answer",
     HANDOFF_ASKED_FOR_HUMAN: "user asked for a human",
     HANDOFF_AI_UNAVAILABLE: "assistant not configured",
     HANDOFF_AI_ERROR: "Groq call failed",
+    HANDOFF_AI_UNCLEAR: "could not understand after retrying",
 }
 
 # Stripped before ranking terms in deferred questions. Topic words are what
@@ -323,7 +342,10 @@ GREETING_WORDS = {
 }
 
 # Handoff confirmation. Fixed copy: this is the plugin speaking, not the model.
-HANDOFF_CONFIRM_TEXT = "Looks like I can't help you with that. Do you want me to connect you with an agent?"
+# Deliberately short. The model's own reply is sent first and carries the
+# explanation, so repeating "I can't help" here would be the second time the
+# user is told that in two messages.
+HANDOFF_CONFIRM_TEXT = "Would you like me to connect you with a member of our team?"
 HANDOFF_ACCEPTED_TEXT = "Okay, I will get you right over to someone to help you further."
 HANDOFF_GOODBYE_TEXT = "Bye for now! \N{SMILING FACE WITH SMILING EYES}"
 HANDOFF_DECLINED_TEXT = (
@@ -431,40 +453,59 @@ someone's wording never licenses an answer the reference does not contain:
 
 - "what are the levels called?" is recognisably about ranks. You should
   understand it, and the reference still does not list the rank names, so it is
-  resolved false anyway.
+  escalate anyway.
 - If a subject appears nowhere in the reference under any wording, that is also
-  resolved false. Do not stretch a neighbouring entry to cover it, and do not
+  escalate. Do not stretch a neighbouring entry to cover it, and do not
   assume two things are the same because they sound similar.
 
-Set resolved to TRUE whenever the reference gives you what you need. Being brief
-is fine, and you do not have to cover everything. Stating a policy the user will
-not like is still a complete answer.
+Give every reply exactly one status.
 
-Set resolved to FALSE, with a brief reply, only for these:
-- answering would need a fact that is simply not in the reference
-- it concerns a specific individual's account, punishment, appeal outcome, or
-  application outcome, or any other case-by-case judgement. Pointing someone to
-  the appeals page is a complete answer and does not count as judging a case.
-- someone reports a problem with a purchase they made, such as paying and not
-  receiving what they paid for. The refund policy as a general question is
-  covered above and should be answered plainly instead of handed off.
-- the user seems upset, or has asked the same thing twice without being helped
+"answered" — you answered it from the reference. Rewording it, or combining two
+  or three entries, still counts. Being brief is fine. Stating a policy the user
+  will not like is a complete answer, not a failure.
 
-"I would have to make a fact up" is the test for false. Being unsure how best to
+"chat" — the message needs no airline fact at all: thanks, a greeting partway
+  through, small talk, someone saying they are annoyed or that you helped. Reply
+  like a person would and stay in the conversation. Never put airline facts in a
+  "chat" reply; if one is needed, the status is not "chat".
+
+"unclear" — you genuinely cannot tell what is being asked. A typo, a fragment, a
+  garbled sentence, or something with two very different readings. Ask them to
+  put it another way, and say which part you are unsure about if you can. Do NOT
+  use this when you understood the question perfectly well and simply do not
+  have the fact — that is "escalate".
+
+"escalate" — you understood, and doing it properly needs a person: a subject the
+  reference does not cover at all, a decision about one individual's account,
+  punishment, appeal or application, a report of a specific purchase going
+  wrong, or a user who is upset or has already asked twice without being helped.
+
+Try before you hand over. If any part of the question is covered, answer that
+part first and then say plainly what you cannot do yourself. If a small
+clarification would let you answer, ask for it instead of escalating. A reply
+that gives someone something and then offers a human is far better than one that
+only offers a human.
+
+Your reply is always shown to the user, including when you escalate — they read
+your words before they are offered an agent. Never write a reply that is only
+"I can't help with that"; say what you do know, or what you would need.
+
+"I would have to make a fact up" is the test for escalating. Being unsure how to
 word something is not.
 
-Worked examples, resolved TRUE:
-- "how do I join a flight?" — combine the group membership requirement with the
-  departures page and the timing pattern.
-- "what time is the next flight?" — give the XX:00 / XX:20 / XX:25 / XX:35
-  pattern and the departures link, without naming an hour.
-- "can I get a refund?" — state the no-refunds policy plainly.
-- "how do I appeal a ban?" — give the appeals link.
-- "what do I wear?" — say uniform is staff-only information.
+Worked examples:
+- "how do I join a flight?" — answered, combining the group membership
+  requirement with the departures page and the timing pattern.
+- "what time is the next flight?" — answered, giving the XX:00 / XX:20 / XX:25 /
+  XX:35 pattern and the departures link, without naming an hour.
+- "can I get a refund?" — answered, stating the no-refunds policy plainly.
+- "thanks, that helped!" — chat.
+- "hlo wut abt teh thing" — unclear, ask which thing they mean.
+- "what are the ranks called?" — escalate, but say first that the age
+  requirement is 13 and where applications are, since that much is covered.
+- "why was my application rejected?" — escalate, a decision about one person.
 
-Worked examples, resolved FALSE:
-- "what are the ranks called?" — the names are not in the reference.
-- "why was my application rejected?" — a case-by-case outcome.
+Language: reply in whatever language the user wrote in.
 
 Links: when the reference information provides a link, reproduce it exactly as
 written, in the same [display.domain](https://full.url) markdown form. Never
@@ -494,7 +535,7 @@ Reference information:
 {FAQ_KNOWLEDGE}
 
 Respond with a single json object with exactly these keys:
-  "resolved": boolean
+  "status": one of "answered", "chat", "unclear", "escalate"
   "reply": either a string, or an array of two strings
 
 Use the array form when the answer reads better as two messages: a short or
@@ -1037,20 +1078,21 @@ class NorwegianSupport(commands.Cog):
         user_id: int,
         user_text: str,
         assistant_text: typing.Optional[str] = None,
-        resolved: typing.Optional[bool] = None,
+        status: typing.Optional[str] = None,
     ) -> None:
         now = datetime.now(timezone.utc)
+        resolved = status in STATUS_HANDLED if status else None
         entries = [{"role": "user", "content": user_text, "at": now}]
         if assistant_text is not None:
-            # `resolved` is kept per turn as well as on the document, because the
+            # `status` is kept per turn as well as on the document, because the
             # replay has to rebuild the exact json this turn was produced as.
-            entries.append({"role": "assistant", "content": assistant_text, "at": now, "resolved": resolved})
+            entries.append({"role": "assistant", "content": assistant_text, "at": now, "status": status})
 
         await self.db.update_one(
             self._open_filter(await self._user_hash(user_id)),
             {
                 "$push": {"messages": {"$each": entries}},
-                "$set": {"resolved": resolved},
+                "$set": {"resolved": resolved, "status": status},
                 "$setOnInsert": {
                     "created_at": now,
                     # TTL index on this field expires the transcript 7 days
@@ -1129,7 +1171,7 @@ class NorwegianSupport(commands.Cog):
             if role not in ("user", "assistant") or not content:
                 continue
             if role == "assistant":
-                content = json.dumps({"resolved": bool(entry.get("resolved", True)), "reply": content})
+                content = json.dumps({"status": entry.get("status") or STATUS_ANSWERED, "reply": content})
             turns.append({"role": role, "content": content})
 
         paired = []
@@ -1142,7 +1184,7 @@ class NorwegianSupport(commands.Cog):
 
         return paired[-AI_HISTORY_LIMIT:]
 
-    async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[bool, str, str]:
+    async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[str, list, str]:
         """Ask Groq to answer or defer. Raises on any failure."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(self._replay(history))
@@ -1158,8 +1200,13 @@ class NorwegianSupport(commands.Cog):
 
         raw = completion.choices[0].message.content
         payload = json.loads(raw)
-        resolved = payload.get("resolved")
+        status = payload.get("status")
         reply = payload.get("reply")
+
+        # Tolerate the old boolean if the model falls back to it, rather than
+        # treating a usable answer as a malformed response and handing off.
+        if status is None and isinstance(payload.get("resolved"), bool):
+            status = STATUS_ANSWERED if payload["resolved"] else STATUS_ESCALATE
 
         # The model may split an answer across two messages, so `reply` is
         # accepted as either a string or a short list of them.
@@ -1171,10 +1218,10 @@ class NorwegianSupport(commands.Cog):
         replies = [part.strip() for part in reply if isinstance(part, str) and part.strip()]
 
         # A malformed response must not be treated as a confident answer.
-        if not isinstance(resolved, bool) or not replies:
+        if status not in STATUSES or not replies:
             raise ValueError(f"unusable Groq payload: {payload!r}")
 
-        return resolved, replies[:2], raw
+        return status, replies[:2], raw
 
     async def _ai_prescreen(self, message: discord.Message) -> bool:
         """Try to resolve the message without a human.
@@ -1206,14 +1253,14 @@ class NorwegianSupport(commands.Cog):
         if transcript is not None:
             closing = self._is_closing_request(content)
             if closing:
-                await self._append_transcript(user.id, content, resolved=True)
+                await self._append_transcript(user.id, content, status=STATUS_CHAT)
                 await self._close_conversation(user.id, message.channel, reason=f"user said {closing!r}")
                 return True
 
         # A bare "hi" is an opening, not an unanswerable question. Asking what
         # they need is the reply; escalating a hello to a human is not.
         if self._is_contentless(content):
-            await self._append_transcript(user.id, content, resolved=True)
+            await self._append_transcript(user.id, content, status=STATUS_CHAT)
             if not greeted:
                 # Mid-conversation, so the greeting's own prompt is not in view.
                 await self._send_with_typing(message.channel, self._plain_embed(CONTENTLESS_PROMPT))
@@ -1223,7 +1270,7 @@ class NorwegianSupport(commands.Cog):
         matched = self._escalation_match(content)
         if matched:
             logger.info("Escalation phrase %r from %s (%s).", matched, user, user.id)
-            await self._append_transcript(user.id, content, resolved=False)
+            await self._append_transcript(user.id, content, status=STATUS_ESCALATE)
             await self._mark_handoff_reason(user.id, HANDOFF_ASKED_FOR_HUMAN)
             return await self._confirm_handoff(message)
 
@@ -1231,7 +1278,7 @@ class NorwegianSupport(commands.Cog):
         # Offering to keep talking to an assistant that cannot answer would loop
         # the user through the same failure on every message.
         if self._groq() is None:
-            await self._append_transcript(user.id, content, resolved=False)
+            await self._append_transcript(user.id, content, status=STATUS_ESCALATE)
             await self._mark_handoff_reason(user.id, HANDOFF_AI_UNAVAILABLE)
             return False
 
@@ -1239,27 +1286,21 @@ class NorwegianSupport(commands.Cog):
 
         try:
             async with safe_typing(message.channel):
-                resolved, replies, raw = await asyncio.wait_for(
+                status, replies, raw = await asyncio.wait_for(
                     self._groq_answer(history, content),
                     timeout=GROQ_TIMEOUT_SECONDS,
                 )
         except Exception:
             logger.error("Groq pre-screen failed for %s (%s); handing off.", user, user.id, exc_info=True)
-            await self._append_transcript(user.id, content, resolved=False)
+            await self._append_transcript(user.id, content, status=STATUS_ESCALATE)
             await self._mark_handoff_reason(user.id, HANDOFF_AI_ERROR)
             return False
 
-        await self._append_transcript(user.id, content, "\n\n".join(replies), resolved)
+        await self._append_transcript(user.id, content, "\n\n".join(replies), status)
 
-        if not resolved:
-            logger.info("AI deferred for %s (%s); asking about handoff.", user, user.id)
-            # Why it deferred is invisible from the line above, so the message
-            # that prompted it and the model's verbatim answer go out together.
-            self._diag("Deferred message from %s (%s) was: %r", user, user.id, content)
-            self._diag("Groq raw response for %s (%s): %s", user, user.id, raw)
-            await self._mark_handoff_reason(user.id, HANDOFF_AI_DEFERRED)
-            return await self._confirm_handoff(message)
-
+        # The model's own words go out first in every case, including when it is
+        # about to hand over. Discarding them and sending only a canned line is
+        # what made the assistant read as giving up rather than trying.
         try:
             for reply in replies:
                 await self._send_with_typing(message.channel, self._ai_embed(reply))
@@ -1267,8 +1308,40 @@ class NorwegianSupport(commands.Cog):
             logger.error("Failed delivering AI reply to %s; handing off.", user, exc_info=True)
             return False
 
-        logger.info("AI resolved the request from %s (%s).", user, user.id)
-        return True
+        if status in STATUS_HANDLED:
+            await self._set_unclear_streak(user.id, 0)
+            logger.info("AI handled the request from %s (%s) as %s.", user, user.id, status)
+            return True
+
+        if status == STATUS_UNCLEAR:
+            streak = await self._bump_unclear_streak(user.id)
+            if streak < MAX_CONSECUTIVE_UNCLEAR:
+                logger.info("AI did not understand %s (%s); asked to rephrase.", user, user.id)
+                return True
+            # Asking a third time would be its own dead end.
+            logger.info("AI still did not understand %s (%s) after %s tries.", user, user.id, streak)
+            await self._mark_handoff_reason(user.id, HANDOFF_AI_UNCLEAR)
+            return await self._confirm_handoff(message)
+
+        logger.info("AI deferred for %s (%s); asking about handoff.", user, user.id)
+        # Why it deferred is invisible from the line above, so the message that
+        # prompted it and the model's verbatim answer go out together.
+        self._diag("Deferred message from %s (%s) was: %r", user, user.id, content)
+        self._diag("Groq raw response for %s (%s): %s", user, user.id, raw)
+        await self._mark_handoff_reason(user.id, HANDOFF_AI_DEFERRED)
+        return await self._confirm_handoff(message)
+
+    async def _bump_unclear_streak(self, user_id: int) -> int:
+        session = await self.db.find_one({"_type": TYPE_SESSION, "user_id": user_id})
+        streak = (session or {}).get("unclear_streak", 0) + 1
+        await self._set_unclear_streak(user_id, streak)
+        return streak
+
+    async def _set_unclear_streak(self, user_id: int, value: int) -> None:
+        await self.db.update_one(
+            {"_type": TYPE_SESSION, "user_id": user_id},
+            {"$set": {"unclear_streak": value}},
+        )
 
     def _plain_embed(self, text: str) -> discord.Embed:
         """Plugin-authored copy: greeting, prompts, handoff messages.
@@ -1671,7 +1744,7 @@ class NorwegianSupport(commands.Cog):
 
         async with safe_typing(ctx):
             try:
-                resolved, replies, raw = await asyncio.wait_for(
+                status, replies, raw = await asyncio.wait_for(
                     self._groq_answer([], question), timeout=GROQ_TIMEOUT_SECONDS
                 )
             except Exception as e:
@@ -1689,17 +1762,24 @@ class NorwegianSupport(commands.Cog):
                 )
 
         embed = self._embed(
-            title="Dry run — answered" if resolved else "Dry run — would hand off",
+            title=f"Dry run — {status}",
             description=f"> {truncate(question, 200)}",
-            color=None if resolved else self.bot.error_color,
+            color=None if status in STATUS_HANDLED else self.bot.error_color,
         )
         embed.add_field(
             name="Outcome",
-            value=(
-                "`resolved: true` — the user gets this reply and no thread is created."
-                if resolved
-                else "`resolved: false` — the user is asked whether to connect to an agent."
-            ),
+            value={
+                STATUS_ANSWERED: "`answered` — the reply goes out and no thread is created.",
+                STATUS_CHAT: "`chat` — conversational reply, no airline fact needed, no thread.",
+                STATUS_UNCLEAR: (
+                    "`unclear` — the reply asks them to rephrase. Only after "
+                    f"{MAX_CONSECUTIVE_UNCLEAR} unclear turns in a row is an agent offered."
+                ),
+                STATUS_ESCALATE: (
+                    "`escalate` — the reply is sent first, then the user is asked "
+                    "whether to connect to an agent."
+                ),
+            }[status],
             inline=False,
         )
         for index, reply in enumerate(replies, start=1):
@@ -1709,7 +1789,7 @@ class NorwegianSupport(commands.Cog):
                 inline=False,
             )
         embed.add_field(name="Raw", value=f"```json\n{truncate(raw, 900)}\n```", inline=False)
-        embed.set_footer(text="Nothing was stored; no conversation was started.")
+        embed.set_footer(text="No history replayed, so this is a first message. Nothing was stored.")
         await ctx.send(embed=embed)
 
     @vlg.command(name="stats")
