@@ -143,6 +143,25 @@ The current content was supplied by the group. Keep it that way — when
 something is unknown, delete the entry rather than guessing, and the question
 will simply escalate to a human.
 
+### Wording vs facts
+
+The prompt tells the model to recognise shorthand, abbreviations, partial names,
+synonyms and typos as pointing at the right entry — "grande" is Fly Grande,
+"unban" is the appeals page, "dress code" is the uniform policy — so a question
+is not deferred merely because it was not phrased the reference's way.
+
+That is deliberately separate from having the fact. The prompt says so
+explicitly, with a worked example: "what are the levels called?" is recognisably
+about ranks, the model should understand it, and it still defers because the rank
+names are not in the reference. **Recognition never licenses an answer the
+reference does not contain**, and the model is told not to stretch a neighbouring
+entry to cover a term that is absent.
+
+The practical consequence: if users ask about something by a name the FAQ does
+not use *at all*, that is an FAQ gap, not a prompt problem. Adding the entry is
+the fix; adding a synonym mapping for a subject that is not in the reference
+would just produce confident invention.
+
 Two known gaps, both deliberate:
 
 - **Rank names are not in the reference.** Public answers are allowed to include
