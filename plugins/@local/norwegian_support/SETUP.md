@@ -178,8 +178,13 @@ so a model that falls back to the old shape is not treated as an error.
 
 ### Partnerships
 
-A message mentioning partner / partnership / collab / affiliate is routed to a
-form rather than a conversation, **before** the escalation check. The five
+A message containing a word starting `partner` / `collab` / `affiliat` is routed
+to a form rather than a conversation, **before** the escalation check. The stems
+are open-ended (`\bpartner\w*`), so "partnered" and "collaborating" match as well
+as "partnership"; the one exception is the bare noun after a possessive — "my
+partner is on the flight" is a passenger, not a proposal, and is left to the
+assistant. `.vlg ask "…"` reports the partnership route, so any wording can be
+checked without DMing the bot. The five
 questions are what a human would ask anyway, so collecting them up front beats a
 ticket that opens by asking them one at a time — even when the request is phrased
 as wanting to speak to someone.
@@ -188,7 +193,9 @@ The reply offers a button, the button opens a Discord modal, and the submission
 is posted to the configured staff channel. `PARTNERSHIP_GUILD_ID` and
 `PARTNERSHIP_CHANNEL_ID` are where it lands; if the bot cannot see that channel
 the user is told the submission failed and offered a human, rather than being
-thanked for something that never arrived.
+thanked for something that never arrived. `.vlg status` resolves that channel and
+names it, so a form that would fail on submission is visible before anyone uses
+it.
 
 The button view is persistent, so a form offered overnight still opens.
 
@@ -306,13 +313,20 @@ sends the user nothing — so FAQ wording can be iterated on in one channel
 instead of a round trip through a test account's DMs.
 
 It deliberately mirrors `_ai_prescreen`'s ordering, so the route it reports is
-the route a real message takes. Greeting-only, closing phrases and escalation
-phrases are named as such rather than being pre-screened, because in a real
-conversation those never reach Groq either.
+the route a real message takes. Greeting-only, closing phrases, partnership terms
+and escalation phrases are named as such rather than being pre-screened, because
+in a real conversation those never reach Groq either.
 
 ### Is my change actually running?
 
-`.vlg version` answers it. The field that matters is the comparison between
+**Check this before diagnosing anything else.** A pull does not change what the
+bot is running; only `?plugin reload @local/norwegian_support` (or a restart)
+does. Until then the bot keeps serving the previous version, which looks exactly
+like the new one being broken — the old button emoji, the old routing, no
+partnership form. `.vlg status` now leads with a red warning when the file on
+disk is newer than the running code, for that reason.
+
+`.vlg version` answers it in detail. The field that matters is the comparison between
 **file last modified** and **plugin loaded**: editing or pulling the file changes
 nothing until the plugin is reloaded, and every other signal looks healthy while
 stale code keeps running. If the file is newer, it says so in red and gives the
@@ -327,11 +341,20 @@ repo commit when the checkout is a git one.
 `.vlg status` answers this directly. Two independent causes:
 
 - **Confirmation Yes/No** — the guild emoji are resolved through `bot.get_emoji`
-  and reported as usable or not. Discord rejects a component carrying an emoji
-  the bot has no access to, and that fails the **entire message**, so an emoji
-  from a server the bot is not in means the prompt never appears and the user is
-  escalated silently. The prompt now retries with plain unicode when that
-  happens, so it degrades instead of vanishing.
+  and reported as usable or not, naming the server that owns them when they are.
+  Discord rejects a component carrying an emoji the bot has no access to, and
+  that fails the **entire message**, so an emoji from a server the bot is not in
+  would mean the prompt never appears and the user is escalated silently. The
+  pair is therefore resolved *before* the send and swapped for ✅ / ❌ when it
+  cannot be used, with a warning in the log naming the emoji; the send-and-retry
+  path remains as a second net.
+
+  **So plain ✅ / ❌ on the buttons is the symptom, not the setting.** It means
+  the bot is not in the server that owns `BUTTON_YES_EMOJI` /
+  `BUTTON_NO_EMOJI` — `.vlg status` says which of the two failed. Fix it by
+  inviting the bot to that server, or by putting ids from a server it is already
+  in into those two constants and reloading. Both are swapped as a pair: one
+  guild emoji beside one unicode mark reads as a rendering fault.
 - **Feedback 👍/👎** — status reports whether the persistent view is registered.
   These only ever appear on answers sent *after* the feature shipped; older
   transcripts have no `answer_message_ids`, so a click could not be attributed to

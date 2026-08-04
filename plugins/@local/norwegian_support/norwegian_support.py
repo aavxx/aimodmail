@@ -281,6 +281,9 @@ STATS_STOPWORDS = {
 BUTTON_YES_FALLBACK = "\N{WHITE HEAVY CHECK MARK}"
 BUTTON_NO_FALLBACK = "\N{CROSS MARK}"
 
+# Matches the id out of "<:name:1234>" / "<a:name:1234>".
+_CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
+
 # Author-row icon. None means "use the bot's own avatar", which follows the
 # Developer Portal without a redeploy and is the normal case.
 #
@@ -373,13 +376,21 @@ FOLLOW_UP_TEXT = "Is there anything else I can help you with? \N{SMILING FACE WI
 # are matched before anything else: the five questions below are what a human
 # would ask anyway, and collecting them up front is better than a ticket that
 # starts by asking them one at a time.
+# Open-ended suffixes rather than a list of endings: "partnered" and
+# "collaborating" were both missed by the enumerated form, and every word
+# starting with these stems is the same request.
 PARTNERSHIP_PATTERNS = [
-    r"\bpartner(?:s|ship|ships|ing)?\b",
-    r"\bcollab(?:s|oration|orations|orate)?\b",
-    r"\baffiliat(?:e|es|ion|ions)\b",
+    r"\bpartner\w*",
+    r"\bcollab\w*",
+    r"\baffiliat\w*",
 ]
 
 _PARTNERSHIP_RE = [re.compile(p, re.IGNORECASE) for p in PARTNERSHIP_PATTERNS]
+
+# "my partner is on the flight" is a passenger, not a business proposal. Only
+# the bare noun is ambiguous this way: "our partnership" is still the request.
+_PARTNERSHIP_POSSESSIVES = {"my", "your", "his", "her", "their", "our", "a"}
+_PARTNERSHIP_AMBIGUOUS = {"partner", "partners"}
 
 PARTNERSHIP_INTRO = (
     "Certainly, we'd be glad to hear about it! Tap the button below and fill in a "
@@ -675,6 +686,7 @@ class NorwegianSupport(commands.Cog):
         self._loaded_at: typing.Optional[datetime] = None
         # user_id -> summary, handed to on_thread_ready once the channel exists.
         self._pending_handoff: typing.Dict[int, str] = {}
+        self._partnership_view: typing.Optional[PartnershipView] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -685,7 +697,11 @@ class NorwegianSupport(commands.Cog):
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
         self.bot.loop.create_task(self._load_verbose())
-        self.bot.add_view(PartnershipView(self))
+        # Kept so cog_unload can stop it. A persistent view outlives the cog
+        # otherwise, and after a reload the old one would still be serving form
+        # buttons through the previous, unhooked instance.
+        self._partnership_view = PartnershipView(self)
+        self.bot.add_view(self._partnership_view)
         self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
@@ -710,6 +726,9 @@ class NorwegianSupport(commands.Cog):
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
         self.maintenance_sweep.cancel()
+        if self._partnership_view is not None:
+            self._partnership_view.stop()
+            self._partnership_view = None
 
     @tasks.loop(minutes=SWEEP_INTERVAL_MINUTES)
     async def maintenance_sweep(self) -> None:
@@ -1087,9 +1106,10 @@ class NorwegianSupport(commands.Cog):
         # Modmail's own unlabelled buttons, carrying the guild emoji and nothing
         # else. The consent notice keeps its text labels: an emoji-only choice is
         # fine for "shall I fetch a human", not for accepting a privacy policy.
+        yes_emoji, no_emoji = self._button_emoji()
         view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
-        view.add_item(AcceptButton("nas-handoff-yes", BUTTON_YES_EMOJI))
-        view.add_item(DenyButton("nas-handoff-no", BUTTON_NO_EMOJI))
+        view.add_item(AcceptButton("nas-handoff-yes", yes_emoji))
+        view.add_item(DenyButton("nas-handoff-no", no_emoji))
 
         # The statement and the buttons are two separate messages.
         try:
@@ -1145,11 +1165,52 @@ class NorwegianSupport(commands.Cog):
         await self._send_with_typing(message.channel, self._plain_embed(HANDOFF_GOODBYE_TEXT))
         return False
 
+    def _resolve_emoji(self, raw: str) -> typing.Optional[discord.Emoji]:
+        """The guild emoji `raw` names, if this bot can actually use it.
+
+        `get_emoji` looks the id up in the bot's own emoji cache, which only
+        holds emoji from servers it is a member of — which is exactly the
+        condition Discord enforces when a component carries one.
+        """
+        match = _CUSTOM_EMOJI_RE.match(raw.strip())
+        if match is None:
+            # Plain unicode. Always usable, nothing to resolve.
+            return None
+        return self.bot.get_emoji(int(match.group(1)))
+
+    def _button_emoji(self) -> typing.Tuple[str, str]:
+        """The yes/no pair to put on a confirmation, already checked.
+
+        Discord rejects a component carrying an emoji the bot cannot use and
+        that failure takes the whole message with it, so the pair is resolved
+        before the send rather than after: the send-and-retry path below is a
+        second net, not the mechanism. Falls back as a pair — one guild emoji
+        beside one unicode mark looks like a rendering fault.
+        """
+        for raw in (BUTTON_YES_EMOJI, BUTTON_NO_EMOJI):
+            if _CUSTOM_EMOJI_RE.match(raw.strip()) and self._resolve_emoji(raw) is None:
+                logger.warning(
+                    "Confirmation emoji %s is not usable by this bot, so the buttons fall back to "
+                    "%s / %s. The bot is not in the server that owns it. Check `%svlg status`.",
+                    raw,
+                    BUTTON_YES_FALLBACK,
+                    BUTTON_NO_FALLBACK,
+                    self.bot.prefix,
+                )
+                return BUTTON_YES_FALLBACK, BUTTON_NO_FALLBACK
+        return BUTTON_YES_EMOJI, BUTTON_NO_EMOJI
+
     @staticmethod
     def _partnership_match(text: str) -> typing.Optional[str]:
         for pattern in _PARTNERSHIP_RE:
-            found = pattern.search(text)
-            if found:
+            for found in pattern.finditer(text):
+                word = found.group(0).lower()
+                if word in _PARTNERSHIP_AMBIGUOUS:
+                    before = re.findall(r"[a-z']+", text[: found.start()].lower())
+                    if before and before[-1] in _PARTNERSHIP_POSSESSIVES:
+                        # Someone's travelling companion. Keep looking: a later
+                        # match in the same message may still be the request.
+                        continue
                 return found.group(0)
         return None
 
@@ -1788,7 +1849,22 @@ class NorwegianSupport(commands.Cog):
         except Exception as e:
             storage = f"unreachable: `{e}`"
 
-        embed = self._embed(title="Vueling support — status")
+        # First, because every other line here describes the code that is
+        # running, not the code that was pulled. Stale code is the one state
+        # where all of this can read healthy and none of it is what is live.
+        stale = self._is_stale()
+        embed = self._embed(
+            title="Vueling support — status",
+            description=(
+                "**The file on disk is newer than the running code, so none of this "
+                "reflects what is live.** Reload with "
+                f"`{self.bot.prefix}plugin reload @local/norwegian_support`, then run this again. "
+                f"See `{self.bot.prefix}vlg version`."
+                if stale
+                else None
+            ),
+            color=self.bot.error_color if stale else None,
+        )
         embed.add_field(
             name="DM hook",
             value="installed" if hooked else "**not installed**",
@@ -1839,16 +1915,54 @@ class NorwegianSupport(commands.Cog):
         # taking the whole message with it, so this is the usual reason a
         # confirmation prompt never appears.
         emoji_lines = []
+        unusable = False
         for label, raw in (("yes", BUTTON_YES_EMOJI), ("no", BUTTON_NO_EMOJI)):
-            match = re.search(r":(\d+)>$", raw)
-            resolved = self.bot.get_emoji(int(match.group(1))) if match else None
-            emoji_lines.append(f"`{label}` {raw} — {'usable' if resolved else '**not usable by this bot**'}")
+            if not _CUSTOM_EMOJI_RE.match(raw.strip()):
+                emoji_lines.append(f"`{label}` {raw} — unicode, always usable")
+                continue
+            resolved = self._resolve_emoji(raw)
+            if resolved is None:
+                unusable = True
+                emoji_lines.append(f"`{label}` `{raw}` — **not usable by this bot**")
+            else:
+                # Naming the owning server turns "not usable" into an action:
+                # either invite the bot there or take the ids from a server it
+                # is already in.
+                emoji_lines.append(f"`{label}` {raw} — usable, from **{resolved.guild}**")
         embed.add_field(
             name="Confirmation button emoji",
             value="\n".join(emoji_lines)
             + (
-                "\n*Unusable means the bot is not in the server that owns the emoji. "
-                "The prompt falls back to plain unicode.*"
+                (
+                    "\n*The bot is not in the server that owns these, so it cannot use them and "
+                    f"the buttons show {BUTTON_YES_FALLBACK} / {BUTTON_NO_FALLBACK} instead. Invite "
+                    "the bot to that server, or edit `BUTTON_YES_EMOJI` / `BUTTON_NO_EMOJI` in the "
+                    "plugin to ids from a server it is already in — then reload the plugin.*"
+                )
+                if unusable
+                else "\n*Unusable would mean the bot is not in the server that owns the emoji, "
+                "and the prompt would fall back to plain unicode.*"
+            ),
+            inline=False,
+        )
+
+        # The form is offered from the DM but delivered to a staff channel, so
+        # the half that can silently break is not visible from the DM side.
+        guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+        channel = guild.get_channel(PARTNERSHIP_CHANNEL_ID) if guild else None
+        if channel is None:
+            channel = self.bot.get_channel(PARTNERSHIP_CHANNEL_ID)
+        embed.add_field(
+            name="Partnership form",
+            value=(
+                (
+                    f"submissions go to {channel.mention} in **{channel.guild}**"
+                    if channel is not None
+                    else f"**channel `{PARTNERSHIP_CHANNEL_ID}` is not visible to this bot** — "
+                    "submissions cannot be delivered, and the user is told so and handed to a human"
+                )
+                + f"\nTriggered by: {', '.join(f'`{p}`' for p in PARTNERSHIP_PATTERNS)}"
+                + f"\nCheck a specific message with `{self.bot.prefix}vlg ask <message>`."
             ),
             inline=False,
         )
@@ -1882,6 +1996,23 @@ class NorwegianSupport(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    def _source_mtime(self) -> typing.Optional[datetime]:
+        """When the plugin file on disk last changed. None if unreadable."""
+        try:
+            return datetime.fromtimestamp(pathlib.Path(__file__).resolve().stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            return None
+
+    def _is_stale(self) -> bool:
+        """True when the file has been pulled or edited since this code loaded.
+
+        The comparison that actually matters: editing or pulling the file does
+        nothing at all until the plugin is reloaded, and a bot still running the
+        previous version looks completely healthy while doing so.
+        """
+        modified = self._source_mtime()
+        return modified is not None and self._loaded_at is not None and modified > self._loaded_at
+
     @vlg.command(name="version", aliases=["updated"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def vlg_version(self, ctx):
@@ -1900,10 +2031,7 @@ class NorwegianSupport(commands.Cog):
                 )
             )
 
-        # The comparison that actually matters. Editing or pulling the file does
-        # nothing until the plugin is reloaded, and every other field here would
-        # look healthy while stale code kept running.
-        stale = self._loaded_at is not None and modified > self._loaded_at
+        stale = self._is_stale()
 
         embed = self._embed(
             title="Vueling support — running code",
@@ -2003,6 +2131,22 @@ class NorwegianSupport(commands.Cog):
                         f"Matches a closing phrase (`{closing}`), so mid-conversation this "
                         "would end the chat. As a first message it would fall through to "
                         "the pre-screen instead."
+                    ),
+                )
+            )
+
+        # Before escalation, exactly as the live route has it: a partnership
+        # request phrased as wanting to speak to someone still gets the form.
+        partnership = self._partnership_match(question)
+        if partnership:
+            return await ctx.send(
+                embed=self._embed(
+                    title="Dry run — no pre-screen",
+                    description=(
+                        f"> {truncate(question, 200)}\n\n"
+                        f"Matches partnership term `{partnership}`, so the form is offered and "
+                        "Groq is never called. Submissions go to the channel shown in "
+                        f"`{self.bot.prefix}vlg status`."
                     ),
                 )
             )
