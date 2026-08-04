@@ -31,6 +31,7 @@ from pymongo import ReturnDocument
 
 from core import checks
 from core.models import DMDisabled, PermissionLevel, getLogger
+from core.time import human_timedelta
 from core.utils import AcceptButton, DenyButton, safe_typing, truncate
 
 try:
@@ -1720,17 +1721,36 @@ class NorwegianSupport(commands.Cog):
             ),
             color=self.bot.error_color if stale else None,
         )
+        # Both the computed age and Discord's own timestamp: the first is exact
+        # and identical for everyone, the second renders in the reader's own
+        # timezone but rounds hard ("an hour ago" for anything near one).
         embed.add_field(
-            name="File last modified",
-            value=discord.utils.format_dt(modified, "F") + "\n" + discord.utils.format_dt(modified, "R"),
+            name="File last updated",
+            value=(
+                f"**{human_timedelta(modified)}**\n"
+                f"{discord.utils.format_dt(modified, 'F')} ({discord.utils.format_dt(modified, 'R')})"
+            ),
             inline=False,
         )
         if self._loaded_at is not None:
             embed.add_field(
                 name="Plugin loaded",
-                value=discord.utils.format_dt(self._loaded_at, "F")
-                + "\n"
-                + discord.utils.format_dt(self._loaded_at, "R"),
+                value=(
+                    f"**{human_timedelta(self._loaded_at)}**"
+                    f" — running for {human_timedelta(self._loaded_at, suffix=False)}\n"
+                    f"{discord.utils.format_dt(self._loaded_at, 'F')}"
+                ),
+                inline=False,
+            )
+            gap = self._loaded_at - modified
+            embed.add_field(
+                name="Loaded after the file changed?",
+                value=(
+                    f"yes, by {human_timedelta(modified, source=self._loaded_at, suffix=False)}"
+                    if gap.total_seconds() >= 0
+                    else f"**no — the file changed "
+                    f"{human_timedelta(self._loaded_at, source=modified, suffix=False)} later**"
+                ),
                 inline=False,
             )
         embed.add_field(name="Content hash", value=f"`{digest}`  ({lines} lines)", inline=False)
