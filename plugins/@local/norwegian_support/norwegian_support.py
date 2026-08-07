@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 import isodate
+from bson import ObjectId
 from discord.ext import commands, tasks
 from pymongo import ReturnDocument
 
@@ -120,6 +121,57 @@ CLOSING_PATTERNS = [
 
 _CLOSING_RE = [re.compile(p, re.IGNORECASE) for p in CLOSING_PATTERNS]
 
+# Offered after the closing messages above, with a button that opens the survey.
+# Only ever on an assistant-ended conversation: a thread a human took over ends
+# through Modmail and never reaches _close_conversation.
+SURVEY_INVITE_TEXT = (
+    "We would like to hear your feedback! Click the button below to answer a " "quick 1 minute survey."
+)
+
+SURVEY_BUTTON_LABEL = "Answer the survey"
+SURVEY_MODAL_TITLE = "Your feedback"
+
+# Discord caps a modal label at 45 characters and its description at 100. Both
+# are asserted below, so an over-long rewrite fails the plugin load rather than
+# failing silently when a user opens the form.
+SURVEY_RATING_QUESTION = "How satisfied were you with our support?"
+SURVEY_TRAINING_QUESTION = "Can we use this chat to help improve our AI?"
+SURVEY_TRAINING_NOTE = "This is 100% anonymous."
+
+SURVEY_RATING_OPTIONS = [
+    ("5", "5 — Very satisfied"),
+    ("4", "4 — Satisfied"),
+    ("3", "3 — Neutral"),
+    ("2", "2 — Dissatisfied"),
+    ("1", "1 — Very dissatisfied"),
+]
+
+assert len(SURVEY_RATING_QUESTION) <= 45, "modal label is capped at 45 characters"
+assert len(SURVEY_TRAINING_QUESTION) <= 45, "modal label is capped at 45 characters"
+assert len(SURVEY_TRAINING_NOTE) <= 100, "modal description is capped at 100 characters"
+
+SURVEY_THANKS_TRAINING = (
+    "Thank you, your feedback has been recorded, and this chat will help us " "improve our assistant."
+)
+SURVEY_THANKS_RATING = "Thank you, your feedback has been recorded."
+SURVEY_THANKS_EXPIRED = (
+    "Thank you, your rating has been recorded. This conversation is no longer "
+    "available, so nothing from it has been kept."
+)
+SURVEY_ALREADY_ANSWERED = "Thanks — you have already answered this one."
+SURVEY_NOT_YOURS = "Sorry, that survey is not yours to answer."
+SURVEY_FAILED = "Sorry, we could not save that. Please try again."
+
+# Whether a 1-5 rating is kept when the user declines the training question. The
+# rating document holds no conversation content — only the hashed user, the
+# number and a timestamp — so it is feedback about the service rather than a
+# copy of the chat. Set to False to discard ratings from anyone who said no.
+KEEP_RATINGS_WITHOUT_CONSENT = True
+
+# Samples shown by `.vlg training` when no count is given.
+TRAINING_SAMPLE_DEFAULT = 3
+TRAINING_SAMPLE_MAX = 10
+
 # Retention for AI pre-screen transcripts. Enforced by a MongoDB TTL index on
 # `expires_at`; documents without that field (sessions, ticket mappings) are
 # ignored by the TTL monitor and kept until something else removes them.
@@ -138,6 +190,15 @@ TYPE_META = "meta"
 # moment the conversation closes, so the identifiable part is scoped to
 # conversations that are actually open.
 TYPE_SESSION = "session"
+
+# Post-disconnect survey answers: the rating, and whether the chat could be
+# reused. Content-free, and keyed by the same one-way hash as a transcript.
+TYPE_SURVEY = "survey"
+
+# Conversations the user agreed we could keep to improve the assistant. These
+# carry no `expires_at` and so outlive the 7 day transcript retention — the
+# whole point of asking. Written only on an explicit yes.
+TYPE_TRAINING = "training_transcript"
 
 # No longer written. Documents from the removed consent gate may still exist;
 # `.vlg forget` clears them alongside a user's transcripts.
@@ -655,6 +716,120 @@ class PartnershipView(discord.ui.View):
         self.add_item(PartnershipButton(cog))
 
 
+class SurveyModal(discord.ui.Modal):
+    """The survey: a 1-5 rating, and whether the chat may be reused.
+
+    Both answers are dropdowns rather than free text. discord.py 2.6 allows a
+    Select inside a Modal only when wrapped in a Label, which is also what
+    carries the question — a Select's own placeholder is not a label.
+    """
+
+    def __init__(self, cog: "NorwegianSupport", transcript_id: str, source: typing.Optional[discord.Message]):
+        super().__init__(title=SURVEY_MODAL_TITLE, timeout=None)
+        self.cog = cog
+        self.transcript_id = transcript_id
+        self.source = source
+
+        self.rating = discord.ui.Select(
+            custom_id="vlg-survey-rating",
+            placeholder="Pick a rating",
+            options=[
+                discord.SelectOption(label=label, value=value) for value, label in SURVEY_RATING_OPTIONS
+            ],
+            required=True,
+        )
+        self.add_item(discord.ui.Label(text=SURVEY_RATING_QUESTION, component=self.rating))
+
+        self.training = discord.ui.Select(
+            custom_id="vlg-survey-training",
+            placeholder="Yes or no",
+            options=[
+                discord.SelectOption(label="Yes", value="yes"),
+                discord.SelectOption(label="No", value="no"),
+            ],
+            required=True,
+        )
+        self.add_item(
+            discord.ui.Label(
+                text=SURVEY_TRAINING_QUESTION,
+                description=SURVEY_TRAINING_NOTE,
+                component=self.training,
+            )
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            rating = int(self.rating.values[0])
+        except (IndexError, ValueError):
+            logger.error("Survey submitted without a usable rating: %r", self.rating.values)
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
+            return
+
+        consented = bool(self.training.values) and self.training.values[0] == "yes"
+        await self.cog.record_survey(
+            interaction,
+            transcript_id=self.transcript_id,
+            rating=rating,
+            consented=consented,
+            source=self.source,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error("Survey modal failed for %s.", interaction.user, exc_info=error)
+        with contextlib.suppress(discord.HTTPException):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
+
+
+class SurveyButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"vlg:survey:(?P<transcript_id>[0-9a-f]{24})",
+):
+    """The button on the survey invitation.
+
+    A dynamic item rather than a member of a persistent view, because each
+    button belongs to one specific conversation. The transcript is encoded in
+    the custom_id and parsed back out on click, so a survey offered overnight
+    still opens after a restart with nothing held in memory.
+    """
+
+    def __init__(self, transcript_id: str):
+        self.transcript_id = transcript_id
+        super().__init__(
+            discord.ui.Button(
+                style=discord.ButtonStyle.primary,
+                label=SURVEY_BUTTON_LABEL,
+                custom_id=f"vlg:survey:{transcript_id}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["transcript_id"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("NorwegianSupport")
+        if cog is None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
+            return
+
+        if await cog.survey_already_answered(interaction, self.transcript_id):
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(SURVEY_ALREADY_ANSWERED, ephemeral=True)
+            return
+
+        await interaction.response.send_modal(SurveyModal(cog, self.transcript_id, interaction.message))
+
+
+def survey_view(transcript_id: str) -> discord.ui.View:
+    """A view carrying just the survey button for one conversation."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(SurveyButton(transcript_id))
+    return view
+
+
 class YesNoView(discord.ui.View):
     """Yes/no view for the handoff confirmation.
 
@@ -702,6 +877,9 @@ class NorwegianSupport(commands.Cog):
         # buttons through the previous, unhooked instance.
         self._partnership_view = PartnershipView(self)
         self.bot.add_view(self._partnership_view)
+        # Registered on the client rather than as a view: each survey button
+        # belongs to one conversation, so there is no single view to keep.
+        self.bot.add_dynamic_items(SurveyButton)
         self.maintenance_sweep.start()
 
     async def _load_verbose(self) -> None:
@@ -729,6 +907,10 @@ class NorwegianSupport(commands.Cog):
         if self._partnership_view is not None:
             self._partnership_view.stop()
             self._partnership_view = None
+        try:
+            self.bot.remove_dynamic_items(SurveyButton)
+        except Exception:
+            logger.debug("Could not unregister the survey button.", exc_info=True)
 
     @tasks.loop(minutes=SWEEP_INTERVAL_MINUTES)
     async def maintenance_sweep(self) -> None:
@@ -892,8 +1074,12 @@ class NorwegianSupport(commands.Cog):
                 unique=True,
                 partialFilterExpression={"_type": TYPE_TICKET},
             )
-            # TTL for stage-4 transcripts only. Documents lacking `expires_at`
-            # (consents, ticket mappings) are never touched by the TTL monitor.
+            # Survey answers and their training copies are found by conversation.
+            await self.db.create_index([("_type", 1), ("transcript_id", 1)])
+            await self.db.create_index([("_type", 1), ("consented_at", -1)])
+            # TTL for pre-screen transcripts only. Documents lacking `expires_at`
+            # — sessions, ticket mappings, survey answers and the conversations
+            # kept for review — are never touched by the TTL monitor.
             await self.db.create_index([("expires_at", 1)], expireAfterSeconds=0)
         except Exception:
             logger.error("Failed creating plugin partition indexes.", exc_info=True)
@@ -1084,7 +1270,7 @@ class NorwegianSupport(commands.Cog):
         return None
 
     async def _close_conversation(self, user_id: int, channel, *, reason: str) -> None:
-        """Send the three closing messages, then end the conversation."""
+        """Send the closing messages and the survey, then end the conversation."""
         try:
             for part in CLOSING_PARTS:
                 await self._send_with_typing(channel, self._plain_embed(part))
@@ -1093,8 +1279,24 @@ class NorwegianSupport(commands.Cog):
             # the assistant believes is over.
             logger.error("Could not deliver the closing messages to %s.", user_id, exc_info=True)
 
-        await self._close_transcript(user_id, handed_off=False)
+        closed = await self._close_transcript(user_id, handed_off=False)
         logger.info("Closed the pre-screen conversation with %s (%s).", user_id, reason)
+
+        # Only the conversation that this call actually closed gets a survey. A
+        # None here means something else closed it first, and offering a second
+        # survey for the same chat would collect the same answer twice.
+        if closed is None:
+            return
+
+        try:
+            await self._send_with_typing(
+                channel,
+                self._plain_embed(SURVEY_INVITE_TEXT),
+                view=survey_view(str(closed["_id"])),
+            )
+        except discord.HTTPException:
+            # No survey, but the conversation is correctly closed either way.
+            logger.error("Could not offer the survey to %s.", user_id, exc_info=True)
 
     async def _confirm_handoff(self, message: discord.Message) -> bool:
         """Ask before escalating.
@@ -1368,8 +1570,8 @@ class NorwegianSupport(commands.Cog):
             {"$set": {"handoff_reason": reason}},
         )
 
-    async def _close_transcript(self, user_id: int, *, handed_off: bool) -> None:
-        """End the pre-screen conversation.
+    async def _close_transcript(self, user_id: int, *, handed_off: bool) -> typing.Optional[dict]:
+        """End the pre-screen conversation, returning the transcript it closed.
 
         Without this the transcript stays open forever: the next conversation
         would skip its disclosure and replay stale history back to Groq.
@@ -1377,14 +1579,153 @@ class NorwegianSupport(commands.Cog):
         `handed_off_at` is still stamped separately when a human took over, so
         "was this escalated" stays answerable rather than being flattened into
         "this ended".
+
+        The returned document is what the survey button is keyed to. Closing is
+        a single atomic update against the open filter, so a conversation the
+        inactivity sweep and a goodbye both reach is only ever closed — and so
+        only ever surveyed — once.
         """
         now = datetime.now(timezone.utc)
         changes = {"closed_at": now}
         if handed_off:
             changes["handed_off_at"] = now
 
-        await self.db.update_one(self._open_filter(await self._user_hash(user_id)), {"$set": changes})
+        closed = await self.db.find_one_and_update(
+            self._open_filter(await self._user_hash(user_id)),
+            {"$set": changes},
+            return_document=ReturnDocument.AFTER,
+        )
         await self.db.delete_one({"_type": TYPE_SESSION, "user_id": user_id})
+        return closed
+
+    # ------------------------------------------------------------------
+    # Survey answers and the training set
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _survey_filter(transcript_id: ObjectId, user_hash: str) -> dict:
+        """One answer per user per conversation.
+
+        Keyed on the submitter as well as the conversation. A custom_id comes
+        back from the client, so keying on the conversation alone would let one
+        person's submission overwrite the answer stored against another's.
+        """
+        return {"_type": TYPE_SURVEY, "transcript_id": transcript_id, "user_id_hash": user_hash}
+
+    async def survey_already_answered(self, interaction: discord.Interaction, transcript_id: str) -> bool:
+        try:
+            answered = await self.db.find_one(
+                self._survey_filter(ObjectId(transcript_id), await self._user_hash(interaction.user.id)),
+                {"_id": 1},
+            )
+        except Exception:
+            # Never block someone from answering because of a lookup failure;
+            # a repeat answer is caught again on write.
+            logger.error("Could not check for an existing survey answer.", exc_info=True)
+            return False
+        return answered is not None
+
+    async def record_survey(
+        self,
+        interaction: discord.Interaction,
+        *,
+        transcript_id: str,
+        rating: int,
+        consented: bool,
+        source: typing.Optional[discord.Message],
+    ) -> None:
+        """Store the answers and, on a yes, the copy kept for review."""
+        now = datetime.now(timezone.utc)
+        user_hash = await self._user_hash(interaction.user.id)
+
+        try:
+            oid = ObjectId(transcript_id)
+        except Exception:
+            logger.error("Survey submitted with an unusable transcript id %r.", transcript_id)
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
+            return
+
+        transcript = await self.db.find_one({"_type": TYPE_TRANSCRIPT, "_id": oid})
+
+        # The custom_id is client-supplied, so a conversation is only usable
+        # once it is shown to belong to whoever pressed the button. Someone
+        # else's is refused outright rather than downgraded to a bare rating,
+        # which would let them write over the real answer.
+        if transcript is not None and transcript.get("user_id_hash") != user_hash:
+            logger.warning(
+                "%s (%s) submitted a survey for a conversation they do not own.",
+                interaction.user,
+                interaction.user.id,
+            )
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(SURVEY_NOT_YOURS, ephemeral=True)
+            return
+
+        stored_training = False
+        if consented and transcript is not None:
+            await self.db.update_one(
+                {"_type": TYPE_TRAINING, "transcript_id": oid, "user_id_hash": user_hash},
+                {
+                    "$set": {
+                        "messages": transcript.get("messages", []),
+                        "message_count": len(transcript.get("messages", [])),
+                        "rating": rating,
+                        "handoff_reason": transcript.get("handoff_reason"),
+                        "conversation_started_at": transcript.get("created_at"),
+                        "conversation_ended_at": transcript.get("closed_at"),
+                        "consented_at": now,
+                    }
+                },
+                # No `expires_at`: this copy is review material for improving the
+                # assistant, not a live conversation, so neither the TTL index
+                # nor _expire_transcripts touches it.
+                upsert=True,
+            )
+            stored_training = True
+
+        stored_rating = consented or KEEP_RATINGS_WITHOUT_CONSENT
+        if stored_rating:
+            await self.db.update_one(
+                self._survey_filter(oid, user_hash),
+                {
+                    "$set": {
+                        "rating": rating,
+                        "training_consent": consented,
+                        "answered_at": now,
+                    }
+                },
+                upsert=True,
+            )
+
+        # Take the button away so the same survey cannot be reopened from an old
+        # message. Losing this is cosmetic; the answer is already stored.
+        if source is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await source.edit(view=None)
+
+        # Each branch says only what happened. A blanket "recorded" is untrue
+        # when the conversation had already expired out from under the button.
+        if stored_training:
+            thanks = SURVEY_THANKS_TRAINING
+        elif consented and stored_rating:
+            thanks = SURVEY_THANKS_EXPIRED
+        elif consented:
+            thanks = "Thank you. This conversation is no longer available, so nothing has been kept."
+        elif stored_rating:
+            thanks = SURVEY_THANKS_RATING
+        else:
+            thanks = "Thank you for your feedback."
+
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_message(thanks, ephemeral=True)
+
+        logger.info(
+            "Survey answered for %s: rating %s, training consent %s.", transcript_id, rating, consented
+        )
+        self._diag(
+            "survey %s rating=%s consent=%s stored=%s", transcript_id, rating, consented, stored_training
+        )
 
     @staticmethod
     def _replay(history: list) -> list:
@@ -1839,6 +2180,8 @@ class NorwegianSupport(commands.Cog):
                 "transcripts": await self.db.count_documents({"_type": TYPE_TRANSCRIPT}),
                 "tickets": await self.db.count_documents({"_type": TYPE_TICKET}),
                 "open conversations": await self.db.count_documents({"_type": TYPE_SESSION}),
+                "survey answers": await self.db.count_documents({"_type": TYPE_SURVEY}),
+                "kept for review": await self.db.count_documents({"_type": TYPE_TRAINING}),
             }
             # Written by the removed consent gate. Non-zero means personal data
             # is being kept that nothing reads any more.
@@ -2399,13 +2742,22 @@ class NorwegianSupport(commands.Cog):
         no consent to withdraw any more, but the transcripts still exist and this
         is the only way to remove them before their 7 day expiry.
         """
-        transcripts = await self.db.delete_many(
-            {"_type": TYPE_TRANSCRIPT, "user_id_hash": await self._user_hash(user.id)}
-        )
+        user_hash = await self._user_hash(user.id)
+        transcripts = await self.db.delete_many({"_type": TYPE_TRANSCRIPT, "user_id_hash": user_hash})
+        # Conversations kept for review have to go too. They were kept on this
+        # user's say-so, and an erasure request reaching everything except the
+        # copy that outlives the others would be the wrong way round. This is
+        # why the training copy keeps the hash rather than nothing at all.
+        training = await self.db.delete_many({"_type": TYPE_TRAINING, "user_id_hash": user_hash})
+        surveys = await self.db.delete_many({"_type": TYPE_SURVEY, "user_id_hash": user_hash})
+        await self.db.delete_many({"_type": TYPE_SESSION, "user_id": user.id})
         # Sweep any record left behind by the removed consent gate.
         legacy = await self.db.delete_many({"_type": TYPE_LEGACY_CONSENT, "user_id": user.id})
 
-        if not transcripts.deleted_count and not legacy.deleted_count:
+        removed = (
+            transcripts.deleted_count + training.deleted_count + surveys.deleted_count + legacy.deleted_count
+        )
+        if not removed:
             return await ctx.send(
                 embed=self._embed(
                     description=f"Nothing stored for {user.mention}.",
@@ -2414,6 +2766,11 @@ class NorwegianSupport(commands.Cog):
             )
 
         note = f"Deleted {transcripts.deleted_count} assistant conversation(s) for {user.mention}."
+        if training.deleted_count or surveys.deleted_count:
+            note += (
+                f"\nAlso removed {training.deleted_count} conversation(s) kept for review "
+                f"and {surveys.deleted_count} survey answer(s)."
+            )
         if legacy.deleted_count:
             note += f"\nAlso cleared {legacy.deleted_count} obsolete consent record(s)."
         note += (
@@ -2423,6 +2780,85 @@ class NorwegianSupport(commands.Cog):
 
         await ctx.send(embed=self._embed(description=note))
         logger.info("Erased stored data for %s (%s) at the request of %s.", user, user.id, ctx.author)
+
+    @vlg.command(name="training")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def vlg_training(self, ctx, samples: int = TRAINING_SAMPLE_DEFAULT):
+        """Conversations users agreed we could keep, with a few read inline.
+
+        A reading list, not a pipeline. Nothing here changes the assistant on
+        its own — `FAQ_KNOWLEDGE` and the prompt are edited by hand, the same
+        way the gaps `.vlg stats` surfaces are fixed today.
+        """
+        samples = max(0, min(samples, TRAINING_SAMPLE_MAX))
+
+        total = await self.db.count_documents({"_type": TYPE_TRAINING})
+        if not total:
+            return await ctx.send(
+                embed=self._embed(
+                    description=(
+                        "Nothing kept yet. Conversations appear here when a user answers "
+                        "yes to the training question in the survey after a chat ends."
+                    ),
+                    color=self.bot.error_color,
+                )
+            )
+
+        answered = await self.db.count_documents({"_type": TYPE_SURVEY})
+        recent = (
+            await self.db.find({"_type": TYPE_TRAINING})
+            .sort("consented_at", -1)
+            .limit(samples)
+            .to_list(length=samples)
+        )
+
+        embed = self._embed(
+            title="Kept for review",
+            description=f"**{total}** conversation(s) from **{answered}** survey answer(s).",
+            footer="No user IDs or names are stored with these",
+        )
+
+        # A field caps at 1024 characters but the whole embed caps at 6000, so
+        # the full ten do not necessarily fit. Stop early rather than have
+        # Discord reject the message outright.
+        shown = 0
+        for doc in recent:
+            name = self._training_sample_name(doc)
+            body = self._training_sample_body(doc)
+            if len(embed) + len(name) + len(body) > 5900:
+                break
+            embed.add_field(name=name, value=body, inline=False)
+            shown += 1
+
+        if shown < len(recent):
+            embed.description = (
+                f"**{total}** conversation(s) from **{answered}** survey answer(s), showing "
+                f"{shown} — the rest did not fit. Ask for fewer at a time."
+            )
+
+        await ctx.send(embed=embed)
+
+    @staticmethod
+    def _training_sample_name(doc: dict) -> str:
+        rating = doc.get("rating")
+        started = doc.get("conversation_started_at")
+        when = started.strftime("%Y-%m-%d") if isinstance(started, datetime) else "unknown date"
+        return f"{when} • rated {rating}/5 • {doc.get('message_count', 0)} messages"
+
+    @staticmethod
+    def _training_sample_body(doc: dict) -> str:
+        """Render a conversation into one embed field, inside the 1024 cap."""
+        lines = []
+        for entry in doc.get("messages", []):
+            speaker = "**User**" if entry.get("role") == "user" else "**AI**"
+            content = " ".join((entry.get("content") or "").split())
+            line = f"{speaker}: {truncate(content, 160)}"
+            # Leave room for the marker rather than losing the whole embed.
+            if sum(len(x) + 1 for x in lines) + len(line) > 970:
+                lines.append("…")
+                break
+            lines.append(line)
+        return "\n".join(lines) or "*empty*"
 
     @vlg.command(name="ticket")
     @checks.has_permissions(PermissionLevel.SUPPORTER)

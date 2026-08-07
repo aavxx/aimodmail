@@ -31,6 +31,7 @@ and ticket log retention must not read `Never`.
 | `.vlg ask <question>` | Supporter | Dry-run the pre-screen, no conversation created |
 | `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
 | `.vlg forget @user` | Supporter | Delete a user's stored assistant conversations |
+| `.vlg training [n]` | Supporter | Conversations kept for review: count and samples |
 | `.vlg ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
 
 The group is `.vlg` (`?nas` still works as an alias, so nothing breaks mid-rollout).
@@ -39,7 +40,9 @@ The group is `.vlg` (`?nas` still works as an alias, so nothing breaks mid-rollo
 to withdraw any more, and the disclosure now links only to the privacy policy, so
 requests will arrive by whatever route that page describes — but the transcripts
 still exist until their 7 day expiry and nothing else deletes them on request.
-`.vlg revoke` still works as an alias.
+`.vlg revoke` still works as an alias. It also removes anything the user agreed
+to leave behind in the training set — see *The post-chat survey*, which is the
+one thing here with no expiry of its own.
 
 ## Required config
 
@@ -304,6 +307,60 @@ Documents written by the removed consent gate are not deleted automatically.
 ```js
 db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
 ```
+
+### The post-chat survey
+
+When the assistant ends a conversation — a closing phrase, or the inactivity
+close — the closing messages are followed by one more offering a survey, with a
+button. **Only assistant-ended conversations reach this.** A conversation a human
+took over ends through `_close_transcript(handed_off=True)` and never passes
+through `_close_conversation`, so closing a ticket is Modmail's own flow and
+produces nothing here.
+
+The survey is a Discord modal with two dropdowns: a 1-5 rating, and *"Can we use
+this chat to help improve our AI? This is 100% anonymous."* Discord caps a modal
+label at 45 characters; `SURVEY_RATING_QUESTION` and `SURVEY_TRAINING_QUESTION`
+are asserted against that at import, so an over-long rewrite fails the plugin
+load rather than breaking the form for a user.
+
+The button is a persistent dynamic item, so a survey offered overnight still
+opens after a restart. The conversation it belongs to is encoded in its
+`custom_id` and checked against whoever clicks it — someone else's survey is
+refused rather than answered.
+
+Closing is a single atomic update, so a conversation the inactivity sweep and a
+goodbye both reach is closed, and surveyed, exactly once.
+
+#### What the answers do
+
+**Yes** copies the conversation into `training_transcript`, which carries no
+`expires_at` and so survives both the TTL index and `_expire_transcripts`.
+**No** copies nothing. The rating is stored either way, with no conversation
+content — set `KEEP_RATINGS_WITHOUT_CONSENT = False` to drop even that on a no.
+
+Read them with `.vlg training` (count, plus recent conversations rendered
+inline). `.vlg status` counts both under *survey answers* and *kept for review*.
+
+**Nothing acts on this data automatically.** `.vlg training` is a reading list.
+The FAQ and prompt are edited by hand, the same way `.vlg stats` gaps are fixed
+today.
+
+#### Two things to check before going live
+
+1. **The linked privacy policy must mention this.** The opening disclosure says
+   processing rests on the contractual relationship and points at
+   `https://vuelingrbx.vercel.app/privacy`. Keeping consented chats past the 7
+   day transcript retention is a separate purpose with a separate lawful basis —
+   the user's explicit yes — and that page should say so. The in-chat question is
+   where consent is captured; the policy page is where it is explained.
+2. **`.vlg forget` reaches the training set**, which is why the copy keeps
+   `user_id_hash` rather than nothing at all. A copy nobody can find is a copy
+   nobody can delete, and this is the one that outlives the others. The hash is
+   the same keyed HMAC used everywhere else — not reversible without the salt,
+   and no name or user ID is stored beside it. That is what "anonymous" means in
+   the survey wording. To make the set genuinely unlinkable instead, drop
+   `user_id_hash` from the copy in `record_survey` and accept that an erasure
+   request can no longer reach it.
 
 ### `.vlg ask`
 
@@ -625,6 +682,8 @@ MongoDB and are separated by a `_type` field:
 | `consent`      | `user_id`, `accepted_at`, `policy_version`                   | until withdrawn |
 | `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `closed_at`, `handed_off_at` | 7 days |
 | `session`      | `user_id`, `started_at`, `last_activity_at`, `warned_at`      | until the conversation closes |
+| `survey`       | `user_id_hash`, `transcript_id`, `rating`, `training_consent`, `answered_at` | kept |
+| `training_transcript` | `user_id_hash`, `transcript_id`, `messages[]`, `message_count`, `rating`, `handoff_reason`, `consented_at`, `conversation_started_at`, `conversation_ended_at` | **kept indefinitely** |
 | `ticket`       | `nas_ref`, `log_key`, `user_id`, `channel_id`, `created_at`   | kept      |
 | `meta`         | `key`, `value` — currently the user-ID hashing salt          | permanent |
 
