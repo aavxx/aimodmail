@@ -32,7 +32,7 @@ try:
 except ImportError:
     pass
 
-from core import checks
+from core import checks, single_instance
 from core.changelog import Changelog
 from core.clients import ApiClient, MongoDBClient, PluginDatabaseClient
 from core.config import ConfigManager
@@ -2232,6 +2232,21 @@ class ModmailBot(commands.Bot):
 
 
 def main():
+    # Before anything else, including the dependency checks below: a second
+    # process must not get far enough to connect, because from that point both
+    # answer every message and the duplication is invisible in either log.
+    try:
+        single_instance.acquire()
+    except single_instance.AlreadyRunning as exc:
+        logger.critical("%s", exc)
+        logger.critical(
+            "Refusing to start a second time. Stop the running process first "
+            "(`kill %s`), or set %s if you really do want more than one.",
+            exc.pid or "<pid>",
+            single_instance.OVERRIDE_ENV,
+        )
+        sys.exit(1)
+
     try:
         # noinspection PyUnresolvedReferences
         import uvloop  # type: ignore

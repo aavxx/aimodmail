@@ -33,7 +33,7 @@ from pymongo import ReturnDocument
 from core import checks
 from core.models import DMDisabled, PermissionLevel, getLogger
 from core.time import human_timedelta
-from core.utils import AcceptButton, DenyButton, safe_typing, truncate
+from core.utils import safe_typing, truncate
 
 try:
     from groq import AsyncGroq
@@ -131,24 +131,61 @@ SURVEY_INVITE_TEXT = (
 SURVEY_BUTTON_LABEL = "Answer the survey"
 SURVEY_MODAL_TITLE = "Your feedback"
 
-# Discord caps a modal label at 45 characters and its description at 100. Both
-# are asserted below, so an over-long rewrite fails the plugin load rather than
-# failing silently when a user opens the form.
-SURVEY_RATING_QUESTION = "How satisfied were you with our support?"
+# The rating questions, in the order they appear. Each is (key, label,
+# description, scale), where scale reads 1 to 5 and is worded for that specific
+# question — a generic "satisfied/dissatisfied" scale against "how quickly did
+# we reply" is the kind of thing that makes a form feel bolted together.
+#
+# `key` is the storage key and must not change once answers exist; the wording
+# above it can be rewritten freely.
+SURVEY_RATING_QUESTIONS = (
+    (
+        "speed",
+        "How quickly did we get back to you?",
+        "1 = far too slow, 5 = very quick",
+        ("Far too slow", "A bit slow", "About right", "Quick", "Very quick"),
+    ),
+    (
+        "helpfulness",
+        "How helpful was the assistant?",
+        "1 = not helpful at all, 5 = very helpful",
+        ("Not helpful at all", "Not very helpful", "Somewhat helpful", "Helpful", "Very helpful"),
+    ),
+    (
+        "overall",
+        "How was your experience overall?",
+        "1 = very dissatisfied, 5 = very satisfied",
+        ("Very dissatisfied", "Dissatisfied", "Neutral", "Satisfied", "Very satisfied"),
+    ),
+)
+
+# The one whose score is the headline: what `.vlg stats` reports and what the
+# low-rating alert fires on. Must be a key in SURVEY_RATING_QUESTIONS.
+SURVEY_HEADLINE_KEY = "overall"
+
 SURVEY_TRAINING_QUESTION = "Can we use this chat to help improve our AI?"
 SURVEY_TRAINING_NOTE = "This is 100% anonymous."
 
-SURVEY_RATING_OPTIONS = [
-    ("5", "5 — Very satisfied"),
-    ("4", "4 — Satisfied"),
-    ("3", "3 — Neutral"),
-    ("2", "2 — Dissatisfied"),
-    ("1", "1 — Very dissatisfied"),
-]
-
-assert len(SURVEY_RATING_QUESTION) <= 45, "modal label is capped at 45 characters"
+# Discord's caps on a modal: 5 components, a 45 character label and a 100
+# character description. Asserted at import so an over-long rewrite fails the
+# plugin load rather than failing silently when a user opens the form.
+assert len(SURVEY_RATING_QUESTIONS) + 1 <= 5, "a modal holds at most 5 components"
+assert SURVEY_HEADLINE_KEY in {q[0] for q in SURVEY_RATING_QUESTIONS}, "headline key must be a question"
+for _key, _label, _description, _scale in SURVEY_RATING_QUESTIONS:
+    assert len(_label) <= 45, f"modal label over 45 characters: {_label!r}"
+    assert len(_description) <= 100, f"modal description over 100 characters: {_description!r}"
+    assert len(_scale) == 5, f"a 1-5 scale needs 5 words: {_key!r}"
 assert len(SURVEY_TRAINING_QUESTION) <= 45, "modal label is capped at 45 characters"
 assert len(SURVEY_TRAINING_NOTE) <= 100, "modal description is capped at 100 characters"
+
+
+def survey_rating_options(scale: typing.Sequence[str]) -> typing.List[discord.SelectOption]:
+    """A 1-5 dropdown, best first — the order a rating scale is read in."""
+    return [
+        discord.SelectOption(label=f"{score} — {scale[score - 1]}", value=str(score))
+        for score in range(5, 0, -1)
+    ]
+
 
 SURVEY_THANKS_TRAINING = (
     "Thank you, your feedback has been recorded, and this chat will help us " "improve our assistant."
@@ -249,13 +286,29 @@ HANDOFF_AI_UNAVAILABLE = "ai_unavailable"
 HANDOFF_AI_ERROR = "ai_error"
 HANDOFF_AI_UNCLEAR = "ai_unclear"
 
+HANDOFF_PARTNERSHIP = "partnership"
+
 HANDOFF_REASON_LABELS = {
     HANDOFF_AI_DEFERRED: "assistant could not answer",
     HANDOFF_ASKED_FOR_HUMAN: "user asked for a human",
     HANDOFF_AI_UNAVAILABLE: "assistant not configured",
     HANDOFF_AI_ERROR: "Groq call failed",
     HANDOFF_AI_UNCLEAR: "could not understand after retrying",
+    HANDOFF_PARTNERSHIP: "partnership lead",
 }
+
+# What staff see at the top of a handed-off ticket. Short enough to scan a
+# channel list on, and ordered so the ones needing a specialist read first.
+HANDOFF_REASON_TAGS = {
+    HANDOFF_PARTNERSHIP: "\N{HANDSHAKE} PARTNERSHIP",
+    HANDOFF_ASKED_FOR_HUMAN: "\N{BUSTS IN SILHOUETTE} ASKED FOR A HUMAN",
+    HANDOFF_AI_UNCLEAR: "\N{WHITE QUESTION MARK ORNAMENT} REPEATEDLY UNCLEAR",
+    HANDOFF_AI_DEFERRED: "\N{MEMO} NOT IN THE FAQ",
+    HANDOFF_AI_UNAVAILABLE: "\N{WARNING SIGN} ASSISTANT OFFLINE",
+    HANDOFF_AI_ERROR: "\N{WARNING SIGN} ASSISTANT ERROR",
+}
+
+HANDOFF_URGENCY_TAG = "\N{FIRE} ANGRY OR URGENT"
 
 # Stripped before ranking terms in deferred questions. Topic words are what
 # tell you which FAQ entry to write; these never do.
@@ -341,6 +394,17 @@ STATS_STOPWORDS = {
 # without a fallback a bad emoji id means no confirmation prompt at all.
 BUTTON_YES_FALLBACK = "\N{WHITE HEAVY CHECK MARK}"
 BUTTON_NO_FALLBACK = "\N{CROSS MARK}"
+
+# Carried by every message whose only visible content is its buttons.
+#
+# Not decoration. A button answers by editing its own message to drop the
+# components, and Discord rejects an edit that would leave a message with no
+# content, no embed and no components. On a components-only message that edit
+# therefore fails, the interaction is never acknowledged, and the click surfaces
+# to the user as "Interaction failed" — which is exactly what the handoff
+# confirmation was doing. A zero-width space renders as nothing and leaves
+# something behind for the edit to keep.
+BUTTON_SPACER = "\N{ZERO WIDTH SPACE}"
 
 # Matches the id out of "<:name:1234>" / "<a:name:1234>".
 _CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
@@ -483,6 +547,102 @@ PARTNERSHIP_FAILED = (
 # Where submitted applications land.
 PARTNERSHIP_GUILD_ID = 1532428044822642808
 PARTNERSHIP_CHANNEL_ID = 1534233033085948074
+
+
+def _env_channel_id(name: str, default: int) -> int:
+    """A channel id from the environment, falling back rather than raising.
+
+    A typo in `.env` must not take the plugin down at import; `.vlg status`
+    reports what these actually resolved to.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.error("%s is not a channel id (%r); falling back to %s.", name, raw, default)
+        return default
+
+
+# Where staff notifications land: the low-rating alert and the weekly digest.
+# Defaults to the partnership channel, which is already known to be visible to
+# the bot — set VLG_STAFF_CHANNEL_ID to send them somewhere quieter.
+STAFF_CHANNEL_ID = _env_channel_id("VLG_STAFF_CHANNEL_ID", PARTNERSHIP_CHANNEL_ID)
+
+# A headline score at or below this raises an alert as soon as it is submitted.
+LOW_RATING_THRESHOLD = 2
+
+# The weekly digest fires on the first sweep at or after this hour on this
+# weekday, and never twice in the same week. Monday morning UTC by default, so
+# it is waiting when the week starts rather than arriving mid-conversation.
+DIGEST_WEEKDAY = 0
+DIGEST_HOUR_UTC = 9
+
+# Guards against a second digest if a sweep runs twice in the same hour, and
+# against a backlog firing if the bot was down over the window.
+DIGEST_MIN_GAP = timedelta(days=6)
+
+# Emoji staff react with to claim a partnership lead, and the note added to the
+# post once someone has. Reaction-based rather than a button so a claim survives
+# any restart with no persistent view to register.
+CLAIM_EMOJI = "\N{RAISED HAND}"
+
+# The claim state lives in the post's own footer rather than in the database.
+# It is what staff read, it survives restarts for free, and there is no second
+# copy that can disagree with what the channel shows.
+CLAIM_UNCLAIMED_FOOTER = f"Unclaimed — react with {CLAIM_EMOJI} to take this lead"
+CLAIM_CLAIMED_PREFIX = "Claimed by "
+
+# Obvious profanity only. Deliberately short and word-boundary anchored: a false
+# positive warns, and then closes the conversation of somebody who did nothing,
+# which is far worse than missing a word. Stems cover the common suffixes.
+PROFANITY_PATTERNS = [
+    r"\bf+u+c+k+\w*",
+    r"\bs+h+i+t+\w*",
+    r"\bb+i+t+c+h+\w*",
+    r"\bc+u+n+t+\w*",
+    r"\ba+s+s+h+o+l+e+\w*",
+    r"\bd+i+c+k+h+e+a+d+\w*",
+    r"\bb+a+s+t+a+r+d+\w*",
+    r"\bw+a+n+k+\w*",
+    r"\bp+r+i+c+k+s?\b",
+    r"\bt+w+a+t+\w*",
+    r"\bb+o+l+l+o+c+k+s+\b",
+    r"\bn+i+g+g+[ae]+r+\w*",
+    r"\bf+a+g+g+o+t+\w*",
+    r"\br+e+t+a+r+d+\w*",
+]
+
+_PROFANITY_RE = [re.compile(p, re.IGNORECASE) for p in PROFANITY_PATTERNS]
+
+# Sent on the first one. Warm, and explicit about what happens next, so the
+# close that may follow is not a surprise.
+PROFANITY_WARNING_TEXT = (
+    "Let's keep the tone respectful, please. \N{SLIGHTLY SMILING FACE} I'm happy to keep "
+    "helping — but if it happens again I'll have to close this chat."
+)
+
+# Sent instead of a second warning. The conversation then closes exactly as an
+# inactivity close does, survey included.
+PROFANITY_CLOSING_TEXT = "I did ask that we keep things respectful, so I'm going to close this chat here."
+
+# Swears in one conversation before it is closed. The first is a warning.
+PROFANITY_STRIKES = 2
+
+# Signals that someone is angry or in a hurry, used only to tag the ticket for
+# staff. Never changes what the user is told, so a false positive costs nothing
+# beyond a misleading tag.
+URGENCY_PATTERNS = [
+    r"\b(?:urgent|urgently|asap|emergency|immediately|right\s+now)\b",
+    r"\b(?:unacceptable|ridiculous|disgraceful|appalling|outrageous)\b",
+    r"\b(?:furious|livid|angry|fed\s+up|sick\s+of|disgusted)\b",
+    r"\b(?:complain|complaint|complaining)\b",
+    r"\b(?:lawyer|legal\s+action|refund\s+now|charge\s?back)\b",
+    r"\b(?:still\s+waiting|no\s+one\s+has\s+(?:replied|answered|helped))\b",
+]
+
+_URGENCY_RE = [re.compile(p, re.IGNORECASE) for p in URGENCY_PATTERNS]
 
 # Escalation phrases, matched on word boundaries so "management" does not trip
 # "agent" and "humanity" does not trip "human". Extend freely; each entry is a
@@ -717,11 +877,12 @@ class PartnershipView(discord.ui.View):
 
 
 class SurveyModal(discord.ui.Modal):
-    """The survey: a 1-5 rating, and whether the chat may be reused.
+    """The survey: three 1-5 scores, and whether the chat may be reused.
 
-    Both answers are dropdowns rather than free text. discord.py 2.6 allows a
+    Every answer is a dropdown rather than free text. discord.py 2.6 allows a
     Select inside a Modal only when wrapped in a Label, which is also what
-    carries the question — a Select's own placeholder is not a label.
+    carries the question and its scale caption — a Select's own placeholder is
+    neither, and is only ever visible before an answer is picked.
     """
 
     def __init__(self, cog: "NorwegianSupport", transcript_id: str, source: typing.Optional[discord.Message]):
@@ -730,22 +891,27 @@ class SurveyModal(discord.ui.Modal):
         self.transcript_id = transcript_id
         self.source = source
 
-        self.rating = discord.ui.Select(
-            custom_id="vlg-survey-rating",
-            placeholder="Pick a rating",
-            options=[
-                discord.SelectOption(label=label, value=value) for value, label in SURVEY_RATING_OPTIONS
-            ],
-            required=True,
-        )
-        self.add_item(discord.ui.Label(text=SURVEY_RATING_QUESTION, component=self.rating))
+        # Rating questions first, in a fixed order, then the one question that
+        # is not a rating. Keeping the yes/no last lets the scale questions read
+        # as a single block instead of being interrupted by a different shape of
+        # answer, and puts the question with a consequence at the end.
+        self.ratings: typing.Dict[str, discord.ui.Select] = {}
+        for key, label, description, scale in SURVEY_RATING_QUESTIONS:
+            select = discord.ui.Select(
+                custom_id=f"vlg-survey-{key}",
+                placeholder="Choose a score",
+                options=survey_rating_options(scale),
+                required=True,
+            )
+            self.add_item(discord.ui.Label(text=label, description=description, component=select))
+            self.ratings[key] = select
 
         self.training = discord.ui.Select(
             custom_id="vlg-survey-training",
             placeholder="Yes or no",
             options=[
-                discord.SelectOption(label="Yes", value="yes"),
-                discord.SelectOption(label="No", value="no"),
+                discord.SelectOption(label="Yes, use it to improve the AI", value="yes"),
+                discord.SelectOption(label="No, do not keep it", value="no"),
             ],
             required=True,
         )
@@ -758,19 +924,23 @@ class SurveyModal(discord.ui.Modal):
         )
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            rating = int(self.rating.values[0])
-        except (IndexError, ValueError):
-            logger.error("Survey submitted without a usable rating: %r", self.rating.values)
-            with contextlib.suppress(discord.HTTPException):
-                await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
-            return
+        ratings = {}
+        for key, select in self.ratings.items():
+            try:
+                ratings[key] = int(select.values[0])
+            except (IndexError, ValueError):
+                # Every rating is required, so an unusable value here means a
+                # malformed payload rather than a question someone skipped.
+                logger.error("Survey submitted without a usable %s score: %r", key, select.values)
+                with contextlib.suppress(discord.HTTPException):
+                    await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
+                return
 
         consented = bool(self.training.values) and self.training.values[0] == "yes"
         await self.cog.record_survey(
             interaction,
             transcript_id=self.transcript_id,
-            rating=rating,
+            ratings=ratings,
             consented=consented,
             source=self.source,
         )
@@ -830,17 +1000,63 @@ def survey_view(transcript_id: str) -> discord.ui.View:
     return view
 
 
+class ChoiceButton(discord.ui.Button):
+    """A yes/no button that always acknowledges the click.
+
+    Replaces Modmail's AcceptButton/DenyButton here. Those answer the
+    interaction *only* by editing the message to drop the view, so any failure
+    of that edit leaves the interaction unacknowledged and Discord tells the
+    user "Interaction failed" — which is what happened on every handoff
+    confirmation, because the buttons sit on a message with nothing else in it
+    and the edit would have emptied it (see BUTTON_SPACER).
+
+    BUTTON_SPACER stops that edit from failing in the first place. This is the
+    second layer: whatever happens to the edit, the click is acknowledged, and
+    the choice is recorded before anything that can raise is attempted.
+    """
+
+    def __init__(self, custom_id: str, emoji: str, value: bool):
+        super().__init__(style=discord.ButtonStyle.gray, emoji=emoji, custom_id=custom_id)
+        self.value = value
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        # First, so a failure below cannot lose a choice the user did make.
+        if view is not None:
+            view.value = self.value
+
+        try:
+            await interaction.response.edit_message(view=None)
+        except discord.HTTPException:
+            logger.error(
+                "Could not clear the choice buttons; acknowledging the click instead.", exc_info=True
+            )
+            with contextlib.suppress(discord.HTTPException):
+                if not interaction.response.is_done():
+                    # A bare acknowledgement. The buttons stay on screen, but
+                    # the click registered and the conversation moves on, which
+                    # is far better than the user being told it failed.
+                    await interaction.response.defer()
+        finally:
+            if view is not None:
+                view.stop()
+
+
 class YesNoView(discord.ui.View):
     """Yes/no view for the handoff confirmation.
 
     Shaped like Modmail's own ConfirmThreadCreationView, but that class hardcodes
-    timeout=30 in __init__ with no parameter to override. The buttons themselves
-    are Modmail's.
+    timeout=30 in __init__ with no parameter to override.
     """
 
     def __init__(self, timeout: float):
         super().__init__(timeout=timeout)
         self.value = None
+
+    def with_choices(self, yes_emoji: str, no_emoji: str) -> "YesNoView":
+        self.add_item(ChoiceButton("nas-handoff-yes", yes_emoji, True))
+        self.add_item(ChoiceButton("nas-handoff-no", no_emoji, False))
+        return self
 
 
 class NorwegianSupport(commands.Cog):
@@ -859,9 +1075,12 @@ class NorwegianSupport(commands.Cog):
         self._user_salt: typing.Optional[str] = None
         self._verbose = False
         self._loaded_at: typing.Optional[datetime] = None
-        # user_id -> summary, handed to on_thread_ready once the channel exists.
-        self._pending_handoff: typing.Dict[int, str] = {}
+        # user_id -> {summary, reason, urgent}, handed to on_thread_ready once
+        # the channel exists.
+        self._pending_handoff: typing.Dict[int, dict] = {}
         self._partnership_view: typing.Optional[PartnershipView] = None
+        # Serialises claim checks; see on_raw_reaction_add.
+        self._claim_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -928,6 +1147,10 @@ class NorwegianSupport(commands.Cog):
             await self._sweep_inactive_conversations()
         except Exception:
             logger.error("Inactivity sweep failed.", exc_info=True)
+        try:
+            await self._maybe_send_digest()
+        except Exception:
+            logger.error("Weekly digest check failed.", exc_info=True)
 
     async def _expire_transcripts(self) -> None:
         """Delete transcripts past their retention window.
@@ -990,6 +1213,147 @@ class NorwegianSupport(commands.Cog):
                 logger.error("Could not warn %s about inactivity.", user_id, exc_info=True)
             else:
                 logger.info("Warned %s that their conversation will close.", user_id)
+
+    async def _maybe_send_digest(self) -> None:
+        """Post the weekly digest once the window comes round.
+
+        Driven off the existing sweep rather than its own timer, and gated on a
+        stored timestamp rather than an in-memory one, so a restart mid-week
+        neither skips a digest nor sends a second.
+        """
+        now = datetime.now(timezone.utc)
+        if now.weekday() != DIGEST_WEEKDAY or now.hour < DIGEST_HOUR_UTC:
+            return
+
+        doc = await self.db.find_one({"_type": TYPE_META, "key": "last_digest_at"})
+        last = (doc or {}).get("value")
+        if isinstance(last, datetime):
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if now - last < DIGEST_MIN_GAP:
+                return
+        elif doc is None:
+            # First ever run. Seed the clock and send nothing, so loading the
+            # plugin on a Monday morning does not fire a digest with a few
+            # hours of data in it.
+            await self.db.update_one(
+                {"_type": TYPE_META, "key": "last_digest_at"},
+                {"$set": {"value": now}},
+                upsert=True,
+            )
+            logger.info("Weekly digest scheduled; the first one goes out next week.")
+            return
+
+        # Stamped before sending. A send that fails must not retry on every
+        # sweep for the rest of the day.
+        await self.db.update_one(
+            {"_type": TYPE_META, "key": "last_digest_at"},
+            {"$set": {"value": now}},
+            upsert=True,
+        )
+
+        embed = await self._digest_embed()
+        if embed is None:
+            logger.info("Weekly digest skipped: nothing on record.")
+            return
+
+        if await self._post_to_staff(embed, what="weekly digest") is not None:
+            logger.info("Weekly digest posted.")
+
+    async def _digest_embed(self) -> typing.Optional[discord.Embed]:
+        """The digest body, or None when there is nothing worth sending."""
+        transcripts = await self.db.find({"_type": TYPE_TRANSCRIPT}).to_list(length=2000)
+        if not transcripts:
+            return None
+
+        gaps = self._faq_gaps(transcripts)
+        embed = self._embed(
+            title="Weekly digest — what the assistant could not answer",
+            description=(
+                f"**{gaps['total']}** conversation(s) in the last {TRANSCRIPT_RETENTION_DAYS} days. "
+                f"**{gaps['deferred']}** ended with the assistant unable to answer "
+                f"(**{gaps['deferral_rate']:.0f}%** of finished conversations).\n\n"
+                "Each FAQ entry written for something below removes a handoff."
+            ),
+        )
+        await self._add_rating_field(embed)
+        self._add_gap_fields(embed, gaps)
+        embed.set_footer(text=f"Runs weekly • {self.bot.prefix}vlg stats for this on demand")
+        return embed
+
+    def _guild_channel(self, channel_id: int):
+        """A staff channel by id, or None if this bot cannot see it.
+
+        Tries the configured guild first so an id that also exists elsewhere
+        cannot be resolved to the wrong server, then falls back to a global
+        lookup for a channel in a guild the constant does not name.
+        """
+        try:
+            guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+            channel = guild.get_channel(channel_id) if guild else None
+            return channel or self.bot.get_channel(channel_id)
+        except Exception:
+            logger.error("Could not resolve channel %s.", channel_id, exc_info=True)
+            return None
+
+    async def _post_to_staff(self, embed: discord.Embed, *, what: str) -> typing.Optional[discord.Message]:
+        """Send one notification to the staff channel. None if it did not land."""
+        channel = self._guild_channel(STAFF_CHANNEL_ID)
+        if channel is None:
+            logger.error(
+                "Staff channel %s is not visible to this bot, so the %s was not sent. "
+                "Check VLG_STAFF_CHANNEL_ID.",
+                STAFF_CHANNEL_ID,
+                what,
+            )
+            return None
+        try:
+            return await channel.send(embed=embed)
+        except discord.HTTPException:
+            logger.error("Could not post the %s to the staff channel.", what, exc_info=True)
+            return None
+
+    async def _alert_low_rating(
+        self, transcript_id: ObjectId, ratings: typing.Dict[str, int], *, consented: bool
+    ) -> None:
+        """Tell staff about a bad score while it is still worth acting on.
+
+        Carries the scores and, when the user agreed to it, the conversation
+        itself — without that consent there is a rating and nothing to read,
+        which is the whole reason the survey asks.
+        """
+        headline = ratings.get(SURVEY_HEADLINE_KEY)
+        embed = self._embed(
+            title=f"Low rating — {headline}/5",
+            description="A conversation was just rated poorly.",
+            color=self.bot.error_color,
+        )
+        embed.add_field(
+            name="Scores",
+            value="\n".join(
+                f"**{ratings[key]}**/5 — {label}"
+                for key, label, _, _ in SURVEY_RATING_QUESTIONS
+                if key in ratings
+            )
+            or "none recorded",
+            inline=False,
+        )
+
+        if consented:
+            training = await self.db.find_one({"_type": TYPE_TRAINING, "transcript_id": transcript_id})
+            if training is not None:
+                embed.add_field(
+                    name="What was said",
+                    value=self._training_sample_body(training),
+                    inline=False,
+                )
+                embed.set_footer(text="Kept for review, so this conversation can be read in full")
+        else:
+            embed.set_footer(
+                text="The user did not agree to us keeping this chat, so there is nothing to read"
+            )
+
+        await self._post_to_staff(embed, what="low-rating alert")
 
     async def _dm_channel(self, user_id: int):
         """The user's DM channel, or None if they cannot be reached."""
@@ -1217,19 +1581,15 @@ class NorwegianSupport(commands.Cog):
     async def _send_buttons(self, channel, view: discord.ui.View):
         """Send a message carrying only the buttons. None if it could not go out.
 
-        Discord has historically refused a message with components and no
-        content or embed, and I could not verify which way this account's API
-        behaves from here, so an empty send falls back to a zero-width space
-        rather than losing the buttons. The space renders as nothing.
+        The spacer is always sent, never as a fallback: see BUTTON_SPACER. A
+        components-only message goes out fine and is the reason clicking either
+        handoff button used to fail, because the reply to the click is an edit
+        that would have left the message empty.
         """
         async with safe_typing(channel):
             await asyncio.sleep(TYPING_DELAY_SECONDS)
         try:
-            return await channel.send(view=view)
-        except discord.HTTPException:
-            logger.debug("Components-only message refused; retrying with a spacer.", exc_info=True)
-        try:
-            return await channel.send(content="​", view=view)
+            return await channel.send(content=BUTTON_SPACER, view=view)
         except discord.HTTPException:
             logger.debug("Buttons could not be sent at all.", exc_info=True)
             return None
@@ -1260,6 +1620,55 @@ class NorwegianSupport(commands.Cog):
             # Emoji, punctuation or an attachment with no text.
             return True
         return all(word in GREETING_WORDS for word in words)
+
+    @staticmethod
+    def _profanity_match(text: str) -> typing.Optional[str]:
+        for pattern in _PROFANITY_RE:
+            found = pattern.search(text)
+            if found:
+                return found.group(0)
+        return None
+
+    @staticmethod
+    def _urgency_match(text: str) -> typing.Optional[str]:
+        for pattern in _URGENCY_RE:
+            found = pattern.search(text)
+            if found:
+                return found.group(0)
+        return None
+
+    async def _handle_profanity(self, message: discord.Message, matched: str) -> bool:
+        """Warn, then close. True when the message was dealt with here.
+
+        The count lives on the open transcript, so it resets with the
+        conversation exactly as asked — a user who swore last week starts again
+        on a clean slate, and someone who swears twice in one chat does not.
+        """
+        user = message.author
+        # Recorded like any other turn first. That keeps the conversation
+        # readable afterwards, and means an opening message that swears has a
+        # transcript to count against rather than being a special case.
+        await self._append_transcript(user.id, message.content or "", status=STATUS_CHAT)
+
+        transcript = await self.db.find_one_and_update(
+            self._open_filter(await self._user_hash(user.id)),
+            {"$inc": {"profanity_count": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        count = (transcript or {}).get("profanity_count", 1)
+        logger.info("Profanity %r from %s (%s), strike %s.", matched, user, user.id, count)
+
+        if count < PROFANITY_STRIKES:
+            with contextlib.suppress(discord.HTTPException):
+                await self._send_with_typing(message.channel, self._ai_embed(PROFANITY_WARNING_TEXT))
+            return True
+
+        with contextlib.suppress(discord.HTTPException):
+            await self._send_with_typing(message.channel, self._ai_embed(PROFANITY_CLOSING_TEXT))
+        # Deliberately the same close as an inactivity timeout: same closing
+        # messages, same survey, same fresh start on their next message.
+        await self._close_conversation(user.id, message.channel, reason="profanity")
+        return True
 
     @staticmethod
     def _is_closing_request(text: str) -> typing.Optional[str]:
@@ -1309,9 +1718,7 @@ class NorwegianSupport(commands.Cog):
         # else. The consent notice keeps its text labels: an emoji-only choice is
         # fine for "shall I fetch a human", not for accepting a privacy policy.
         yes_emoji, no_emoji = self._button_emoji()
-        view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
-        view.add_item(AcceptButton("nas-handoff-yes", yes_emoji))
-        view.add_item(DenyButton("nas-handoff-no", no_emoji))
+        view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS).with_choices(yes_emoji, no_emoji)
 
         # The statement and the buttons are two separate messages.
         try:
@@ -1335,9 +1742,9 @@ class NorwegianSupport(commands.Cog):
                 BUTTON_NO_EMOJI,
                 self.bot.prefix,
             )
-            view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS)
-            view.add_item(AcceptButton("nas-handoff-yes", BUTTON_YES_FALLBACK))
-            view.add_item(DenyButton("nas-handoff-no", BUTTON_NO_FALLBACK))
+            view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS).with_choices(
+                BUTTON_YES_FALLBACK, BUTTON_NO_FALLBACK
+            )
             prompt = await self._send_buttons(message.channel, view)
 
         if prompt is None:
@@ -1402,6 +1809,67 @@ class NorwegianSupport(commands.Cog):
                 return BUTTON_YES_FALLBACK, BUTTON_NO_FALLBACK
         return BUTTON_YES_EMOJI, BUTTON_NO_EMOJI
 
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """First staff member to react owns the lead.
+
+        Raw rather than `on_reaction_add` so a post from before the last
+        restart still claims — the cached-message variant silently ignores
+        anything not in memory, which is most of what this channel holds.
+        """
+        if str(payload.emoji) != CLAIM_EMOJI:
+            return
+        if payload.channel_id != PARTNERSHIP_CHANNEL_ID:
+            return
+        if payload.user_id == getattr(self.bot.user, "id", None):
+            return
+
+        channel = self._guild_channel(payload.channel_id)
+        if channel is None:
+            return
+
+        # Serialised because the check and the edit are separated by awaits, and
+        # two people clicking at the same moment would otherwise both read the
+        # post as unclaimed and both be told they had it.
+        async with self._claim_lock:
+            try:
+                message = await channel.fetch_message(payload.message_id)
+            except discord.HTTPException:
+                return
+
+            if message.author.id != getattr(self.bot.user, "id", None) or not message.embeds:
+                return
+
+            embed = message.embeds[0]
+            footer = (embed.footer.text or "") if embed.footer else ""
+            if footer != CLAIM_UNCLAIMED_FOOTER:
+                # Already claimed, or not a claimable post. Take the late
+                # reaction back off so the post keeps showing one owner.
+                if footer.startswith(CLAIM_CLAIMED_PREFIX):
+                    with contextlib.suppress(discord.HTTPException):
+                        member = payload.member or await self.bot.fetch_user(payload.user_id)
+                        await message.remove_reaction(payload.emoji, member)
+                return
+
+            claimer = payload.member or self.bot.get_user(payload.user_id)
+            if claimer is None:
+                with contextlib.suppress(discord.HTTPException):
+                    claimer = await self.bot.fetch_user(payload.user_id)
+            if claimer is None:
+                return
+
+            name = getattr(claimer, "display_name", None) or str(claimer)
+            embed.set_footer(text=f"{CLAIM_CLAIMED_PREFIX}{name}")
+            embed.colour = self.bot.main_color
+
+            try:
+                await message.edit(embed=embed)
+            except discord.HTTPException:
+                logger.error("Could not mark partnership lead %s claimed.", payload.message_id, exc_info=True)
+                return
+
+        logger.info("Partnership lead %s claimed by %s (%s).", payload.message_id, name, payload.user_id)
+
     @staticmethod
     def _partnership_match(text: str) -> typing.Optional[str]:
         for pattern in _PARTNERSHIP_RE:
@@ -1445,14 +1913,7 @@ class NorwegianSupport(commands.Cog):
         for field, (label, _, _) in zip(answers, PARTNERSHIP_QUESTIONS):
             embed.add_field(name=label, value=truncate(str(field.value).strip() or "—", 1000), inline=False)
 
-        channel = None
-        try:
-            guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
-            channel = guild.get_channel(PARTNERSHIP_CHANNEL_ID) if guild else None
-            if channel is None:
-                channel = self.bot.get_channel(PARTNERSHIP_CHANNEL_ID)
-        except Exception:
-            logger.error("Could not resolve the partnership channel.", exc_info=True)
+        channel = self._guild_channel(PARTNERSHIP_CHANNEL_ID)
 
         delivered = False
         if channel is None:
@@ -1463,10 +1924,17 @@ class NorwegianSupport(commands.Cog):
             )
         else:
             try:
-                await channel.send(embed=embed)
+                embed.set_footer(text=CLAIM_UNCLAIMED_FOOTER)
+                posted = await channel.send(embed=embed)
                 delivered = True
             except discord.HTTPException:
                 logger.error("Could not post the partnership application.", exc_info=True)
+            else:
+                # Seeded by the bot so staff can claim with one click rather
+                # than finding the emoji. Failing here costs the convenience,
+                # not the claim: reacting manually works just as well.
+                with contextlib.suppress(discord.HTTPException):
+                    await posted.add_reaction(CLAIM_EMOJI)
 
         dm = interaction.channel
         if dm is None:
@@ -1558,6 +2026,18 @@ class NorwegianSupport(commands.Cog):
             upsert=True,
         )
 
+    async def _flag_urgency(self, user_id: int) -> None:
+        """Mark the conversation as sounding angry or urgent.
+
+        Separate from `handoff_reason` because it is orthogonal to it: someone
+        can be furious *and* asking for a partnership, and staff want to see
+        both on the ticket.
+        """
+        await self.db.update_one(
+            self._open_filter(await self._user_hash(user_id)),
+            {"$set": {"urgent": True}},
+        )
+
     async def _mark_handoff_reason(self, user_id: int, reason: str) -> None:
         """Record why a conversation is about to reach a human.
 
@@ -1630,12 +2110,17 @@ class NorwegianSupport(commands.Cog):
         interaction: discord.Interaction,
         *,
         transcript_id: str,
-        rating: int,
+        ratings: typing.Dict[str, int],
         consented: bool,
         source: typing.Optional[discord.Message],
     ) -> None:
         """Store the answers and, on a yes, the copy kept for review."""
         now = datetime.now(timezone.utc)
+        # Kept alongside the per-question scores so one number still means
+        # something without unpacking the dict: it is what `.vlg stats` reports,
+        # what the low-rating alert fires on, and what answers stored before
+        # there was more than one question already hold.
+        headline = ratings.get(SURVEY_HEADLINE_KEY)
         user_hash = await self._user_hash(interaction.user.id)
 
         try:
@@ -1670,7 +2155,8 @@ class NorwegianSupport(commands.Cog):
                     "$set": {
                         "messages": transcript.get("messages", []),
                         "message_count": len(transcript.get("messages", [])),
-                        "rating": rating,
+                        "ratings": ratings,
+                        "rating": headline,
                         "handoff_reason": transcript.get("handoff_reason"),
                         "conversation_started_at": transcript.get("created_at"),
                         "conversation_ended_at": transcript.get("closed_at"),
@@ -1690,7 +2176,8 @@ class NorwegianSupport(commands.Cog):
                 self._survey_filter(oid, user_hash),
                 {
                     "$set": {
-                        "rating": rating,
+                        "ratings": ratings,
+                        "rating": headline,
                         "training_consent": consented,
                         "answered_at": now,
                     }
@@ -1721,11 +2208,23 @@ class NorwegianSupport(commands.Cog):
             await interaction.response.send_message(thanks, ephemeral=True)
 
         logger.info(
-            "Survey answered for %s: rating %s, training consent %s.", transcript_id, rating, consented
+            "Survey answered for %s: %s, training consent %s.",
+            transcript_id,
+            ", ".join(f"{k}={v}" for k, v in ratings.items()) or "no scores",
+            consented,
         )
         self._diag(
-            "survey %s rating=%s consent=%s stored=%s", transcript_id, rating, consented, stored_training
+            "survey %s ratings=%r consent=%s stored=%s", transcript_id, ratings, consented, stored_training
         )
+
+        # Fired last and never allowed to affect the user's reply: they have
+        # already been thanked, and a staff notification failing is not their
+        # problem.
+        if stored_rating and headline is not None and headline <= LOW_RATING_THRESHOLD:
+            try:
+                await self._alert_low_rating(oid, ratings, consented=consented)
+            except Exception:
+                logger.error("Could not raise the low-rating alert.", exc_info=True)
 
     @staticmethod
     def _replay(history: list) -> list:
@@ -1831,6 +2330,18 @@ class NorwegianSupport(commands.Cog):
                 # Not worth abandoning the request over; carry on and answer.
                 logger.error("Failed opening conversation with %s (%s).", user, user.id, exc_info=True)
 
+        # After the opening, so a first message that swears still gets the
+        # disclosure, and before everything else, so no other route can answer
+        # a message that is about to be moderated.
+        swore = self._profanity_match(content)
+        if swore:
+            return await self._handle_profanity(message, swore)
+
+        # Noted for the ticket tag, not acted on. Checked on every message
+        # because the temper usually arrives a few turns in, not at the top.
+        if self._urgency_match(content):
+            await self._flag_urgency(user.id)
+
         # Only once a conversation is already running: "bye" as an opening line
         # is not a request to close something that has not started.
         if transcript is not None:
@@ -1860,7 +2371,11 @@ class NorwegianSupport(commands.Cog):
             if await self._offer_partnership_form(message):
                 return True
             logger.error("Could not offer the partnership form to %s; handing off.", user)
-            await self._mark_handoff_reason(user.id, HANDOFF_AI_ERROR)
+            # Tagged as the lead it is, not as the error that routed it. A
+            # submitted form never opens a thread at all, so this reason only
+            # ever appears when the form itself could not be offered — which is
+            # exactly the case where staff need to know it was a partnership.
+            await self._mark_handoff_reason(user.id, HANDOFF_PARTNERSHIP)
             return False
 
         matched = self._escalation_match(content)
@@ -2028,11 +2543,32 @@ class NorwegianSupport(commands.Cog):
         user = message.author
         transcript = await self._open_transcript(user.id)
         history = (transcript or {}).get("messages", [])
+
         try:
-            self._pending_handoff[user.id] = await self._summarise(history)
+            summary = await self._summarise(history)
         except Exception:
             logger.error("Preparing the handoff summary failed.", exc_info=True)
-            self._pending_handoff[user.id] = SUMMARY_FALLBACK
+            summary = SUMMARY_FALLBACK
+
+        # Why it escalated is read here rather than in on_thread_ready, because
+        # the transcript is closed in between and carrying it across is cheaper
+        # and less fragile than looking it up again afterwards.
+        self._pending_handoff[user.id] = {
+            "summary": summary,
+            "reason": (transcript or {}).get("handoff_reason"),
+            "urgent": bool((transcript or {}).get("urgent")),
+        }
+
+    @staticmethod
+    def _handoff_tags(pending: dict) -> typing.List[str]:
+        """The triage labels for one handoff, most specific first."""
+        tags = []
+        if pending.get("urgent"):
+            tags.append(HANDOFF_URGENCY_TAG)
+        tag = HANDOFF_REASON_TAGS.get(pending.get("reason"))
+        if tag:
+            tags.append(tag)
+        return tags
 
     @commands.Cog.listener()
     async def on_thread_ready(self, thread, creator, category, initial_message):
@@ -2045,8 +2581,8 @@ class NorwegianSupport(commands.Cog):
         if recipient is None:
             return
 
-        summary = self._pending_handoff.pop(recipient.id, None)
-        if summary is None:
+        pending = self._pending_handoff.pop(recipient.id, None)
+        if pending is None:
             # A thread Modmail opened without going through the pre-screen,
             # such as ?contact. Not ours to annotate.
             return
@@ -2081,12 +2617,17 @@ class NorwegianSupport(commands.Cog):
             except Exception:
                 logger.error("Could not store ticket mapping %s.", reference, exc_info=True)
 
+        tags = self._handoff_tags(pending)
         embed = self._embed(
             title="Assistant summary",
-            description=summary,
-            color=self.bot.main_color,
+            description=pending.get("summary") or SUMMARY_FALLBACK,
+            # An angry or urgent ticket is coloured as one, so it stands out in
+            # the channel before anyone reads a word of it.
+            color=self.bot.error_color if pending.get("urgent") else self.bot.main_color,
             footer=f"Reference {reference}" if reference else "Reference unavailable",
         )
+        if tags:
+            embed.add_field(name="Triage", value="  ".join(f"**{t}**" for t in tags), inline=False)
         try:
             await thread.channel.send(embed=embed)
         except discord.HTTPException:
@@ -2218,6 +2759,15 @@ class NorwegianSupport(commands.Cog):
             value=f"`{self.db.name}`",
             inline=True,
         )
+        # First-class here, not just in `.vlg version`: after a deploy this is
+        # the one line that answers "did the restart actually pick up the new
+        # code" without anyone having to guess from behaviour.
+        commit = self._git_head()
+        embed.add_field(
+            name="Commit",
+            value=f"`{commit}`" if commit else "unknown — not a git checkout",
+            inline=True,
+        )
         embed.add_field(
             name="Indexes",
             value="ready" if self._ready.is_set() else "pending",
@@ -2320,6 +2870,13 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
 
+        problems, lines = self._config_checks()
+        embed.add_field(
+            name=("Configuration" if not problems else f"Configuration — **{problems} to fix**"),
+            value="\n".join(lines),
+            inline=False,
+        )
+
         # The linked privacy policy is what now states retention, so this is no
         # longer self-checking: if that page promises deletion, this has to be set
         # for the promise to hold.
@@ -2338,6 +2895,106 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
         await ctx.send(embed=embed)
+
+    def _config_checks(self) -> typing.Tuple[int, typing.List[str]]:
+        """Every setting that can be wrong without anything visibly breaking.
+
+        A bad channel id or an unset key does not raise anywhere — it just means
+        a notification silently never arrives. Returns how many are wrong, and
+        one line per check, so a glance at `.vlg status` answers "is the
+        environment right" without reading `.env` on the box.
+        """
+        checks: typing.List[typing.Tuple[bool, str, str]] = []
+
+        guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+        checks.append(
+            (
+                guild is not None,
+                "Partnership guild",
+                f"**{guild}**" if guild else f"`{PARTNERSHIP_GUILD_ID}` — bot is not in this server",
+            )
+        )
+
+        modmail_guild = getattr(self.bot, "guild", None)
+        checks.append(
+            (
+                modmail_guild is not None,
+                "Modmail guild",
+                f"**{modmail_guild}**" if modmail_guild else "unresolved — check `GUILD_ID`",
+            )
+        )
+
+        staff = self._guild_channel(STAFF_CHANNEL_ID)
+        configured = "set" if os.getenv("VLG_STAFF_CHANNEL_ID") else "defaulted to the partnership channel"
+        checks.append(
+            (
+                staff is not None,
+                "Staff notifications",
+                (
+                    f"{staff.mention} ({configured}) — digest and low-rating alerts"
+                    if staff is not None
+                    else f"`{STAFF_CHANNEL_ID}` not visible ({configured}) — "
+                    "**alerts and the weekly digest will not arrive**"
+                ),
+            )
+        )
+
+        # Set but unparseable falls back silently by design, so say so here.
+        raw_staff = (os.getenv("VLG_STAFF_CHANNEL_ID") or "").strip()
+        if raw_staff:
+            parseable = raw_staff.isdigit()
+            checks.append(
+                (
+                    parseable,
+                    "VLG_STAFF_CHANNEL_ID",
+                    f"`{raw_staff}`" if parseable else f"`{raw_staff}` is not a channel id — **ignored**",
+                )
+            )
+
+        key_set = bool(os.getenv("GROQ_API_KEY"))
+        checks.append(
+            (
+                key_set and AsyncGroq is not None,
+                "GROQ_API_KEY",
+                (
+                    "set"
+                    if key_set and AsyncGroq is not None
+                    else ("groq package missing" if key_set else "**not set** — every request escalates")
+                ),
+            )
+        )
+
+        log_url = (self.bot.config.get("log_url") or "").strip()
+        checks.append(
+            (
+                bool(log_url),
+                "log_url",
+                f"`{log_url}`" if log_url else f"unset — `{self.bot.prefix}vlg ticket` cannot link a log",
+            )
+        )
+
+        expiry = self.bot.config.get("log_expiration")
+        expiry_set = bool(expiry and expiry != isodate.Duration())
+        checks.append(
+            (
+                expiry_set,
+                "Retention",
+                (
+                    f"transcripts {TRANSCRIPT_RETENTION_DAYS}d, ticket logs "
+                    f"`{isodate.duration_isoformat(expiry)}`"
+                    if expiry_set
+                    else f"transcripts {TRANSCRIPT_RETENTION_DAYS}d, ticket logs **never expire**"
+                ),
+            )
+        )
+
+        problems = sum(1 for ok, _, _ in checks if not ok)
+        # Named rather than inlined: an escape inside an f-string expression is
+        # a syntax error before Python 3.12, and this has to run on 3.10.
+        good = "\N{WHITE HEAVY CHECK MARK}"
+        bad = "\N{WARNING SIGN}"
+        lines = [f"{good if ok else bad} {name}: {detail}" for ok, name, detail in checks]
+        return problems, lines
 
     def _source_mtime(self) -> typing.Optional[datetime]:
         """When the plugin file on disk last changed. None if unreadable."""
@@ -2590,21 +3247,12 @@ class NorwegianSupport(commands.Cog):
                 )
             )
 
-        total = len(transcripts)
-        still_open = sum(1 for t in transcripts if t.get("closed_at") is None)
-        handed_off = [t for t in transcripts if t.get("handed_off_at") is not None]
-        finished = [t for t in transcripts if t.get("closed_at") is not None]
-
-        # Only genuine deferrals belong in the headline rate. A user typing
-        # "agent" is a routing preference, not a failure to answer.
-        deferred = [t for t in handed_off if t.get("handoff_reason") == HANDOFF_AI_DEFERRED]
-        deferral_rate = (len(deferred) / len(finished) * 100) if finished else 0.0
-        handoff_rate = (len(handed_off) / len(finished) * 100) if finished else 0.0
+        gaps = self._faq_gaps(transcripts)
 
         embed = self._embed(
             title="Vueling AI — stats",
             description=(
-                f"**{total}** conversation(s) on record, **{still_open}** still open.\n"
+                f"**{gaps['total']}** conversation(s) on record, **{gaps['still_open']}** still open.\n"
                 f"Transcripts are deleted after {TRANSCRIPT_RETENTION_DAYS} days, so this is "
                 "a rolling window, not all time."
             ),
@@ -2612,76 +3260,145 @@ class NorwegianSupport(commands.Cog):
         embed.add_field(
             name="Reached a human",
             value=(
-                f"**{handoff_rate:.0f}%** of finished conversations ({len(handed_off)}/{len(finished)})\n"
-                f"of which **{deferral_rate:.0f}%** were the assistant genuinely unable to answer"
-                if finished
+                f"**{gaps['handoff_rate']:.0f}%** of finished conversations "
+                f"({gaps['handed_off']}/{gaps['finished']})\n"
+                f"of which **{gaps['deferral_rate']:.0f}%** were the assistant genuinely unable to answer"
+                if gaps["finished"]
                 else "no finished conversations yet"
             ),
             inline=False,
         )
 
-        reasons = {}
-        for t in handed_off:
-            reasons[t.get("handoff_reason") or "unrecorded"] = (
-                reasons.get(t.get("handoff_reason") or "unrecorded", 0) + 1
-            )
-        if reasons:
+        if gaps["reasons"]:
             embed.add_field(
                 name="Why it handed off",
                 value="\n".join(
                     f"`{count}` {HANDOFF_REASON_LABELS.get(reason, reason)}"
-                    for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1])
+                    for reason, count in gaps["reasons"]
                 ),
                 inline=False,
             )
 
-        questions = [self._last_user_message(t) for t in deferred]
+        await self._add_rating_field(embed)
+        self._add_gap_fields(embed, gaps)
+
+        embed.set_footer(text="Add FAQ entries for what shows up here; each one removes a handoff.")
+        await ctx.send(embed=embed)
+
+    @staticmethod
+    def _faq_gaps(transcripts: typing.List[dict]) -> dict:
+        """Reduce transcripts to the numbers `.vlg stats` and the digest report.
+
+        Pulled out of the command so the weekly digest reports exactly what
+        someone running the command by hand would see, rather than a second
+        implementation that can drift from it.
+        """
+        still_open = sum(1 for t in transcripts if t.get("closed_at") is None)
+        handed_off = [t for t in transcripts if t.get("handed_off_at") is not None]
+        finished = [t for t in transcripts if t.get("closed_at") is not None]
+
+        # Only genuine deferrals belong in the headline rate. A user typing
+        # "agent" is a routing preference, not a failure to answer.
+        deferred = [t for t in handed_off if t.get("handoff_reason") == HANDOFF_AI_DEFERRED]
+
+        reasons: typing.Dict[str, int] = {}
+        for t in handed_off:
+            key = t.get("handoff_reason") or "unrecorded"
+            reasons[key] = reasons.get(key, 0) + 1
+
+        questions = [NorwegianSupport._last_user_message(t) for t in deferred]
         questions = [q for q in questions if q]
 
-        if questions:
-            repeats = {}
-            for q in questions:
-                key = " ".join(re.findall(r"[\w']+", q.lower()))
-                repeats[key] = repeats.get(key, 0) + 1
-            repeated = [(k, c) for k, c in repeats.items() if c > 1]
-            repeated.sort(key=lambda kv: -kv[1])
-            if repeated:
-                embed.add_field(
-                    name="Asked more than once",
-                    value="\n".join(f"`{c}x` {truncate(k, 80)}" for k, c in repeated[:5]),
-                    inline=False,
-                )
+        repeats: typing.Dict[str, int] = {}
+        for q in questions:
+            key = " ".join(re.findall(r"[\w']+", q.lower()))
+            repeats[key] = repeats.get(key, 0) + 1
+        repeated = sorted(((k, c) for k, c in repeats.items() if c > 1), key=lambda kv: -kv[1])
 
-            # Most questions are phrased uniquely, so term frequency is what
-            # actually points at the missing FAQ entry.
-            terms = {}
-            for q in questions:
-                for word in set(re.findall(r"[a-z']{3,}", q.lower())):
-                    if word not in STATS_STOPWORDS:
-                        terms[word] = terms.get(word, 0) + 1
-            ranked = sorted(terms.items(), key=lambda kv: -kv[1])[:12]
-            if ranked:
-                embed.add_field(
-                    name="Common terms in unanswered questions",
-                    value=" ".join(f"`{w}`×{c}" for w, c in ranked),
-                    inline=False,
-                )
+        # Most questions are phrased uniquely, so term frequency is what
+        # actually points at the missing FAQ entry.
+        terms: typing.Dict[str, int] = {}
+        for q in questions:
+            for word in set(re.findall(r"[a-z']{3,}", q.lower())):
+                if word not in STATS_STOPWORDS:
+                    terms[word] = terms.get(word, 0) + 1
+        ranked = sorted(terms.items(), key=lambda kv: -kv[1])[:12]
 
-            embed.add_field(
-                name="Most recent unanswered",
-                value="\n".join(f"• {truncate(q, 90)}" for q in questions[-5:]),
-                inline=False,
-            )
-        else:
+        return {
+            "total": len(transcripts),
+            "still_open": still_open,
+            "handed_off": len(handed_off),
+            "finished": len(finished),
+            "deferred": len(deferred),
+            "handoff_rate": (len(handed_off) / len(finished) * 100) if finished else 0.0,
+            "deferral_rate": (len(deferred) / len(finished) * 100) if finished else 0.0,
+            "reasons": sorted(reasons.items(), key=lambda kv: -kv[1]),
+            "repeated": repeated,
+            "terms": ranked,
+            "questions": questions,
+        }
+
+    @staticmethod
+    def _add_gap_fields(embed: discord.Embed, gaps: dict) -> None:
+        """The what-to-write-next half, shared by the command and the digest."""
+        if not gaps["questions"]:
             embed.add_field(
                 name="Unanswered questions",
                 value="None recorded. Either nothing has been deferred, or those "
                 "conversations predate handoff reasons being stored.",
                 inline=False,
             )
+            return
 
-        embed.set_footer(text="Add FAQ entries for what shows up here; each one removes a handoff.")
-        await ctx.send(embed=embed)
+        if gaps["repeated"]:
+            embed.add_field(
+                name="Asked more than once",
+                value="\n".join(f"`{c}x` {truncate(k, 80)}" for k, c in gaps["repeated"][:5]),
+                inline=False,
+            )
+        if gaps["terms"]:
+            embed.add_field(
+                name="Common terms in unanswered questions",
+                value=" ".join(f"`{w}`×{c}" for w, c in gaps["terms"]),
+                inline=False,
+            )
+        embed.add_field(
+            name="Most recent unanswered",
+            value="\n".join(f"• {truncate(q, 90)}" for q in gaps["questions"][-5:]),
+            inline=False,
+        )
+
+    async def _add_rating_field(self, embed: discord.Embed) -> None:
+        """Average survey scores, when any have been submitted."""
+        try:
+            answers = await self.db.find(
+                {"_type": TYPE_SURVEY}, {"ratings": 1, "rating": 1, "training_consent": 1}
+            ).to_list(length=2000)
+        except Exception:
+            logger.error("Could not read survey answers.", exc_info=True)
+            return
+
+        if not answers:
+            return
+
+        lines = []
+        for key, label, _, _ in SURVEY_RATING_QUESTIONS:
+            # Answers stored before there was more than one question carry only
+            # the headline score, so fall back to it for that one question.
+            scores = []
+            for a in answers:
+                score = (a.get("ratings") or {}).get(key)
+                if score is None and key == SURVEY_HEADLINE_KEY:
+                    score = a.get("rating")
+                if isinstance(score, int):
+                    scores.append(score)
+            if scores:
+                lines.append(f"**{sum(scores) / len(scores):.1f}**/5 — {label} ({len(scores)})")
+
+        consented = sum(1 for a in answers if a.get("training_consent"))
+        lines.append(f"{consented} of {len(answers)} agreed we could keep the chat")
+
+        embed.add_field(name="Survey", value="\n".join(lines), inline=False)
 
     @staticmethod
     def _last_user_message(transcript: dict) -> typing.Optional[str]:
@@ -2780,6 +3497,35 @@ class NorwegianSupport(commands.Cog):
 
         await ctx.send(embed=self._embed(description=note))
         logger.info("Erased stored data for %s (%s) at the request of %s.", user, user.id, ctx.author)
+
+    @vlg.command(name="digest")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def vlg_digest(self, ctx):
+        """Send the weekly digest now, without waiting for its slot.
+
+        For checking the staff channel is reachable and the content reads
+        right. Does not move the weekly schedule.
+        """
+        embed = await self._digest_embed()
+        if embed is None:
+            return await ctx.send(
+                embed=self._embed(
+                    description="Nothing on record to summarise yet.", color=self.bot.error_color
+                )
+            )
+
+        sent = await self._post_to_staff(embed, what="weekly digest")
+        await ctx.send(
+            embed=self._embed(
+                description=(
+                    f"Digest posted to <#{STAFF_CHANNEL_ID}>."
+                    if sent is not None
+                    else f"**Could not post to <#{STAFF_CHANNEL_ID}>** (`{STAFF_CHANNEL_ID}`). "
+                    "Check the bot can see that channel, or set `VLG_STAFF_CHANNEL_ID`."
+                ),
+                color=None if sent is not None else self.bot.error_color,
+            )
+        )
 
     @vlg.command(name="training")
     @checks.has_permissions(PermissionLevel.SUPPORTER)

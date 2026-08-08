@@ -32,6 +32,7 @@ and ticket log retention must not read `Never`.
 | `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
 | `.vlg forget @user` | Supporter | Delete a user's stored assistant conversations |
 | `.vlg training [n]` | Supporter | Conversations kept for review: count and samples |
+| `.vlg digest` | Supporter | Send the weekly digest now, for testing the channel |
 | `.vlg ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
 
 The group is `.vlg` (`?nas` still works as an alias, so nothing breaks mid-rollout).
@@ -138,6 +139,59 @@ GROQ_API_KEY=gsk_...
 export needed. `.vlg status` reports whether the key and the `groq` package are
 both present. Without either, every request simply escalates to a human; nothing
 breaks.
+
+Optional, and worth setting:
+
+```
+VLG_STAFF_CHANNEL_ID=...
+```
+
+Where the weekly digest and low-rating alerts land. **It defaults to the
+partnership channel**, because that one is already known to be visible to the
+bot — which also means that without this set, leads and alerts share a channel.
+Point it somewhere of its own. A value that is not a number is ignored with a
+warning rather than taking the plugin down, and `.vlg status` says which of the
+two is in effect.
+
+### Config sanity
+
+`.vlg status` now ends with a **Configuration** block: one line per setting that
+can be wrong without anything visibly breaking — both guild IDs, the staff
+channel, `GROQ_API_KEY`, `log_url`, and retention. A bad `.env` value does not
+raise anywhere; it just means a notification silently never arrives, so this is
+the place that says so. The heading counts the problems, so a healthy bot is one
+glance rather than a read.
+
+The **Commit** field alongside it is the short hash of the running checkout. After
+a deploy, compare it against what you shipped rather than guessing from
+behaviour whether the restart took.
+
+## Running twice
+
+Two bot processes on one token both receive every gateway event, so every DM is
+answered twice. Nothing in Discord's API prevents this and neither process logs
+anything unusual.
+
+`core/single_instance.py` takes an `flock` before `main()` does anything else. A
+second process refuses to start and names the PID holding the lock:
+
+```
+another bot process is already running (pid 4171, lock /tmp/modmail-9c1f2a0b4e77.lock)
+```
+
+It **refuses rather than killing** the other process — killing by a PID read out
+of a file is how you take down something that merely reused the number. Stop the
+running one deliberately, then start again.
+
+An `flock` is chosen over a PID file because the kernel releases it when the
+process ends *however* it ends, so a bot that was killed or OOMed leaves nothing
+stale behind. The PID in the file is only there to name the holder in the message
+above.
+
+The lock path is derived from the install directory, so two different bots on one
+host do not block each other. `MODMAIL_LOCK_FILE` overrides it, and
+`MODMAIL_ALLOW_MULTIPLE=1` skips the check entirely — with a warning, since the
+duplicate messages are the whole thing it exists to prevent.
 
 ## The FAQ — read this before going live
 
@@ -328,6 +382,47 @@ opens after a restart. The conversation it belongs to is encoded in its
 `custom_id` and checked against whoever clicks it — someone else's survey is
 refused rather than answered.
 
+#### The questions
+
+`SURVEY_RATING_QUESTIONS` holds three 1-5 questions — speed, helpfulness, and
+overall — each with its own scale wording, because a generic
+satisfied/dissatisfied scale against "how quickly did we reply" is what makes a
+form feel bolted together. The yes/no sits last so the scale questions read as
+one block and the question with a consequence comes at the end.
+
+A modal takes at most **5 components**, which is the hard ceiling on this: three
+ratings plus the yes/no leaves room for one more question, no more. That limit
+is asserted at import alongside the label and description caps.
+
+`SURVEY_HEADLINE_KEY` (`overall`) is the score that stands for the conversation:
+what `.vlg stats` averages first and what the low-rating alert fires on. Each
+answer stores the full `ratings` map *and* that one score as `rating`, so
+answers submitted when there was only one question still read correctly.
+
+Changing a question's `key` orphans the answers already stored under it. The
+wording above it can be rewritten freely.
+
+#### Low-rating alerts
+
+A headline score at or below `LOW_RATING_THRESHOLD` (2) posts to the staff
+channel as soon as it is submitted, with all three scores. If the user agreed to
+us keeping the chat it carries the conversation too; if they did not, it says so
+rather than leaving staff wondering where the transcript went. The alert is
+raised after the user has already been thanked and can never affect their reply.
+
+#### The weekly digest
+
+Monday 09:00 UTC (`DIGEST_WEEKDAY`, `DIGEST_HOUR_UTC`), posted to the same
+channel: the deferral rate, survey averages, and the same FAQ-gap analysis
+`.vlg stats` prints. Both call `_faq_gaps`, so the digest cannot drift from what
+someone running the command by hand sees.
+
+It rides the existing 5-minute maintenance sweep rather than a second timer, and
+is gated on a timestamp in the database, so a restart mid-week neither skips a
+digest nor sends two. The first ever run seeds that timestamp and sends nothing —
+otherwise loading the plugin on a Monday morning would fire a digest covering a
+few hours. `.vlg digest` sends one on demand without moving the schedule.
+
 Closing is a single atomic update, so a conversation the inactivity sweep and a
 goodbye both reach is closed, and surveyed, exactly once.
 
@@ -361,6 +456,64 @@ today.
    the survey wording. To make the set genuinely unlinkable instead, drop
    `user_id_hash` from the copy in `record_survey` and accept that an erasure
    request can no longer reach it.
+
+### Tone moderation
+
+`PROFANITY_PATTERNS` is checked on every message, after the opening disclosure
+so a first message that swears still gets it, and before every other route so
+nothing else can answer a message about to be moderated.
+
+The first swear warns, warmly, and says plainly that a second closes the chat.
+The second closes it **exactly as an inactivity timeout does** — same closing
+messages, same survey, same fresh start on the next message. Nothing is blocked
+or banned; the user can simply message again.
+
+The count lives on the open transcript as `profanity_count`, so it resets with
+the conversation: someone who swore last week starts clean, someone who swears
+twice in one chat does not.
+
+The list is deliberately short and word-boundary anchored. A false positive here
+warns, then closes the conversation of somebody who did nothing — much worse than
+missing a word — so add stems cautiously and keep the `\b` anchors.
+
+### Triage tags on handoffs
+
+A handed-off ticket opens with the assistant's summary and a **Triage** line:
+
+| tag | when |
+|---|---|
+| 🔥 ANGRY OR URGENT | `URGENCY_PATTERNS` matched anywhere in the conversation |
+| 🤝 PARTNERSHIP | a partnership lead that could not be routed to the form |
+| 👥 ASKED FOR A HUMAN | the user asked outright |
+| ❔ REPEATEDLY UNCLEAR | `MAX_CONSECUTIVE_UNCLEAR` unclear turns in a row |
+| 📝 NOT IN THE FAQ | the assistant understood and had no answer |
+| ⚠️ ASSISTANT OFFLINE / ERROR | Groq unreachable or misconfigured |
+
+Urgency is stored separately from `handoff_reason` because it is orthogonal to
+it — someone can be furious *and* asking about a partnership, and both belong on
+the ticket. An urgent ticket is also coloured with `error_color`, so it stands
+out in the channel list before anyone reads a word.
+
+The urgency check never changes what the user is told, so a false positive costs
+nothing beyond a misleading tag. That is why it can afford to be broad where the
+profanity list cannot.
+
+### Claiming a partnership lead
+
+Each submission is posted with a 🤚 reaction already on it and an *Unclaimed*
+footer. The first staff member to react owns it: the footer becomes *Claimed by
+…* and any later reaction is removed, so the post always shows one owner.
+
+The claim state lives in the post's own footer rather than in the database. It is
+what staff read, it survives restarts for free, and there is no second copy that
+can disagree with the channel. The listener is `on_raw_reaction_add`, not
+`on_reaction_add`, because the cached-message variant silently ignores anything
+not in memory — which is most of that channel after a restart.
+
+Two people reacting at the same moment are serialised behind a lock, since the
+check and the edit are separated by awaits and both would otherwise be told they
+had it. Removing the losing reaction needs *Manage Messages*; without it the
+claim still works and the extra reaction just stays.
 
 ### `.vlg ask`
 
@@ -680,10 +833,10 @@ MongoDB and are separated by a `_type` field:
 | `_type`        | Fields                                                     | Retention |
 |----------------|------------------------------------------------------------|-----------|
 | `consent`      | `user_id`, `accepted_at`, `policy_version`                   | until withdrawn |
-| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `closed_at`, `handed_off_at` | 7 days |
+| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `closed_at`, `handed_off_at`, `handoff_reason`, `urgent`, `profanity_count` | 7 days |
 | `session`      | `user_id`, `started_at`, `last_activity_at`, `warned_at`      | until the conversation closes |
-| `survey`       | `user_id_hash`, `transcript_id`, `rating`, `training_consent`, `answered_at` | kept |
-| `training_transcript` | `user_id_hash`, `transcript_id`, `messages[]`, `message_count`, `rating`, `handoff_reason`, `consented_at`, `conversation_started_at`, `conversation_ended_at` | **kept indefinitely** |
+| `survey`       | `user_id_hash`, `transcript_id`, `ratings{}`, `rating`, `training_consent`, `answered_at` | kept |
+| `training_transcript` | `user_id_hash`, `transcript_id`, `messages[]`, `message_count`, `ratings{}`, `rating`, `handoff_reason`, `consented_at`, `conversation_started_at`, `conversation_ended_at` | **kept indefinitely** |
 | `ticket`       | `nas_ref`, `log_key`, `user_id`, `channel_id`, `created_at`   | kept      |
 | `meta`         | `key`, `value` — currently the user-ID hashing salt          | permanent |
 
