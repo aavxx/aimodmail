@@ -1,25 +1,39 @@
-# Norwegian Air Shuttle support plugin — setup
+# AI support assistant — setup
 
-## Load
+Full reference. If you only want it working, `README.md` plus `?ai setup` is
+enough; this is the document you come back to when you want to know exactly what
+something does.
 
-```
-?plugin load @local/norwegian_support
-```
-
-Reload after editing during development:
+## Install
 
 ```
-?plugin reload @local/norwegian_support
+?plugin add aavxx/norwegian/aisupport@main
 ```
 
-Verify wiring, storage and config with:
+Then put your Groq key in the bot's `.env`:
 
 ```
-.ai status
+GROQ_API_KEY=gsk_...
 ```
 
-The DM hook must read `installed`, `confirm_thread_creation` must read `off`,
-and ticket log retention must not read `Never`.
+Restart the bot so the key is picked up, then:
+
+```
+?ai setup
+```
+
+Check it afterwards with `?ai status`. **Answering messages** must read yes,
+**AI** must read connected, and nothing should be listed under *Needs
+attention*.
+
+Updating later:
+
+```
+?plugin update aavxx/norwegian/aisupport@main
+```
+
+Settings live in the database rather than in the files, so updating never resets
+them.
 
 ## Staff commands
 
@@ -205,7 +219,7 @@ Sent by Modmail itself once a thread is created at handoff.
 
 ```
 ?config set thread_creation_title Ticket Opened
-?config set thread_creation_response A member of the Norwegian Air Shuttle support team will be with you shortly. Please keep your booking or flight details to hand.
+?config set thread_creation_response A member of our support team will be with you shortly.
 ?config set thread_creation_footer Your message has been sent to the support team
 ```
 
@@ -306,9 +320,9 @@ is still on the built-in default.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `brandname` | Vueling | Your organisation's name, as users see it |
-| `assistantname` | Vueling AI | What the assistant calls itself |
-| `privacyurl` | the Vueling policy | The privacy policy linked in the opening notice |
+| `brandname` | this server | Your organisation's name, as users see it |
+| `assistantname` | Support Assistant | What the assistant calls itself |
+| `privacyurl` | unset | The privacy policy linked in the opening notice |
 | `ticketprefix` | VLG | Prefix on ticket references, e.g. `VLG-A3K9PQ` |
 | `greeting` | "Hola! I'm {brand}'s…" | The assistant's opening line; `{brand}` is substituted |
 | `yesemoji` / `noemoji` | guild emoji | Emoji on the "connect me to a human" buttons |
@@ -490,15 +504,15 @@ duplicate messages are the whole thing it exists to prevent.
 
 ## The FAQ — read this before going live
 
-`FAQ_KNOWLEDGE` in `norwegian_support.py` is the **only** thing the assistant is
-allowed to answer from. It is instructed to hand off anything not covered, so:
+What you set with `?ai setup` and `?ai knowledge` is the **only** thing the
+assistant is allowed to answer from. It is instructed to hand off anything not
+covered, so the two mistakes are not symmetrical:
 
 - **A wrong entry becomes a wrong answer, stated confidently, to a real user.**
 - A missing entry costs nothing: that question escalates to a human.
 
-The current content was supplied by the group. Keep it that way — when
-something is unknown, delete the entry rather than guessing, and the question
-will simply escalate to a human.
+So when something is unknown, leave it out rather than guessing. The question
+simply goes to a person, which is what would have happened anyway.
 
 ### The four states
 
@@ -606,8 +620,6 @@ the model is instructed to reproduce them verbatim, never as bare URLs and never
 invented. Discord renders markdown links in embed descriptions, so the user sees
 the clean domain.
 
-The link domains and the assistant's identity are both Vueling now.
-
 ### Diagnosing a deferral
 
 When the assistant hands off, the log line only says it deferred. The user's
@@ -672,7 +684,7 @@ Documents written by the removed consent gate are not deleted automatically.
 `.ai forget` clears them per user. To drop them all at once:
 
 ```js
-db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
+db.getCollection("plugins.AISupport").deleteMany({_type: "consent"})
 ```
 
 ### The post-chat survey
@@ -755,10 +767,10 @@ today.
 
 #### Two things to check before going live
 
-1. **The linked privacy policy must mention this.** The opening disclosure says
-   processing rests on the contractual relationship and points at
-   `https://vuelingrbx.vercel.app/privacy`. Keeping consented chats past the 7
-   day transcript retention is a separate purpose with a separate lawful basis —
+1. **The privacy policy you set with `privacyurl` must mention this.** The
+   opening disclosure says processing rests on the contractual relationship and
+   points at that page. Keeping consented chats past the normal transcript
+   retention is a separate purpose with a separate lawful basis —
    the user's explicit yes — and that page should say so. The in-chat question is
    where consent is captured; the policy page is where it is explained.
 2. **`.ai forget` reaches the training set**, which is why the copy keeps
@@ -843,7 +855,7 @@ in a real conversation those never reach Groq either.
 ### Is my change actually running?
 
 **Check this before diagnosing anything else.** A pull does not change what the
-bot is running; only `?plugin reload @local/norwegian_support` (or a restart)
+bot is running; only `?plugin update aavxx/norwegian/aisupport@main` (or a restart)
 does. Until then the bot keeps serving the previous version, which looks exactly
 like the new one being broken — the old button emoji, the old routing, no
 partnership form. `.ai status` now leads with a red warning when the file on
@@ -1006,14 +1018,14 @@ assistant that cannot answer would loop the user through the same failure.
 
 ### Embeds
 
-Every embed the plugin builds carries the **Vueling AI author row** — name plus
+Every embed the plugin builds carries the **assistant's author row** — name plus
 the bot's own avatar, read from `bot.user.display_avatar` so it follows whatever
 is set in the Developer Portal without a redeploy.
 
 | Message | Colour | Title | Footer |
 |---|---|---|---|
 | Greeting, prompts, handoff copy, consent notice | `main_color` | none | none |
-| Model-generated replies | `mod_color` | none | `Vueling AI can make mistakes…`, no icon |
+| Model-generated replies | `mod_color` | none | `<assistant> can make mistakes…`, no icon |
 
 Model replies carry no title: the author row already names the assistant, and
 both together says it twice. The footer is plain text — an icon beside a
@@ -1048,32 +1060,6 @@ A conversation ends when a human takes over: the handoff stamps `handed_off_at`
 on the transcript, so the next time that user writes in they are greeted afresh.
 A conversation the assistant resolved stays open, so follow-up questions do not
 re-greet; it lapses naturally when the transcript expires after `retentiondays`.
-
-### Branding, mid-rebrand
-
-Three surfaces say Vueling by explicit instruction: the greeting, the embed
-title (`Vueling AI`), and the caveat footer. Everything else is deliberately
-untouched pending the full rebrand pass — bot identity, the repo name, the
-`.ai` command group, and the `NorwegianSupport` cog class (whose name *is* the
-partition name, so renaming it orphans every stored document).
-
-Ticket references are now `VLG-XXXXXX`. The stored field is still called
-`nas_ref` for compatibility with existing documents; renaming it needs a data
-migration.
-
-The privacy notice now names Vueling, and `POLICY_VERSION` is **2**. Everyone
-who accepted under version 1 is re-prompted on their next ticket, with the
-renewal wording explaining the rename. Declining the new notice withdraws the
-old consent, as it does for any renewal.
-
-**Still naming the old airline**, and needing action outside this file: the
-`thread_creation_response` **config value** suggested above. Editing this file
-does nothing on its own — re-run the `?config set` on the live bot.
-
-Also still Norwegian Air Shuttle, but internal only and left for the rebrand
-pass: the module docstring, the `.ai` command group help text, the
-`norwegian_support` plugin/folder name, and the `NorwegianSupport` cog class
-(whose name is the storage partition, so it needs a data migration).
 
 ### Embed icon
 
@@ -1113,49 +1099,15 @@ Modmail's log key stays the durable identifier; `VLG-XXXXXX` is the readable
 handle, drawn from an alphabet with no `O/0` or `I/1` so a code read aloud
 cannot land on the wrong ticket.
 
-## Local changes to Modmail core
-
-This plugin is self-contained with one exception. **Re-apply it after any
-upstream Modmail merge** — a merge that takes upstream's version of `bot.py`
-will drop it silently, and the only symptom is a traceback in the log.
-
-Find it with:
-
-```
-grep -n "LOCAL PATCH" bot.py
-```
-
-### `bot.py` — `on_message`, pin-notice delete
-
-`Thread.setup()` pins the genesis message (`core/thread.py`, in
-`send_genesis_message`), which makes Discord post a *"<bot> pinned a message to
-this channel"* notice. `on_message` deletes that notice to keep the channel
-clean, but upstream does it unguarded:
-
-```python
-if message.type == discord.MessageType.pins_add and message.author == self.user:
-    await message.delete()
-```
-
-If the notice is already gone the delete raises `NotFound` out of `on_message`,
-which discord.py logs as an unhandled exception and which aborts the rest of the
-handler. Already-deleted is the outcome we wanted anyway. The patch catches
-`NotFound` (debug, nothing to do) and `Forbidden` (warning — missing Manage
-Messages, worth knowing once but not worth a traceback per thread).
-
-This is not caused by the plugin: it never pins, deletes, or touches thread
-channels. But because handoff is now the main thing that creates threads, the
-traceback reliably appears about a second after an "AI deferred" log line, which
-makes it look related. It is not.
-
-`bot.py` is not black-clean upstream, so do not run the formatter over it to fix
-this — that produces a large unrelated diff and makes future merges worse.
-
 ## Storage
 
 `bot.api.get_plugin_partition(self)` returns a single collection, not a
-database, so all documents live in **`plugins.NorwegianSupport`** in Modmail's
-MongoDB and are separated by a `_type` field:
+database, so all documents live in **`plugins.AISupport`** in your bot's own
+MongoDB — the one its `CONNECTION_URI` points at — separated by a `_type` field.
+
+This is what keeps installs apart. The collection is reached through the bot's
+own database connection, so two bots running this plugin share nothing unless
+they were deliberately pointed at the same database.
 
 | `_type`        | Fields                                                     | Retention |
 |----------------|------------------------------------------------------------|-----------|
@@ -1212,5 +1164,5 @@ let us. A declining user is therefore prompted again on their next message.
 Ticket message content itself is not stored here. It lives in Modmail's own
 `logs` collection and expires via `log_expiration` above.
 
-Renaming the `NorwegianSupport` cog class changes the partition name and
+Renaming the `AISupport` cog class changes the partition name and
 orphans all existing data.

@@ -1,25 +1,19 @@
 """
-Norwegian Air Shuttle (Roblox) support plugin for Modmail.
+AI support assistant for Modmail.
 
-A new conversation opens with a fixed data-processing disclosure, then is
-pre-screened by Groq.
-Questions the assistant can answer from the FAQ below are answered without a
-thread ever being created; everything else falls through to Modmail, which
-creates the thread exactly as it always did. Every failure path ends in that
-fallthrough, so a user is never left without a response.
+Sits in front of Modmail's thread creation. A new conversation opens with a
+data-processing disclosure and a greeting, then the user's message is
+pre-screened by an LLM: anything answerable from the knowledge you have given it
+is answered without a ticket ever being created, and everything else falls
+through to Modmail, which opens the thread exactly as it always did. Every
+failure path ends in that fallthrough, so a user is never left without a reply.
 
-The handoff summary and ticket reference (stage 5) slot into `_gate` at the
-marked seam.
+Everything is configured from inside Discord — `.ai setup` walks through it, and
+nothing about this plugin needs editing in code to install it. Only credentials
+live in `.env`, and only one of them belongs to this plugin: GROQ_API_KEY.
 
-Almost everything here is configured from inside Discord rather than from this
-file or from `.env`: `.ai set` for settings that carry a value, `.ai features`
-for the optional behaviour that is simply on or off. Both are stored in the
-plugin partition, so they survive reloads, restarts and a `git pull`. The
-constants below are the defaults those settings fall back to. See the Settings
-section for the registry.
-
-Credentials — the bot token, GROQ_API_KEY, the Mongo URI — stay in `.env`. Those
-are secrets rather than settings.
+Stored data lives in the bot's own database, in a partition Modmail hands out
+per plugin, so two installs of this plugin never share anything.
 """
 
 import asyncio
@@ -55,27 +49,26 @@ logger = getLogger(__name__)
 # The command group. `ai` is the primary name, so a fresh install on any bot
 # reads as `.ai status` rather than as somebody else's branding.
 #
-# The legacy names stay as aliases: this plugin was `nas` and then `vlg` before
-# it was `ai`, and typing either still works. Aliases do not appear in the help
-# listing, so a new install sees only `.ai` while existing muscle memory and any
-# saved command still resolve.
+# Renaming with `.ai set commandname` keeps the previous name working as an
+# alias, and `.ai set extraaliases` adds any others. Aliases never appear in the
+# help listing, so the menu always teaches exactly one name.
 GROUP_NAME = "ai"
-LEGACY_ALIASES = ("vlg", "nas")
 
 # Default identity. Both are settings (`brandname` / `assistantname`), and every
 # user-facing string that names either reads the setting rather than a constant,
 # so installing this on another bot is a rename rather than an edit.
 #
-# BRAND_NAME is the organisation ("Vueling"); ASSISTANT_NAME is what the bot
-# calls itself ("Vueling AI"). They are separate because the disclosure is about
-# the company while the embed author row is about the bot.
-BRAND_NAME = "Vueling"
-ASSISTANT_NAME = "Vueling AI"
+# BRAND_NAME is the organisation; ASSISTANT_NAME is what the bot calls itself.
+# They are separate because the disclosure is about the organisation while the
+# author row on every message is about the bot. Both are placeholders until
+# `.ai setup` replaces them, and `.ai status` says so until it has.
+BRAND_NAME = "this server"
+ASSISTANT_NAME = "Support Assistant"
 
 # Linked from the opening disclosure. Per-install and legally load-bearing: it
 # is the only route by which a user exercises their data rights, so it is a
 # setting rather than something to remember to edit.
-PRIVACY_POLICY_URL = "https://vuelingrbx.vercel.app/privacy"
+PRIVACY_POLICY_URL = ""
 
 
 def disclosure_parts(brand: str, privacy_url: str) -> typing.Tuple[str, str]:
@@ -86,11 +79,14 @@ def disclosure_parts(brand: str, privacy_url: str) -> typing.Tuple[str, str]:
     per user. Data rights are exercised through the linked privacy policy, not
     in chat.
     """
+    # An unset policy URL drops the sentence rather than rendering an empty
+    # markdown link. Pointing a user at a link that goes nowhere is worse than
+    # not offering one, and `.ai status` nags until it is set.
+    where = f" For more information, see our [privacy policy]({privacy_url})." if privacy_url else ""
     return (
         f"{brand} will process your data to provide you with the services you "
         f"have requested and improve your experience with {brand}, based on the "
-        "execution of a contractual relationship. For more information, see our "
-        f"[privacy policy]({privacy_url}).",
+        f"execution of a contractual relationship.{where}",
         "This chatbot uses an Artificial Intelligence tool to identify the most "
         "relevant answers to frequently asked questions.",
     )
@@ -98,7 +94,7 @@ def disclosure_parts(brand: str, privacy_url: str) -> typing.Tuple[str, str]:
 
 # Human-facing ticket reference prefix, mapped to Modmail's own log key. The
 # default for the `ticketprefix` setting.
-TICKET_PREFIX = "VLG"
+TICKET_PREFIX = "TKT"
 
 # Reference body alphabet. No O/0 or I/1, so a code read aloud or retyped from
 # memory cannot land on the wrong ticket.
@@ -270,7 +266,7 @@ KNOWLEDGE_SHORT_MAX = 900
 TRANSCRIPT_RETENTION_DAYS = 7
 
 # Discriminators. get_plugin_partition() hands back a single collection
-# (plugins.NorwegianSupport), so the logical collections share it.
+# (plugins.AISupport), so the logical collections share it.
 TYPE_TRANSCRIPT = "ai_transcript"
 TYPE_TICKET = "ticket"
 
@@ -332,12 +328,11 @@ def ai_footer(assistant: str) -> str:
     return f"{assistant} can make mistakes. Please double check responses."
 
 
-# Handoff confirmation buttons: guild emoji, no label. Defaults for the
-# `yesemoji` / `noemoji` settings — these ids belong to one specific server, so
-# on any other install they resolve to nothing and the prompt falls back to
-# plain unicode. Setting them is how another install gets its own.
-BUTTON_YES_EMOJI = "<:yes:1534231866888945764>"
-BUTTON_NO_EMOJI = "<:no:1534231863319593172>"
+# Handoff confirmation buttons, no label. Plain unicode by default because it
+# works on every server; `.ai set yesemoji` swaps in a custom one, which only
+# renders if this bot is in the server that owns it.
+BUTTON_YES_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
+BUTTON_NO_EMOJI = "\N{CROSS MARK}"
 
 # The model picks exactly one of these per reply. A single enum rather than a
 # pair of booleans, so it cannot express a contradiction like understood-but-not
@@ -516,11 +511,10 @@ DISCLOSURE_GAP_SECONDS = 1.0
 
 # The opening line of the greeting. A setting, because it is the first thing
 # anyone reads and the one piece of copy most likely to want changing per
-# install — "Hola!" in particular is Vueling's voice, not a neutral default.
-# {brand} is substituted; a greeting with no placeholder in it is used as-is.
+# install. {brand} is substituted; a greeting with no placeholder in it is used
+# as written.
 GREETING_OPENER = (
-    "Hola! I'm {brand}'s virtual assistant. I'm new and still learning but "
-    "there are a lot of things I can do for you."
+    "Hi! I'm {brand}'s virtual assistant. I'm still learning, but there is a " "lot I can help with."
 )
 
 # The question after it. Fixed: it explains how to talk to the assistant rather
@@ -635,11 +629,10 @@ PARTNERSHIP_INTRO = (
     "Certainly, we'd be glad to hear about it! Tap the button below and fill in a "
     "few details about your group and I'll pass it straight to the team."
 )
-# Deliberately still says "vlg" after the rename to `.ai`, as do the survey
-# custom_ids below. A custom_id is baked into every button already posted in
-# Discord; renaming these would orphan every live partnership post and survey
-# invitation, which is a real cost for a string no user ever sees.
-PARTNERSHIP_BUTTON_ID = "vlg-partnership"
+# Never change these once a version is in use: a custom_id is baked into every
+# button already posted in Discord, so renaming one orphans every live
+# partnership post and survey invitation.
+PARTNERSHIP_BUTTON_ID = "aisupport-partnership"
 PARTNERSHIP_BUTTON_LABEL = "Request a partnership"
 PARTNERSHIP_MODAL_TITLE = "Partnership request"
 
@@ -662,11 +655,9 @@ PARTNERSHIP_FAILED = (
     "you it arrived when it hasn't. Let me put you through to someone instead."
 )
 
-# Where submitted applications land. The guild is the first guess only — see
-# `_home_guild`, which falls back to Modmail's own configured server, so a fresh
-# install elsewhere resolves channels without touching this.
-PARTNERSHIP_GUILD_ID = 1532428044822642808
-PARTNERSHIP_CHANNEL_ID = 1534233033085948074
+# Unset until `.ai setup` picks a channel. Zero resolves to nothing, which the
+# status check reports rather than letting it fail silently.
+PARTNERSHIP_CHANNEL_ID = 0
 
 
 def _env_channel_id(name: str, default: int) -> int:
@@ -971,7 +962,7 @@ VALUE_SETTINGS = (
         "Your organisation's name, as users see it. Used in the opening privacy "
         "notice, the greeting, and what the AI is told it works for.",
         maximum=60,
-        example="Vueling",
+        example="Acme Support",
     ),
     Setting(
         "assistantname",
@@ -980,7 +971,7 @@ VALUE_SETTINGS = (
         "What the assistant calls itself. Shown on every message it sends and in "
         "the goodbye when a chat ends.",
         maximum=60,
-        example="Vueling AI",
+        example="Acme Assistant",
     ),
     Setting(
         "privacyurl",
@@ -995,10 +986,10 @@ VALUE_SETTINGS = (
         "ticketprefix",
         "text",
         lambda: TICKET_PREFIX,
-        "The prefix on ticket references, e.g. `VLG` gives `VLG-A3K9PQ`. Existing "
+        "The prefix on ticket references, e.g. `TKT` gives `TKT-A3K9PQ`. Existing "
         "references keep the prefix they were issued with.",
         maximum=10,
-        example="VLG",
+        example="TKT",
     ),
     Setting(
         "greeting",
@@ -1011,7 +1002,7 @@ VALUE_SETTINGS = (
     Setting(
         "knowledge",
         "knowledge",
-        lambda: SAMPLE_KNOWLEDGE,
+        lambda: DEFAULT_KNOWLEDGE,
         "What the assistant knows about your business. It may only answer from "
         "this — anything not in here is handed to a human.",
         maximum=KNOWLEDGE_MAX,
@@ -1042,11 +1033,20 @@ VALUE_SETTINGS = (
         example="https://example.com/logo.png",
     ),
     Setting(
+        "extraaliases",
+        "text",
+        lambda: "",
+        "Extra names the plugin also answers to, comma separated. The previous "
+        "name is kept automatically when you rename; this is for any others.",
+        maximum=100,
+        example="support, help",
+    ),
+    Setting(
         "legacyaliases",
         "bool",
         lambda: True,
-        f"Whether the old command names ({', '.join('.' + a for a in LEGACY_ALIASES)}) still work "
-        f"alongside `.{GROUP_NAME}`. Turn this off for a single clean command name.",
+        "Whether the previous command name, and anything in `extraaliases`, still "
+        "work alongside the current one. Off gives you a single clean name.",
         # Lives in `set` rather than `features`: it configures how you reach the
         # plugin, not anything the assistant does for users.
         menu="set",
@@ -1354,57 +1354,12 @@ ESCALATION_PATTERNS = [
 
 _ESCALATION_RE = [re.compile(p, re.IGNORECASE) for p in ESCALATION_PATTERNS]
 
-# Everything the assistant is allowed to answer from. Supplied by the group, not
-# invented here. The model is instructed to hand off anything not covered, so a
-# wrong entry becomes a confidently wrong answer while a missing one merely
-# escalates. Keep it that way: delete rather than guess.
-# The reference the assistant answers from, as shipped. This is now only the
-# *default* for the `knowledge` setting, and it describes one specific airline —
-# on anybody else's install it is a set of confidently wrong answers waiting to
-# happen, which is why `.ai status` flags it as a problem the moment the brand
-# name says this is not that airline.
-SAMPLE_KNOWLEDGE = """\
-Membership and eligibility
-- The minimum age to join the team is 13.
-- Passengers must be a member of the Roblox group to attend flights.
-- Alt accounts are not allowed.
-
-Flights
-- Every flight follows the same pattern, where XX is that flight's hour: the
-  server opens at XX:00, locks at XX:20, boarding begins at XX:25, and the
-  flight departs at XX:35.
-- The hour itself varies by flight. NEVER state a specific hour or date. Give
-  the pattern if asked how flights run, and point to the departures page or the
-  Discord server's events for actual times.
-- Departures: [departures.vuelingrbx.com](https://vuelingrbx.vercel.app/departures),
-  or check the Discord server's events.
-
-Fly Grande (priority boarding)
-- Fly Grande is priority boarding, purchased in-game for 15 Robux.
-- It is a one-time purchase and applies to a single flight.
-
-Payments
-- There are no refunds under any circumstances. State this plainly. Do not
-  soften it, do not suggest exceptions, and do not offer to check or escalate a
-  refund request.
-
-Jobs and staff
-- Open positions: [work.vuelingrbx.com](https://vuelingrbx.vercel.app/work)
-- Publicly, only basic staff information may be given: the age requirement and
-  the rank names. Nothing beyond that.
-- The rank names are not listed in this reference. If asked to name the ranks,
-  do not guess: hand off instead.
-- Promotion and rank details are basic-only in public. Fuller detail is
-  available once someone is hired.
-- The uniform policy is internal, is covered in the employee handbook, and is
-  not for public disclosure. If asked about uniform, say that it is staff-only
-  information. That is a complete answer.
-
-Moderation
-- Ban appeals: [appeal.vuelingrbx.com](https://vuelingrbx.vercel.app/appeal)
-- Giving someone the appeals link is a complete answer. Never comment on
-  whether a specific ban or appeal was justified.
-"""
+# Ships empty. There is deliberately no sample: knowledge is stated to users as
+# fact in the assistant's own words, and a plausible-looking example someone
+# forgot to replace is worse than an assistant that starts out knowing nothing
+# and says so. Empty means every question goes to a human, which is the safe
+# direction, and `.ai status` says why until `.ai setup` fills it in.
+DEFAULT_KNOWLEDGE = ""
 
 
 # The fence used to mark supplied knowledge as data inside the prompt. Stripped
@@ -1469,12 +1424,11 @@ def build_system_prompt(brand: str, knowledge: str, pricing: str, never: str) ->
         else ""
     )
     return f"""\
-You are the first-line automated support assistant for {brand}, a virtual
-airline group on Roblox. You answer straightforward questions from passengers
-and staff.
+You are the first-line automated support assistant for {brand}. You answer
+straightforward questions from the people who contact them.
 
 Every fact you state must come from the reference information below. Never
-invent flight times, prices, rank names, policies or links.
+invent times, prices, names, policies or links.
 
 That is a rule about facts, not about phrasing. You are expected to reword the
 reference, and to combine two or three points from different parts of it, to
@@ -1487,15 +1441,12 @@ Work out what they are referring to, not whether they said it the reference's
 way. People use shorthand, abbreviations, partial names, plurals, synonyms and
 typos, and all of those still point at the same entry:
 
-- "grande", "fly grande", "priority", "priority boarding" → Fly Grande
-- "alts", "alt account", "second account", "two accounts" → alt accounts
-- "jobs", "hiring", "applications", "vacancies", "recruitment", "apply" → open positions
-- "unban", "appeal", "I got banned" → the appeals page
-- "outfit", "dress code", "what do I wear", "kit" → the uniform policy
-- "timetable", "schedule", "next one", "departure times" → the flight pattern and departures page
-- "money back", "refund", "can I get my robux back" → the refunds policy
-- "how old do you have to be", "age limit", "am I old enough" → the minimum age
-- "the group", "joining", "do I need to be a member" → the group membership requirement
+- an abbreviation or nickname for something the reference names in full
+- a plural, a synonym, or an obvious typo of a term in the reference
+- "how much", "price", "cost", "fees" → whatever the reference says about prices
+- "how do I join", "signing up", "membership" → whatever it says about joining
+- "refund", "money back", "cancel my order" → whatever it says about refunds
+- "opening times", "when are you open", "hours" → whatever it says about times
 
 Recognising the term and possessing the fact are separate things, and matching
 someone's wording never licenses an answer the reference does not contain:
@@ -1513,10 +1464,10 @@ Give every reply exactly one status.
   or three entries, still counts. Being brief is fine. Stating a policy the user
   will not like is a complete answer, not a failure.
 
-"chat" — the message needs no airline fact at all: thanks, a greeting partway
+"chat" — the message needs no fact from the reference at all: thanks, a greeting partway
   through, small talk, someone saying they are annoyed or that you helped. Reply
-  like a person would and stay in the conversation. Never put airline facts in a
-  "chat" reply; if one is needed, the status is not "chat".
+  like a person would and stay in the conversation. Never put reference facts in
+  a "chat" reply; if one is needed, the status is not "chat".
 
 "unclear" — you genuinely cannot tell what is being asked. A typo, a fragment, a
   garbled sentence, or something with two very different readings. Ask them to
@@ -1542,16 +1493,15 @@ your words before they are offered an agent. Never write a reply that is only
 "I would have to make a fact up" is the test for escalating. Being unsure how to
 word something is not.
 
-Worked examples:
-- "how do I join a flight?" — answered, combining the group membership
-  requirement with the departures page and the timing pattern.
-- "what time is the next flight?" — answered, giving the XX:00 / XX:20 / XX:25 /
-  XX:35 pattern and the departures link, without naming an hour.
-- "can I get a refund?" — answered, stating the no-refunds policy plainly.
+Worked examples, using whatever the reference happens to contain:
+- A question the reference answers directly — answered, in your own words.
+- A question needing two or three entries combined — still answered.
+- A question whose answer is a restriction the user will not like — answered,
+  stated plainly and delivered kindly.
 - "thanks, that helped!" — chat.
 - "hlo wut abt teh thing" — unclear, ask which thing they mean.
-- "what are the ranks called?" — escalate, but say first that the age
-  requirement is 13 and where applications are, since that much is covered.
+- A question about a subject the reference mentions but does not give the detail
+  for — escalate, after saying what the reference does cover.
 - "why was my application rejected?" — escalate, a decision about one person.
 
 Language: reply in whatever language the user wrote in.
@@ -1673,19 +1623,19 @@ SETUP_STEPS = (
         "What is your organisation called?",
         "Used in the privacy notice users see, in the greeting, and in what the assistant is told "
         "it works for.",
-        example="Vueling",
+        example="Acme Support",
     ),
     SetupStep(
         "assistantname",
         "What should the assistant call itself?",
         "Shown on every message it sends, and in the goodbye when a chat ends.",
-        example="Vueling AI",
+        example="Acme Assistant",
     ),
     SetupStep(
         "ticketprefix",
         "What prefix should ticket references use?",
-        "A reference looks like `VLG-A3K9PQ`. Users quote it when following something up.",
-        example="VLG",
+        "A reference looks like `TKT-A3K9PQ`. Users quote it when following something up.",
+        example="TKT",
     ),
     SetupStep(
         "privacyurl",
@@ -1707,7 +1657,7 @@ SETUP_STEPS = (
         "the safe direction — a missing fact costs you a handoff, a wrong one gets stated to a "
         "customer as though it were true. Write plain lines, one fact each.",
         kind="knowledge",
-        example="- We are a virtual airline on Roblox.\n- The minimum age to join is 13.",
+        example="- We sell handmade furniture, made to order.\n- Delivery takes 2-3 weeks.",
     ),
     SetupStep(
         "pricing",
@@ -1715,7 +1665,7 @@ SETUP_STEPS = (
         "Kept separate because it changes most often and is worst to get wrong. Skip if you would "
         "rather a human handled anything involving money.",
         kind="knowledge",
-        example="- Priority boarding costs 15 Robux, one flight, no refunds.",
+        example="- A standard chair is 120 GBP. Delivery is 15 GBP, or free over 300 GBP.",
     ),
     SetupStep(
         "neveranswer",
@@ -1764,7 +1714,7 @@ SETUP_STEPS = (
 class PartnershipModal(discord.ui.Modal):
     """The five questions, asked as one form instead of five turns."""
 
-    def __init__(self, cog: "NorwegianSupport"):
+    def __init__(self, cog: "AISupport"):
         super().__init__(title=PARTNERSHIP_MODAL_TITLE, timeout=None)
         self.cog = cog
         self.answers: typing.List[discord.ui.TextInput] = []
@@ -1788,7 +1738,7 @@ class PartnershipModal(discord.ui.Modal):
 
 
 class PartnershipButton(discord.ui.Button):
-    def __init__(self, cog: "NorwegianSupport"):
+    def __init__(self, cog: "AISupport"):
         super().__init__(
             style=discord.ButtonStyle.primary,
             label=PARTNERSHIP_BUTTON_LABEL,
@@ -1803,7 +1753,7 @@ class PartnershipButton(discord.ui.Button):
 class PartnershipView(discord.ui.View):
     """Persistent: the form has to still open the next day, and after a restart."""
 
-    def __init__(self, cog: "NorwegianSupport"):
+    def __init__(self, cog: "AISupport"):
         super().__init__(timeout=None)
         self.add_item(PartnershipButton(cog))
 
@@ -1817,7 +1767,7 @@ class SurveyModal(discord.ui.Modal):
     neither, and is only ever visible before an answer is picked.
     """
 
-    def __init__(self, cog: "NorwegianSupport", transcript_id: str, source: typing.Optional[discord.Message]):
+    def __init__(self, cog: "AISupport", transcript_id: str, source: typing.Optional[discord.Message]):
         super().__init__(title=SURVEY_MODAL_TITLE, timeout=None)
         self.cog = cog
         self.transcript_id = transcript_id
@@ -1830,7 +1780,7 @@ class SurveyModal(discord.ui.Modal):
         self.ratings: typing.Dict[str, discord.ui.Select] = {}
         for key, label, description, scale in SURVEY_RATING_QUESTIONS:
             select = discord.ui.Select(
-                custom_id=f"vlg-survey-{key}",
+                custom_id=f"aisupport-survey-{key}",
                 placeholder="Choose a score",
                 options=survey_rating_options(scale),
                 required=True,
@@ -1845,7 +1795,7 @@ class SurveyModal(discord.ui.Modal):
         self.training: typing.Optional[discord.ui.Select] = None
         if cog.setting("training"):
             self.training = discord.ui.Select(
-                custom_id="vlg-survey-training",
+                custom_id="aisupport-survey-training",
                 placeholder="Yes or no",
                 options=[
                     discord.SelectOption(label="Yes, use it to improve the AI", value="yes"),
@@ -1894,7 +1844,7 @@ class SurveyModal(discord.ui.Modal):
 
 class SurveyButton(
     discord.ui.DynamicItem[discord.ui.Button],
-    template=r"vlg:survey:(?P<transcript_id>[0-9a-f]{24})",
+    template=r"aisupport:survey:(?P<transcript_id>[0-9a-f]{24})",
 ):
     """The button on the survey invitation.
 
@@ -1910,7 +1860,7 @@ class SurveyButton(
             discord.ui.Button(
                 style=discord.ButtonStyle.primary,
                 label=SURVEY_BUTTON_LABEL,
-                custom_id=f"vlg:survey:{transcript_id}",
+                custom_id=f"aisupport:survey:{transcript_id}",
             )
         )
 
@@ -1919,7 +1869,7 @@ class SurveyButton(
         return cls(match["transcript_id"])
 
     async def callback(self, interaction: discord.Interaction):
-        cog = interaction.client.get_cog("NorwegianSupport")
+        cog = interaction.client.get_cog("AISupport")
         if cog is None:
             with contextlib.suppress(discord.HTTPException):
                 await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
@@ -1994,12 +1944,12 @@ class YesNoView(discord.ui.View):
         self.value = None
 
     def with_choices(self, yes_emoji: str, no_emoji: str) -> "YesNoView":
-        self.add_item(ChoiceButton("nas-handoff-yes", yes_emoji, True))
-        self.add_item(ChoiceButton("nas-handoff-no", no_emoji, False))
+        self.add_item(ChoiceButton("aisupport-handoff-yes", yes_emoji, True))
+        self.add_item(ChoiceButton("aisupport-handoff-no", no_emoji, False))
         return self
 
 
-class NorwegianSupport(commands.Cog):
+class AISupport(commands.Cog):
     """Consent gate and AI pre-screen ahead of Modmail's thread creation."""
 
     def __init__(self, bot):
@@ -2152,7 +2102,16 @@ class NorwegianSupport(commands.Cog):
         typing an old one gets the explanation in `_alias_allowed` rather than
         Discord's silence about an unknown command.
         """
-        return [name for name in (GROUP_NAME, *LEGACY_ALIASES) if name != primary]
+        extra = [a.strip().lower() for a in str(self.setting("extraaliases")).split(",")]
+        wanted = [GROUP_NAME, *(a for a in extra if a)]
+        # Deduplicated in order, so the list is stable across reloads and
+        # `_apply_command_name` can compare it against what is registered.
+        seen, aliases = set(), []
+        for name in wanted:
+            if name != primary and name not in seen:
+                seen.add(name)
+                aliases.append(name)
+        return aliases
 
     def _apply_command_name(self) -> None:
         """Re-register the group under the configured name.
@@ -2394,12 +2353,11 @@ class NorwegianSupport(commands.Cog):
     def _home_guild(self) -> typing.Optional[discord.Guild]:
         """The server staff channels are looked up in.
 
-        PARTNERSHIP_GUILD_ID names one specific server, which is right for the
-        install this was written for and meaningless on any other, so it is only
-        the first guess. Modmail's own configured guild is the fallback, which is
-        the correct answer for a fresh install and needs nothing set.
+        Modmail's own configured guild, which is the right answer for every
+        install and needs nothing set. Kept as a method so the fallback below —
+        a global channel lookup — has one place to start from.
         """
-        return self.bot.get_guild(PARTNERSHIP_GUILD_ID) or getattr(self.bot, "guild", None)
+        return getattr(self.bot, "guild", None)
 
     def _guild_channel(self, channel_id: int):
         """A staff channel by id, or None if this bot cannot see it.
@@ -2500,11 +2458,11 @@ class NorwegianSupport(commands.Cog):
         """
         current = self.bot.process_dm_modmail
 
-        if getattr(current, "__nas_wrapped__", False):
+        if getattr(current, "__aisupport_wrapped__", False):
             # A previous instance of this cog is still wrapped (reload without a
             # clean unload). Take over its original rather than nesting wrappers,
             # which would run the gate twice per DM.
-            original = getattr(current, "__nas_original__", None)
+            original = getattr(current, "__aisupport_original__", None)
             logger.warning("DM hook already installed; taking over the existing wrapper chain.")
         else:
             original = current
@@ -2517,17 +2475,17 @@ class NorwegianSupport(commands.Cog):
         async def wrapper(message: discord.Message) -> None:
             return await self._gate(message, original)
 
-        wrapper.__nas_wrapped__ = True
-        wrapper.__nas_original__ = original
+        wrapper.__aisupport_wrapped__ = True
+        wrapper.__aisupport_original__ = original
 
         self.bot.process_dm_modmail = wrapper
-        logger.info("Norwegian support DM hook installed.")
+        logger.info("AI support DM hook installed.")
 
     def _remove_dm_hook(self) -> None:
         if self._original_process_dm is None:
             return
 
-        if not getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False):
+        if not getattr(self.bot.process_dm_modmail, "__aisupport_wrapped__", False):
             logger.warning("DM hook was replaced by something else; leaving it alone.")
             self._original_process_dm = None
             return
@@ -2545,7 +2503,7 @@ class NorwegianSupport(commands.Cog):
             self.bot.process_dm_modmail = original
 
         self._original_process_dm = None
-        logger.info("Norwegian support DM hook removed.")
+        logger.info("AI support DM hook removed.")
 
     async def _ensure_indexes(self) -> None:
         """Create the partition's indexes. Safe to run repeatedly."""
@@ -2555,7 +2513,7 @@ class NorwegianSupport(commands.Cog):
             await self.db.create_index([("_type", 1), ("user_id_hash", 1)])
             await self.db.create_index([("_type", 1), ("last_activity_at", 1)])
             await self.db.create_index(
-                [("nas_ref", 1)],
+                [("reference", 1)],
                 unique=True,
                 partialFilterExpression={"_type": TYPE_TICKET},
             )
@@ -2569,7 +2527,7 @@ class NorwegianSupport(commands.Cog):
         except Exception:
             logger.error("Failed creating plugin partition indexes.", exc_info=True)
         else:
-            logger.info("Norwegian support storage indexes ready.")
+            logger.info("AI support storage indexes ready.")
         finally:
             self._ready.set()
 
@@ -2632,7 +2590,7 @@ class NorwegianSupport(commands.Cog):
             return await passthrough(message)
 
         except Exception:
-            logger.error("Norwegian support gate failed; falling back to Modmail.", exc_info=True)
+            logger.error("AI support gate failed; falling back to Modmail.", exc_info=True)
             try:
                 return await passthrough(message)
             except Exception:
@@ -3499,7 +3457,7 @@ class NorwegianSupport(commands.Cog):
 
         # A blank line is the author's own break and beats any sentence end.
         # Sentence ends are the fallback, and require the whitespace so a period
-        # inside "vuelingrbx.vercel.app" is never mistaken for one.
+        # inside a domain such as "example.co.uk" is never mistaken for one.
         candidates = [match.end() for match in re.finditer(r"\n\s*\n", text)]
         if not any(usable(index) for index in candidates):
             candidates = [match.end() for match in re.finditer(r"(?<=[.!?])\s+", text)]
@@ -3733,11 +3691,11 @@ class NorwegianSupport(commands.Cog):
         return summary or SUMMARY_FALLBACK
 
     async def _new_ticket_reference(self) -> str:
-        """A VLG-XXXXXX code, unique against the partition."""
+        """A prefixed reference code, unique against the partition."""
         for _ in range(10):
             body = "".join(secrets.choice(TICKET_ALPHABET) for _ in range(TICKET_BODY_LENGTH))
             reference = f'{self.setting("ticketprefix")}-{body}'
-            if await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference}) is None:
+            if await self.db.find_one({"_type": TYPE_TICKET, "reference": reference}) is None:
                 return reference
         # 32^6 codes makes this essentially unreachable, but never hand back a
         # reference that might already belong to another ticket.
@@ -3816,7 +3774,7 @@ class NorwegianSupport(commands.Cog):
                 await self.db.insert_one(
                     {
                         "_type": TYPE_TICKET,
-                        "nas_ref": reference,
+                        "reference": reference,
                         "log_key": log_key,
                         "user_id": recipient.id,
                         "channel_id": thread.channel.id,
@@ -3914,7 +3872,9 @@ class NorwegianSupport(commands.Cog):
     # Diagnostics
     # ------------------------------------------------------------------
 
-    @commands.group(name=GROUP_NAME, aliases=list(LEGACY_ALIASES), invoke_without_command=True)
+    # Registered under the built-in name; `_apply_command_name` re-registers it
+    # under whatever `commandname` says once the stored settings have loaded.
+    @commands.group(name=GROUP_NAME, invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def ai(self, ctx, *, category: str = None):
         """The AI support assistant: settings, reports and data tools.
@@ -4052,7 +4012,7 @@ class NorwegianSupport(commands.Cog):
         read the source.
         """
         ok, why_not = self._ai_ready()
-        hooked = getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False)
+        hooked = getattr(self.bot.process_dm_modmail, "__aisupport_wrapped__", False)
         stale = self._is_stale()
 
         # Everything below describes the running code, which is not necessarily
@@ -4175,6 +4135,13 @@ class NorwegianSupport(commands.Cog):
         # only place it can admit to being on. It writes message content to the
         # bot log, which is not on the deletion path the privacy policy
         # describes, so leaving it running by accident matters.
+        if not str(self.setting("privacyurl")).strip():
+            problems.append(
+                "No privacy policy link is set, so the notice users see before their first "
+                "message has nowhere to point them for their data rights. Set one with "
+                f"`{self._cmd('set privacyurl')}`."
+            )
+
         if self.setting("verbose"):
             problems.append(
                 "Developer logging is on, and is writing the contents of people's messages "
@@ -4228,7 +4195,7 @@ class NorwegianSupport(commands.Cog):
         This is the old `.ai status` — accurate, dense, and written for whoever
         is working on the plugin rather than running it.
         """
-        hooked = getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False)
+        hooked = getattr(self.bot.process_dm_modmail, "__aisupport_wrapped__", False)
 
         try:
             counts = {
@@ -4253,7 +4220,7 @@ class NorwegianSupport(commands.Cog):
             description=(
                 "**The file on disk is newer than the running code, so none of this "
                 "reflects what is live.** Reload with "
-                f"`{self.bot.prefix}plugin reload @local/norwegian_support`, then run this again. "
+                f"`{self.bot.prefix}plugin update aisupport`, then run this again. "
                 f"See `{self._cmd('version')}`."
                 if stale
                 else None
@@ -4533,10 +4500,10 @@ class NorwegianSupport(commands.Cog):
         stale = self._is_stale()
 
         embed = self._embed(
-            title="Vueling support — running code",
+            title=f"{self.setting('assistantname')} — running code",
             description=(
                 "**The file on disk is newer than the running code.** "
-                f"Reload with `{self.bot.prefix}plugin reload @local/norwegian_support`."
+                f"Reload with `{self.bot.prefix}plugin update aisupport`."
                 if stale
                 else "Running code matches the file on disk."
             ),
@@ -4702,7 +4669,7 @@ class NorwegianSupport(commands.Cog):
             name="Outcome",
             value={
                 STATUS_ANSWERED: "`answered` — the reply goes out and no thread is created.",
-                STATUS_CHAT: "`chat` — conversational reply, no airline fact needed, no thread.",
+                STATUS_CHAT: "`chat` — conversational reply, no reference fact needed, no thread.",
                 STATUS_UNCLEAR: (
                     "`unclear` — the reply asks them to rephrase. Only after "
                     f"{MAX_CONSECUTIVE_UNCLEAR} unclear turns in a row is an agent offered."
@@ -4810,7 +4777,7 @@ class NorwegianSupport(commands.Cog):
             key = t.get("handoff_reason") or "unrecorded"
             reasons[key] = reasons.get(key, 0) + 1
 
-        questions = [NorwegianSupport._last_user_message(t) for t in deferred]
+        questions = [AISupport._last_user_message(t) for t in deferred]
         questions = [q for q in questions if q]
 
         repeats: typing.Dict[str, int] = {}
@@ -5501,7 +5468,7 @@ class NorwegianSupport(commands.Cog):
         line = sanitise_knowledge(text)
         current = str(self.setting(chosen))
         # Replacing the sample outright rather than appending to it: adding your
-        # own fact to somebody else's airline is worse than either alone.
+        # own fact to a leftover example is worse than either alone.
         if chosen == "knowledge" and self._setting_source("knowledge") != "set":
             current = ""
 
@@ -5684,8 +5651,8 @@ class NorwegianSupport(commands.Cog):
         group = self._registered_group()
         primary = group.name if group is not None else str(self.setting("commandname"))
 
-        # For `.vlg set`, the name used is in invoked_parents; for a bare `.vlg`
-        # it is invoked_with. Either way it is how the group was reached.
+        # For a subcommand the name used is in invoked_parents; for a bare group
+        # call it is invoked_with. Either way it is how the group was reached.
         used = (ctx.invoked_parents[0] if ctx.invoked_parents else ctx.invoked_with) or ""
         if used.lower() == primary.lower():
             return True
@@ -5952,8 +5919,8 @@ class NorwegianSupport(commands.Cog):
     @ai.command(name="ticket")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def ai_ticket(self, ctx, reference: str):
-        """Look up a VLG-XXXXXX reference and its Modmail log."""
-        doc = await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference.upper()})
+        """Look up a ticket reference and its Modmail log."""
+        doc = await self.db.find_one({"_type": TYPE_TICKET, "reference": reference.upper()})
         if doc is None:
             return await ctx.send(
                 embed=self._embed(
@@ -5963,7 +5930,7 @@ class NorwegianSupport(commands.Cog):
             )
 
         log_key = doc.get("log_key")
-        embed = self._embed(title=doc["nas_ref"])
+        embed = self._embed(title=doc["reference"])
         embed.add_field(name="User", value=f"<@{doc['user_id']}>", inline=True)
         embed.add_field(name="Log key", value=f"`{log_key}`", inline=True)
         if log_key:
@@ -5979,4 +5946,4 @@ class NorwegianSupport(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(NorwegianSupport(bot))
+    await bot.add_cog(AISupport(bot))

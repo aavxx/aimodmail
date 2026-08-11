@@ -1,9 +1,0 @@
-*
-!.gitignore
-
-# The Norwegian Air Shuttle support plugin is tracked deliberately: it is this
-# repo's own plugin rather than a third-party drop-in, so it needs to deploy
-# with the bot. Everything else under @local stays local-only as upstream intends.
-!norwegian_support/
-!norwegian_support/**
-norwegian_support/__pycache__/
