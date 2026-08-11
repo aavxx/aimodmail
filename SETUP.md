@@ -10,13 +10,21 @@ something does.
 ?plugin add aavxx/norwegian/aisupport@main
 ```
 
-Then put your Groq key in the bot's `.env`:
+Then give it a [Groq](https://console.groq.com) API key, either in the bot's
+`.env` (needs shell access, needs a restart):
 
 ```
 GROQ_API_KEY=gsk_...
 ```
 
-Restart the bot so the key is picked up, then:
+or from Discord, with no shell access at all:
+
+```
+.ai devmode
+.ai set groqkey gsk_...
+```
+
+See *The API key* below for which wins and how the value is protected. Then:
 
 ```
 ?ai setup
@@ -280,27 +288,73 @@ restyles the plugin's embeds too.
 ?config set error_color #C0392B
 ```
 
-## Environment
+## The API key
 
-The AI pre-screen needs a Groq API key in `.env` alongside the existing Modmail
-values:
+The assistant needs a [Groq](https://console.groq.com) API key. There are two
+places to put it, and **the one set in Discord wins**.
+
+### In `.env` (needs shell access)
 
 ```
 GROQ_API_KEY=gsk_...
 ```
 
 `core/config.py` calls `load_dotenv()` at import, so `.env` is enough — no
-export needed. `.ai status` reports whether the key and the `groq` package are
-both present. Without either, every request simply escalates to a human; nothing
-breaks.
+export needed. The bot has to be restarted to pick up a change.
+
+### In Discord (no shell access needed)
+
+```
+.ai devmode
+.ai set groqkey gsk_...
+```
+
+Stored in this bot's own database like every other setting, so it survives
+restarts and is never shared with another install. It takes effect immediately —
+no restart, no reload.
+
+It is behind `devmode` because it is not part of everyday configuration and does
+not belong in the menu everyone sees. `.ai devmode` toggles that; it is a switch
+you have to know about rather than a real barrier.
+
+### Why the database wins
+
+The whole reason this setting exists is for people who cannot reach `.env`. If a
+stale `.env` value silently beat the one they had just set, the person unable to
+edit `.env` would also be unable to work around it — the exact situation the
+setting is meant to solve. So the stored key takes precedence, and `.ai status`
+names which source is in force so it is never a guess.
+
+To fall back to `.env` again, clear the stored one:
+
+```
+.ai set groqkey default
+```
+
+### What is done with it
+
+- **Never displayed.** `.ai set`, `.ai set groqkey` and `.ai status` show
+  `set` or `not set` and, at most, which source it came from. There is no
+  command anywhere that prints the value.
+- **Never logged.** The line recording the change says *"set groqkey to a new
+  value"*. Every other setting logs its value; this one is special-cased.
+- **Never echoed in an error.** A rejected key is still a key, so the validation
+  messages describe the problem without quoting what you typed.
+- **Your message is deleted** after it is saved, so the key does not sit in
+  channel history. If the bot lacks **Manage Messages**, the confirmation says so
+  and tells you to delete it yourself — it does not fail quietly.
+
+Two things worth knowing. The key is stored **as plain text in your database**,
+the same as every other setting; treat database access as equivalent to key
+access. And Discord may have the message in transit and in client caches before
+the delete lands, so a key pasted into a busy public channel should be rotated
+rather than trusted.
+
+Without a key from either source, nothing breaks: every request simply escalates
+to a human.
 
 That is the only thing this plugin needs from `.env`. Everything else is set
 from inside Discord — see *Settings* below.
-
-`VLG_STAFF_CHANNEL_ID` is still read, but only as the *default* for the
-`staffchannel` setting, so an install that set it before `.ai set` existed keeps
-working untouched. Once you run `.ai set staffchannel`, the stored setting wins
-and `.ai status` says so.
 
 ## Settings
 
