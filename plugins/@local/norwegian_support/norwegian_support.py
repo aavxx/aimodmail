@@ -482,15 +482,17 @@ BUTTON_SPACER = "\N{ZERO WIDTH SPACE}"
 # Matches the id out of "<:name:1234>" / "<a:name:1234>".
 _CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
 
-# Author-row icon. None means "use the bot's own avatar", which follows the
-# Developer Portal without a redeploy and is the normal case.
+# Author-row icon, and the default for the `iconurl` setting. Empty means "use
+# the bot's own avatar", which follows the Developer Portal without a redeploy
+# and is the normal case.
 #
-# Set this to a direct image URL only if the embed icon needs to differ from the
-# bot's avatar. Note the Portal has two separate images: the App Icon on General
-# Information, and the Bot avatar on the Bot tab. Only the Bot avatar reaches
-# `bot.user.display_avatar`, so setting the App Icon alone leaves the embed icon
-# on Discord's default grey.
-AI_ICON_URL: typing.Optional[str] = None
+# Set `iconurl` to a direct image URL only if the embed icon needs to differ from
+# the bot's avatar. Note the Portal has two separate images: the App Icon on
+# General Information, and the Bot avatar on the Bot tab. Only the Bot avatar
+# reaches `bot.user.display_avatar`, so setting the App Icon alone leaves the
+# embed icon on Discord's default grey — which is the usual reason for wanting
+# this setting at all.
+AI_ICON_URL = ""
 
 # How long the typing indicator runs before each message the assistant composes.
 # Overridable with `.ai set typingdelay`; this is the default.
@@ -819,6 +821,7 @@ class Setting:
         maximum: typing.Optional[float] = None,
         unit: str = "",
         example: str = "",
+        menu: typing.Optional[str] = None,
     ):
         self.key = key
         self.kind = kind
@@ -828,6 +831,11 @@ class Setting:
         self.maximum = maximum
         self.unit = unit
         self.example = example
+        # Which command lists it. Booleans belong in `features` by default,
+        # because that is what "an optional feature" means — but a few switches
+        # configure the plugin itself rather than the assistant's behaviour, and
+        # those read better alongside the other install settings.
+        self.menu = menu or ("features" if kind == "bool" else "set")
 
     @property
     def default(self) -> typing.Any:
@@ -835,7 +843,7 @@ class Setting:
 
     @property
     def is_feature(self) -> bool:
-        return self.kind == "bool"
+        return self.menu == "features"
 
     def parse(self, raw: str, guild: typing.Optional[discord.Guild]) -> typing.Any:
         """Turn what someone typed into a stored value, or raise ValueError.
@@ -906,6 +914,8 @@ class Setting:
             # which is the fastest way to see that it is wrong.
             return str(value)
         if self.kind in ("text", "url"):
+            if not value:
+                return "*unset*"
             return f"`{truncate(str(value), 80)}`"
         return f"`{self._number(value)}`{self.unit}"
 
@@ -959,6 +969,25 @@ VALUE_SETTINGS = (
         "The first thing the assistant says. Write `{brand}` where you want your "
         "organisation's name to appear.",
         maximum=400,
+    ),
+    Setting(
+        "iconurl",
+        "url",
+        lambda: AI_ICON_URL,
+        "A direct image link to show as the icon on the assistant's messages. "
+        "Leave unset to use the bot's own Discord avatar.",
+        maximum=400,
+        example="https://example.com/logo.png",
+    ),
+    Setting(
+        "legacyaliases",
+        "bool",
+        lambda: True,
+        f"Whether the old command names ({', '.join('.' + a for a in LEGACY_ALIASES)}) still work "
+        f"alongside `.{GROUP_NAME}`. Turn this off for a single clean command name.",
+        # Lives in `set` rather than `features`: it configures how you reach the
+        # plugin, not anything the assistant does for users.
+        menu="set",
     ),
     Setting(
         "yesemoji",
@@ -1153,60 +1182,96 @@ SETTINGS: typing.Dict[str, Setting] = {
 #
 # Kept next to the settings rather than beside the commands because it is the
 # same kind of thing: the plugin's front door, written for a stranger.
+# Each entry is (key, label, blurb, commands), and each command is
+# (name, blurb, dev_only).
+#
+# `dev_only` is the audit that matters: would somebody running their own copy of
+# this ever need it, or does it only mean something to whoever is building the
+# plugin? A customer needs to know the assistant is answering well and to action
+# an erasure request. They do not need a git commit hash.
 COMMAND_CATEGORIES = (
     (
+        "general",
         "General",
+        "Everyday checks.",
         (
-            ("status", "Is everything wired up and working? Start here when something looks wrong."),
-            ("version", "Which version of the plugin is actually running right now."),
-            ("ask", "Try a question against the assistant privately, without opening a real chat."),
+            ("status", "Is the assistant running and set up correctly?", False),
+            ("ask", "Ask the assistant something yourself, to see how it would answer.", False),
         ),
     ),
     (
+        "settings",
         "Settings",
+        "Change how the assistant behaves.",
         (
-            ("set", "Change a setting that has a value — channels, timings, your organisation's name."),
-            ("features", "Turn optional features on and off."),
+            ("set", "Names, channels, timings, and anything else with a value.", False),
+            ("features", "Turn optional parts of the assistant on and off.", False),
         ),
     ),
     (
+        "reports",
         "Reports",
+        "How well it is doing.",
         (
-            ("stats", "How well the assistant is doing, and what to add to the FAQ next."),
-            ("digest", "Send this week's summary to the staff channel now, instead of waiting."),
+            ("stats", "How often the assistant answers, and what it keeps getting stuck on.", False),
+            ("digest", "Send the weekly summary to your staff channel right now.", False),
         ),
     ),
     (
+        "data",
         "User data",
+        "Records kept about the people who message you.",
         (
-            ("forget", "Delete everything stored about one user. Use this for erasure requests."),
-            ("training", "Read the chats users agreed could be kept to improve the assistant."),
-            ("ticket", "Look up a ticket reference and find its transcript."),
+            ("forget", "Delete everything stored about one person. Use this for erasure requests.", False),
+            ("training", "Read the chats people agreed could be kept to improve the assistant.", False),
+            ("ticket", "Look up a ticket reference and find its conversation.", False),
         ),
     ),
     (
+        "developer",
         "Developer",
-        (("verbose", "Log why the assistant handed a chat over. Writes message content to the log."),),
+        "Only useful while working on the plugin itself.",
+        (
+            ("version", "Which build is running, down to the commit.", True),
+            ("verbose", "Log why the assistant handed a chat over. Writes message content to the log.", True),
+            ("devmode", "Show or hide everything on this list.", True),
+        ),
     ),
 )
 
-# Listed only while devmode is on — internal debugging rather than day-to-day
-# running. See `_command_visible` for the exception that keeps a *running* tool
-# on screen regardless.
-DEV_COMMANDS = frozenset({"verbose"})
+# Derived rather than written out again, so a command cannot be marked dev-only
+# in one place and not the other.
+DEV_COMMANDS = frozenset(name for _, _, _, entries in COMMAND_CATEGORIES for name, _, dev in entries if dev)
 
-# Never listed, at all. `devmode` is deliberately undiscoverable: it is the
-# switch you have to have been told about.
-HIDDEN_COMMANDS = frozenset({"devmode"})
+ALL_LISTED_COMMANDS = frozenset(name for _, _, _, entries in COMMAND_CATEGORIES for name, _, _ in entries)
 
-assert DEV_COMMANDS <= {
-    name for _, entries in COMMAND_CATEGORIES for name, _ in entries
-}, "a dev command is missing from the listing, so devmode could never reveal it"
+CATEGORY_KEYS = tuple(key for key, _, _, _ in COMMAND_CATEGORIES)
+
+# Typed instead of the real category key often enough to be worth accepting.
+CATEGORY_ALIASES = {
+    "userdata": "data",
+    "user": "data",
+    "privacy": "data",
+    "setting": "settings",
+    "config": "settings",
+    "report": "reports",
+    "dev": "developer",
+    "debug": "developer",
+}
+
+# `devmode` is the way back in, so it can never be gated behind itself: with
+# devmode off it is unlisted, but still runs for anyone allowed to run it.
+ALWAYS_RUNNABLE = frozenset({"devmode"})
 
 # TYPE_META also holds bookkeeping that is not a setting. Reserved so a future
 # setting cannot be given a key that would overwrite one of them.
 _RESERVED_META_KEYS = {"user_id_salt", "last_digest_at"}
 assert not (SETTINGS.keys() & _RESERVED_META_KEYS), "a setting key collides with stored bookkeeping"
+
+# Every command the menu lists must exist, or the menu advertises something that
+# cannot be run. Checked against the real group at load; see `_check_catalogue`.
+assert DEV_COMMANDS <= ALL_LISTED_COMMANDS, "a dev command is missing from the listing"
+assert ALWAYS_RUNNABLE <= ALL_LISTED_COMMANDS, "an always-runnable command is not listed anywhere"
 
 # Escalation phrases, matched on word boundaries so "management" does not trip
 # "agent" and "humanity" does not trip "human". Extend freely; each entry is a
@@ -1729,6 +1794,7 @@ class NorwegianSupport(commands.Cog):
         # Settings arrive after the cog is added, so the decorators' own
         # `hidden` values are whatever the class declared. Reconcile them now.
         self._apply_devmode_visibility()
+        self._check_catalogue()
 
     def setting(self, key: str) -> typing.Any:
         """The current value of a setting, or its default when unset."""
@@ -3452,8 +3518,9 @@ class NorwegianSupport(commands.Cog):
         while building the opening disclosure, and an exception there would fall
         through the gate's fail-open path and skip the disclosure entirely.
         """
-        if AI_ICON_URL:
-            return AI_ICON_URL
+        configured = self.setting("iconurl")
+        if configured:
+            return configured
         user = getattr(self.bot, "user", None)
         return getattr(getattr(user, "display_avatar", None), "url", None)
 
@@ -3463,62 +3530,285 @@ class NorwegianSupport(commands.Cog):
 
     @commands.group(name=GROUP_NAME, aliases=list(LEGACY_ALIASES), invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def ai(self, ctx):
-        """The AI support assistant: settings, reports and data tools."""
-        await ctx.send(embed=self._command_overview())
+    async def ai(self, ctx, *, category: str = None):
+        """The AI support assistant: settings, reports and data tools.
 
-    def _command_overview(self) -> discord.Embed:
-        """The grouped command list shown by a bare `.ai`.
+        Bare, it prints the categories. With a category name it prints that
+        category's commands.
 
-        Written for someone who has never seen this plugin: grouped by what you
-        would be trying to do, and described in terms of what each command is
-        for rather than what it technically does. Modmail's own help formatter
-        gives one flat alphabetical list of docstrings, which is accurate and
-        tells a newcomer nothing.
+        `category` is caught here rather than being a set of real subcommands
+        because the group already runs `invoke_without_command`: anything that
+        is not a known subcommand arrives here as text, which means the category
+        menu costs no extra registered commands and never collides with one.
+        """
+        if category is None:
+            return await ctx.send(embed=self._category_menu())
+
+        wanted = category.strip().lower().lstrip("-")
+        wanted = CATEGORY_ALIASES.get(wanted, wanted)
+
+        found = next((c for c in COMMAND_CATEGORIES if c[0] == wanted), None)
+        if found is None:
+            return await ctx.send(embed=self._unknown_category_embed(category))
+
+        embed = self._category_embed(found)
+        if embed is None:
+            return await ctx.send(embed=self._unknown_category_embed(category))
+        await ctx.send(embed=embed)
+
+    def _visible_categories(self):
+        """Categories with at least one command worth showing, in order."""
+        for key, label, blurb, entries in COMMAND_CATEGORIES:
+            visible = [e for e in entries if self._command_visible(e[0])]
+            if visible:
+                yield key, label, blurb, visible
+
+    def _category_menu(self) -> discord.Embed:
+        """What a bare `.ai` prints: the categories, and how to open one.
+
+        Deliberately short. The full command list was one screen of text that
+        made somebody read every line to find the one they wanted; this asks a
+        single question — what are you trying to do — and gets out of the way.
         """
         embed = self._embed(
-            title=f"{self.setting('assistantname')} — commands",
-            description=(
-                f"Type `{self._cmd('<command>')}` to run one, or "
-                f"`{self.bot.prefix}help {GROUP_NAME} <command>` for the full detail on it."
-            ),
+            title=f"{self.setting('assistantname')}",
+            description=(f"Pick a category to see what is in it, e.g. " f"`{self._cmd(CATEGORY_KEYS[0])}`."),
             footer="Settings are stored in the database and survive restarts",
         )
 
-        for category, entries in COMMAND_CATEGORIES:
-            visible = [(name, blurb) for name, blurb in entries if self._command_visible(name)]
-            if not visible:
-                continue
+        for key, label, blurb, visible in self._visible_categories():
             embed.add_field(
-                name=category,
-                value="\n".join(f"`{name}` — {blurb}" for name, blurb in visible),
+                name=f"{label}  ·  `{self._cmd(key)}`",
+                value=f"{blurb} *({len(visible)} command{'s' if len(visible) != 1 else ''})*",
                 inline=False,
             )
 
         return embed
 
-    def _command_visible(self, name: str) -> bool:
-        """Whether a command belongs in the listing right now.
+    def _category_embed(self, category) -> typing.Optional[discord.Embed]:
+        """One category's commands, or None when nothing in it is visible."""
+        key, label, blurb, entries = category
+        visible = [e for e in entries if self._command_visible(e[0])]
+        if not visible:
+            return None
 
-        `devmode` is never listed: it is the one thing you have to already know
-        about. The rest of the developer tools are listed only while devmode is
-        on — with one exception. A tool that is currently *running* is always
-        listed, however devmode is set, because the alternative is `verbose`
-        quietly writing message content to the log with nothing on screen
-        admitting it.
+        embed = self._embed(
+            title=label,
+            description=blurb,
+            footer=f"{self.bot.prefix}help {GROUP_NAME} <command> for the full detail on one",
+        )
+        for name, command_blurb, dev in visible:
+            embed.add_field(
+                name=self._cmd(name) + ("  ·  developer" if dev else ""),
+                value=command_blurb,
+                inline=False,
+            )
+        return embed
+
+    def _unknown_category_embed(self, typed: str) -> discord.Embed:
+        """Someone typed something that is neither a command nor a category."""
+        options = "\n".join(
+            f"`{self._cmd(key)}` — {blurb}" for key, _, blurb, _ in self._visible_categories()
+        )
+        return self._embed(
+            title=f"No category called {truncate(typed, 40)!r}",
+            description=f"Pick one of these instead:\n\n{options}",
+            color=self.bot.error_color,
+        )
+
+    def _command_visible(self, name: str) -> bool:
+        """Whether a command is listed — and, for dev tools, whether it runs.
+
+        Developer commands are listed only while devmode is on, with one
+        exception: a tool that is currently *running* stays listed however
+        devmode is set. Otherwise `verbose` could sit there writing message
+        content to the log with nothing on screen admitting it — and, since this
+        also governs execution, with no way to reach the command to turn it off.
         """
-        if name in HIDDEN_COMMANDS:
-            return False
         if name not in DEV_COMMANDS:
             return True
         if self.setting("devmode"):
             return True
-        return bool(self._settings.get(name))
+        # A dev command that is also a stored toggle, and is currently on.
+        return bool(name in SETTINGS and self._settings.get(name))
 
     @ai.command(name="status")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def ai_status(self, ctx):
-        """Show plugin wiring, storage and config state."""
+        """Is the assistant running and set up correctly?"""
+        if self.setting("devmode"):
+            return await ctx.send(embed=await self._technical_status())
+        await ctx.send(embed=await self._plain_status())
+
+    def _ai_ready(self) -> typing.Tuple[bool, str]:
+        """Whether the assistant can answer at all, and why not if it cannot."""
+        if AsyncGroq is None:
+            return False, "the `groq` package is not installed"
+        if not os.getenv("GROQ_API_KEY"):
+            return False, "no API key is configured"
+        return True, ""
+
+    async def _plain_status(self) -> discord.Embed:
+        """The default view: what an admin running this actually wants to know.
+
+        No commit hash, no collection names, no wiring. Someone reading this is
+        asking "is it working, and is it doing what I asked it to" — every line
+        answers some part of that, in words that mean something without having
+        read the source.
+        """
+        ok, why_not = self._ai_ready()
+        hooked = getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False)
+        stale = self._is_stale()
+
+        # Everything below describes the running code, which is not necessarily
+        # the code on disk. That one state makes every other line unreliable, so
+        # it goes first and colours the whole embed.
+        healthy = ok and hooked and not stale
+        embed = self._embed(
+            title=f"{self.setting('assistantname')}",
+            description=(
+                "\N{WARNING SIGN} **The plugin was updated but not reloaded**, so this may "
+                "not describe what is actually running. Reload it and check again."
+                if stale
+                else (
+                    "Everything looks fine."
+                    if healthy
+                    else "\N{WARNING SIGN} Something needs attention — see below."
+                )
+            ),
+            color=None if healthy else self.bot.error_color,
+        )
+
+        yes, no = "\N{WHITE HEAVY CHECK MARK}", "\N{CROSS MARK}"
+
+        embed.add_field(
+            name="Answering messages",
+            value=(
+                f"{yes} Yes — new messages reach the assistant."
+                if hooked
+                else f"{no} **No** — the assistant is not seeing messages. Try reloading the plugin."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="AI",
+            value=(
+                f"{yes} Connected and answering."
+                if ok
+                else f"{no} **Not set up** — {why_not}, so every message goes straight to a human."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Running for",
+            value=self._uptime_text(),
+            inline=False,
+        )
+
+        # What it is doing for users, in the same words `.ai features` uses.
+        on_now = [f.key for f in FEATURE_SETTINGS if self.setting(f.key) and self._command_visible(f.key)]
+        off_now = [
+            f.key for f in FEATURE_SETTINGS if not self.setting(f.key) and self._command_visible(f.key)
+        ]
+        embed.add_field(
+            name="Features",
+            value=(
+                (f"{yes} On: " + ", ".join(f"`{k}`" for k in on_now) + "\n" if on_now else "")
+                + (f"{no} Off: " + ", ".join(f"`{k}`" for k in off_now) + "\n" if off_now else "")
+                + f"Change these with `{self._cmd('features')}`."
+            ),
+            inline=False,
+        )
+
+        # Only the problems, and only in words that say what to do about them.
+        # A brand new install can trip most of them at once, and an embed field
+        # caps at 1024 characters — over that Discord rejects the whole message,
+        # so a badly configured bot would answer this command with nothing.
+        problems = self._plain_problems()
+        if problems:
+            lines, shown = [], 0
+            for problem in problems:
+                line = f"\N{WARNING SIGN} {problem}"
+                if sum(len(x) + 1 for x in lines) + len(line) > 940:
+                    break
+                lines.append(line)
+                shown += 1
+            if shown < len(problems):
+                lines.append(f"*…and {len(problems) - shown} more. Fix these first.*")
+            value = "\n".join(lines)
+        else:
+            value = f"{yes} Nothing to fix."
+
+        embed.add_field(
+            name="Needs attention" if problems else "Setup",
+            value=value,
+            inline=False,
+        )
+
+        embed.set_footer(text=f"{self._cmd('set')} to change settings")
+        return embed
+
+    def _uptime_text(self) -> str:
+        """How long the bot has been up, in words, with the exact time after it."""
+        started = getattr(self.bot, "start_time", None)
+        if started is None:
+            return "unknown"
+        # human_timedelta is Modmail's own, and reads "2 days ago" — the "ago"
+        # is right for a start time and wrong for a duration, so only the
+        # relative timestamp is used, which Discord renders in local time.
+        return f"{self.bot.uptime}\nStarted {discord.utils.format_dt(started, 'R')}"
+
+    def _plain_problems(self) -> typing.List[str]:
+        """Everything wrong that an admin can actually fix, in plain words."""
+        problems = []
+
+        if self._home_guild() is None:
+            problems.append(
+                "The bot cannot find your server, so staff channels will not work. Check `GUILD_ID`."
+            )
+
+        if self.setting("digest") or self.setting("lowratingalerts"):
+            if self._guild_channel(self.setting("staffchannel")) is None:
+                problems.append(
+                    "The staff channel is not one this bot can see, so alerts and the weekly "
+                    f"summary will not arrive. Set it with `{self._cmd('set staffchannel')} #channel`."
+                )
+
+        if self.setting("partnershipform"):
+            if self._guild_channel(self.setting("partnershipchannel")) is None:
+                problems.append(
+                    "Partnership applications have nowhere to go — that channel is not visible "
+                    f"to the bot. Set it with `{self._cmd('set partnershipchannel')} #channel`."
+                )
+
+        if self.bot.config["confirm_thread_creation"]:
+            problems.append(
+                "Modmail's own 'confirm thread creation' is on, so people are asked twice before "
+                "a ticket opens. Turn it off with `?config set confirm_thread_creation no`."
+            )
+
+        expiry = self.bot.config.get("log_expiration")
+        if not (expiry and expiry != isodate.Duration()):
+            problems.append(
+                "Ticket transcripts are kept forever. If your privacy policy promises deletion, "
+                "set `log_expiration` (for example `?config set log_expiration P7D`)."
+            )
+
+        for label, raw in (("yes", self.setting("yesemoji")), ("no", self.setting("noemoji"))):
+            if _CUSTOM_EMOJI_RE.match(str(raw).strip()) and self._resolve_emoji(raw) is None:
+                problems.append(
+                    f"The `{label}` button emoji belongs to a server this bot is not in, so a "
+                    f"plain one is used instead. Change it with `{self._cmd('set ' + label + 'emoji')}`."
+                )
+
+        return problems
+
+    async def _technical_status(self) -> discord.Embed:
+        """The devmode view: wiring, storage and everything that can be wrong.
+
+        This is the old `.ai status` — accurate, dense, and written for whoever
+        is working on the plugin rather than running it.
+        """
         hooked = getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False)
 
         try:
@@ -3538,73 +3828,43 @@ class NorwegianSupport(commands.Cog):
         except Exception as e:
             storage = f"unreachable: `{e}`"
 
-        # First, because every other line here describes the code that is
-        # running, not the code that was pulled. Stale code is the one state
-        # where all of this can read healthy and none of it is what is live.
         stale = self._is_stale()
         embed = self._embed(
-            title=f"{self.setting('assistantname')} — status",
+            title=f"{self.setting('assistantname')} — technical status",
             description=(
                 "**The file on disk is newer than the running code, so none of this "
                 "reflects what is live.** Reload with "
                 f"`{self.bot.prefix}plugin reload @local/norwegian_support`, then run this again. "
-                f"See `{self._cmd()} version`."
+                f"See `{self._cmd('version')}`."
                 if stale
                 else None
             ),
             color=self.bot.error_color if stale else None,
         )
-        embed.add_field(
-            name="DM hook",
-            value="installed" if hooked else "**not installed**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Partition",
-            value=f"`{self.db.name}`",
-            inline=True,
-        )
-        # First-class here, not just in `.ai version`: after a deploy this is
-        # the one line that answers "did the restart actually pick up the new
-        # code" without anyone having to guess from behaviour.
+        embed.add_field(name="DM hook", value="installed" if hooked else "**not installed**", inline=True)
+        embed.add_field(name="Partition", value=f"`{self.db.name}`", inline=True)
         commit = self._git_head()
         embed.add_field(
             name="Commit",
             value=f"`{commit}`" if commit else "unknown — not a git checkout",
             inline=True,
         )
-        embed.add_field(
-            name="Indexes",
-            value="ready" if self._ready.is_set() else "pending",
-            inline=True,
-        )
+        embed.add_field(name="Indexes", value="ready" if self._ready.is_set() else "pending", inline=True)
+        embed.add_field(name="Uptime", value=self._uptime_text(), inline=True)
         embed.add_field(name="Storage", value=storage, inline=False)
+
+        ok, why_not = self._ai_ready()
         embed.add_field(
-            name="confirm_thread_creation",
-            value=(
-                "`off` — correct, the plugin gate replaces it"
-                if not self.bot.config["confirm_thread_creation"]
-                else "`on` — **turn this off**, it double-prompts ahead of the plugin gate"
-            ),
+            name="AI pre-screen",
+            value=f"ready — `{GROQ_MODEL}`" if ok else f"**{why_not}** — every request escalates",
             inline=False,
         )
 
-        if AsyncGroq is None:
-            ai_state = "**groq package missing** — every request escalates"
-        elif not os.getenv("GROQ_API_KEY"):
-            ai_state = "**GROQ_API_KEY not set** — every request escalates"
-        else:
-            ai_state = f"ready — `{GROQ_MODEL}`"
-        embed.add_field(name="AI pre-screen", value=ai_state, inline=False)
-
-        # The author-row icon is a common source of "that isn't my logo": the
-        # Portal's App Icon and the Bot avatar are different images, and only
-        # the latter reaches display_avatar.
         icon = self._bot_avatar()
-        if AI_ICON_URL:
-            icon_state = f"overridden by `AI_ICON_URL`\n{icon}"
+        if self.setting("iconurl"):
+            icon_state = f"set with `{self._cmd('set iconurl')}`\n{icon}"
         elif icon:
-            icon_state = f"bot avatar\n{icon}"
+            icon_state = f"the bot's own avatar\n{icon}"
         else:
             icon_state = "**none** — the bot has no avatar set on the Portal's *Bot* tab"
         embed.add_field(name="Embed icon", value=icon_state, inline=False)
@@ -3615,7 +3875,7 @@ class NorwegianSupport(commands.Cog):
         emoji_lines = []
         unusable = False
         for label, raw in (("yes", self.setting("yesemoji")), ("no", self.setting("noemoji"))):
-            if not _CUSTOM_EMOJI_RE.match(raw.strip()):
+            if not _CUSTOM_EMOJI_RE.match(str(raw).strip()):
                 emoji_lines.append(f"`{label}` {raw} — unicode, always usable")
                 continue
             resolved = self._resolve_emoji(raw)
@@ -3623,34 +3883,25 @@ class NorwegianSupport(commands.Cog):
                 unusable = True
                 emoji_lines.append(f"`{label}` `{raw}` — **not usable by this bot**")
             else:
-                # Naming the owning server turns "not usable" into an action:
-                # either invite the bot there or take the ids from a server it
-                # is already in.
                 emoji_lines.append(f"`{label}` {raw} — usable, from **{resolved.guild}**")
         embed.add_field(
             name="Confirmation button emoji",
             value="\n".join(emoji_lines)
             + (
                 (
-                    "\n*The bot is not in the server that owns these, so it cannot use them and "
-                    f"the buttons show {BUTTON_YES_FALLBACK} / {BUTTON_NO_FALLBACK} instead. Invite "
-                    "the bot to that server, or edit `BUTTON_YES_EMOJI` / `BUTTON_NO_EMOJI` in the "
-                    "plugin to ids from a server it is already in — then reload the plugin.*"
+                    "\n*The bot is not in the server that owns these, so the buttons show "
+                    f"{BUTTON_YES_FALLBACK} / {BUTTON_NO_FALLBACK} instead. Invite the bot there, "
+                    f"or set ids from a server it is already in with `{self._cmd('set yesemoji')}` "
+                    f"and `{self._cmd('set noemoji')}`.*"
                 )
                 if unusable
-                else "\n*Unusable would mean the bot is not in the server that owns the emoji, "
-                "and the prompt would fall back to plain unicode.*"
+                else "\n*Change these with " f"`{self._cmd('set yesemoji')}` / `{self._cmd('set noemoji')}`.*"
             ),
             inline=False,
         )
 
-        # The form is offered from the DM but delivered to a staff channel, so
-        # the half that can silently break is not visible from the DM side.
         partnership_channel_id = self.setting("partnershipchannel")
-        guild = self._home_guild()
-        channel = guild.get_channel(partnership_channel_id) if guild else None
-        if channel is None:
-            channel = self.bot.get_channel(partnership_channel_id)
+        channel = self._guild_channel(partnership_channel_id)
         embed.add_field(
             name="Partnership form",
             value=(
@@ -3665,20 +3916,17 @@ class NorwegianSupport(commands.Cog):
                     )
                 )
                 + f"\nTriggered by: {', '.join(f'`{p}`' for p in PARTNERSHIP_PATTERNS)}"
-                + f"\nCheck a specific message with `{self._cmd()} ask <message>`."
+                + f"\nCheck a specific message with `{self._cmd('ask')} <message>`."
             ),
             inline=False,
         )
 
-        # A glance at what is on, so a feature nobody remembers turning off is
-        # visible from the one command people already run.
         on, off = "\N{WHITE HEAVY CHECK MARK}", "\N{CROSS MARK}"
         embed.add_field(
             name="Features",
             value=(
                 " ".join(f"{on if self.setting(f.key) else off}`{f.key}`" for f in FEATURE_SETTINGS)
-                + f"\n{self._cmd()} features to change these, "
-                + f"{self._cmd()} set for values."
+                + f"\n{self._cmd('features')} to change these, {self._cmd('set')} for values."
             ),
             inline=False,
         )
@@ -3690,9 +3938,6 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
 
-        # The linked privacy policy is what now states retention, so this is no
-        # longer self-checking: if that page promises deletion, this has to be set
-        # for the promise to hold.
         expiry = self.bot.config.get("log_expiration")
         embed.add_field(
             name="Ticket log retention",
@@ -3707,7 +3952,7 @@ class NorwegianSupport(commands.Cog):
             ),
             inline=False,
         )
-        await ctx.send(embed=embed)
+        return embed
 
     def _config_checks(self) -> typing.Tuple[int, typing.List[str]]:
         """Every setting that can be wrong without anything visibly breaking.
@@ -3846,7 +4091,9 @@ class NorwegianSupport(commands.Cog):
         modified = self._source_mtime()
         return modified is not None and self._loaded_at is not None and modified > self._loaded_at
 
-    @ai.command(name="version", aliases=["updated"])
+    # Hidden by default: a commit hash is meaningful to whoever builds this
+    # plugin and to nobody who merely runs it. _apply_devmode_visibility settles it.
+    @ai.command(name="version", aliases=["updated"], hidden=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def ai_version(self, ctx):
         """What code is actually running, and whether it is the code on disk."""
@@ -4054,7 +4301,10 @@ class NorwegianSupport(commands.Cog):
                 value=truncate(reply, 1000),
                 inline=False,
             )
-        embed.add_field(name="Raw", value=f"```json\n{truncate(raw, 900)}\n```", inline=False)
+        if self.setting("devmode"):
+            # The model's verbatim JSON. Useful when the prompt is what you are
+            # working on, noise when the FAQ is.
+            embed.add_field(name="Raw", value=f"```json\n{truncate(raw, 900)}\n```", inline=False)
         embed.set_footer(text="No history replayed, so this is a first message. Nothing was stored.")
         await ctx.send(embed=embed)
 
@@ -4074,7 +4324,7 @@ class NorwegianSupport(commands.Cog):
         if not transcripts:
             return await ctx.send(
                 embed=self._embed(
-                    title="Vueling AI — stats",
+                    title=f"{self.setting('assistantname')} — stats",
                     description=(
                         "No conversations on record yet.\n\nTranscripts are deleted after "
                         f"{self.setting('retentiondays')} days, so this is always a rolling window."
@@ -4085,7 +4335,7 @@ class NorwegianSupport(commands.Cog):
         gaps = self._faq_gaps(transcripts)
 
         embed = self._embed(
-            title="Vueling AI — stats",
+            title=f"{self.setting('assistantname')} — stats",
             description=(
                 f"**{gaps['total']}** conversation(s) on record, **{gaps['still_open']}** still open.\n"
                 f"Transcripts are deleted after {self.setting('retentiondays')} days, so this is "
@@ -4508,11 +4758,19 @@ class NorwegianSupport(commands.Cog):
         return embed
 
     @ai.command(name="devmode", hidden=True)
-    @checks.has_permissions(PermissionLevel.OWNER)
-    async def ai_devmode(self, ctx, enabled: bool = None):
-        """Show or hide the developer commands. Undocumented on purpose."""
-        await self.set_setting("devmode", (not self.setting("devmode")) if enabled is None else enabled)
-        state = self.setting("devmode")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_devmode(self, ctx):
+        """Show or hide the developer commands. Toggles; takes no arguments.
+
+        ADMINISTRATOR rather than OWNER on purpose. A failed Modmail permission
+        check is completely silent — `on_command_error` only speaks when the
+        check carries a `fail_msg`, and the permission check does not — so an
+        OWNER-level command reads to anybody who is merely a server admin as a
+        command that does nothing at all. Every other command here is
+        ADMINISTRATOR; this one matching them is what makes it work.
+        """
+        state = not self.setting("devmode")
+        await self.set_setting("devmode", state)
         self._apply_devmode_visibility()
 
         logger.info("Developer mode turned %s by %s.", "on" if state else "off", ctx.author)
@@ -4521,17 +4779,21 @@ class NorwegianSupport(commands.Cog):
                 title=f"Developer mode {'on' if state else 'off'}",
                 description=(
                     (
-                        "Developer commands are now listed in "
-                        f"`{self._cmd()}`: {', '.join(f'`{c}`' for c in sorted(DEV_COMMANDS))}."
+                        f"Everything is now listed in `{self._cmd()}` and in "
+                        f"`{self.bot.prefix}help {GROUP_NAME}`, including "
+                        + ", ".join(f"`{c}`" for c in sorted(DEV_COMMANDS))
+                        + "."
                     )
                     if state
                     else (
-                        "Developer commands are hidden from the command list again. "
-                        "They still work if you type them."
+                        "Developer commands are hidden again, and typing one now refuses "
+                        "to run rather than quietly working.\n\n"
+                        f"Run `{self._cmd('devmode')}` again to turn this back on — that "
+                        "one always works."
                     )
                 ),
                 color=None if state else self.bot.error_color,
-                footer="This command is never listed, on or off",
+                footer="Toggles. Stored per install, and survives restarts",
             )
         )
 
@@ -4554,10 +4816,99 @@ class NorwegianSupport(commands.Cog):
             return
 
         for command in group.commands:
-            if command.name in HIDDEN_COMMANDS:
-                command.hidden = True
-            elif command.name in DEV_COMMANDS:
+            if command.name in DEV_COMMANDS:
                 command.hidden = not self._command_visible(command.name)
+
+    def _check_catalogue(self) -> None:
+        """Warn if the menu and the real commands have drifted apart.
+
+        The menu is written by hand, so it can advertise a command that was
+        renamed or list nothing for one that was added. Neither breaks anything
+        loudly — you just get a menu that lies — so it is checked once at load
+        and logged rather than raised.
+        """
+        group = self.bot.get_command(GROUP_NAME)
+        if group is None or not hasattr(group, "commands"):
+            return
+
+        real = {c.name for c in group.commands}
+        advertised = set(ALL_LISTED_COMMANDS)
+
+        missing = advertised - real
+        if missing:
+            logger.error("%s lists commands that do not exist: %s", GROUP_NAME, ", ".join(sorted(missing)))
+        unlisted = real - advertised
+        if unlisted:
+            logger.warning(
+                "%s has commands missing from its menu: %s", GROUP_NAME, ", ".join(sorted(unlisted))
+            )
+
+    async def cog_check(self, ctx) -> bool:
+        """Gate every command in this cog, before it runs.
+
+        Two things are enforced here rather than as per-command checks, because
+        a group running `invoke_without_command` does not run its own checks
+        when a subcommand is invoked — so a check on the group would silently
+        cover nothing.
+
+        Both failures answer the user. A bare `return False` raises CheckFailure,
+        which Modmail logs and says nothing about unless the check carries a
+        `fail_msg`, and a command that responds with silence is the thing this
+        whole change is fixing.
+        """
+        if not await self._alias_allowed(ctx):
+            return False
+        return await self._devmode_allowed(ctx)
+
+    async def _alias_allowed(self, ctx) -> bool:
+        """Refuse a legacy alias when this install has turned them off."""
+        if self.setting("legacyaliases"):
+            return True
+
+        # For `.vlg set`, the alias is in invoked_parents; for a bare `.vlg` it
+        # is invoked_with. Either way it is the name the group was reached by.
+        used = (ctx.invoked_parents[0] if ctx.invoked_parents else ctx.invoked_with) or ""
+        if used.lower() not in {a.lower() for a in LEGACY_ALIASES}:
+            return True
+
+        with contextlib.suppress(discord.HTTPException):
+            await ctx.send(
+                embed=self._embed(
+                    title=f"Use {self._cmd()} instead",
+                    description=(
+                        f"`{self.bot.prefix}{used}` is an old name for this plugin and has "
+                        f"been turned off on this install.\n\nThe command is "
+                        f"`{self._cmd()}`.\n\nTo allow the old names again: "
+                        f"`{self._cmd('set legacyaliases on')}`."
+                    ),
+                    color=self.bot.error_color,
+                )
+            )
+        return False
+
+    async def _devmode_allowed(self, ctx) -> bool:
+        """Refuse a developer command while developer mode is off.
+
+        Hiding a command from a list it was never going to be read from is not
+        much of a gate; this is the part that means anything.
+        """
+        name = getattr(ctx.command, "name", "")
+        if name in ALWAYS_RUNNABLE or self._command_visible(name):
+            return True
+
+        with contextlib.suppress(discord.HTTPException):
+            await ctx.send(
+                embed=self._embed(
+                    title="That one is a developer command",
+                    description=(
+                        f"`{self._cmd(name)}` is for working on the plugin rather than "
+                        "running it, so it is turned off here.\n\n"
+                        f"Run `{self._cmd('devmode')}` if you need it."
+                    ),
+                    color=self.bot.error_color,
+                )
+            )
+        return False
 
     # Declared hidden so it stays hidden in the window between the cog being
     # added and the stored settings arriving. _apply_devmode_visibility settles it.

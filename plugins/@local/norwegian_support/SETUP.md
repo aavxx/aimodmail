@@ -23,44 +23,63 @@ and ticket log retention must not read `Never`.
 
 ## Staff commands
 
-The group is **`.ai`**. `.ai` and `.nas` are still aliases, so anything typed
-from memory or saved in a macro keeps working — but `.ai` is the name shown
-everywhere, and the one a fresh install sees.
+The group is **`.ai`**. `.vlg` and `.nas` still work as aliases — turn them off
+with `.ai set legacyaliases off` if you want a single clean name.
 
-Running `.ai` on its own prints the command list grouped by what you are trying
-to do, rather than one flat alphabetical dump:
+`.ai` on its own prints the **categories**, not every command. Pick one to open
+it:
 
-| Group | Command | Permission | Purpose |
+```
+.ai                 → the categories
+.ai general         → the commands in that category
+.ai settings
+.ai reports
+.ai data
+```
+
+| Category | Command | Permission | Purpose |
 |---|---|---|---|
-| General | `.ai status` | Administrator | Is everything wired up and working |
-| General | `.ai version` | Supporter | What code is actually running |
-| General | `.ai ask <question>` | Supporter | Dry-run a question, no conversation created |
-| Settings | `.ai set` | Administrator | Settings that carry a value |
-| Settings | `.ai features` | Administrator | Turn optional features on and off |
-| Reports | `.ai stats` | Supporter | Deferral rate, feedback, what to add to the FAQ |
-| Reports | `.ai digest` | Supporter | Send the weekly digest now, for testing the channel |
-| User data | `.ai forget @user` | Supporter | Delete everything stored about one user |
-| User data | `.ai training [n]` | Supporter | Chats kept for review: count and samples |
-| User data | `.ai ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
-| Developer | `.ai verbose` | Administrator | Log why the AI handed over (see below) |
+| General | `.ai status` | Administrator | Is the assistant running and set up correctly |
+| General | `.ai ask <question>` | Supporter | Ask it something yourself, to see how it answers |
+| Settings | `.ai set` | Administrator | Names, channels, timings, anything with a value |
+| Settings | `.ai features` | Administrator | Turn optional parts on and off |
+| Reports | `.ai stats` | Supporter | How often it answers, and what it gets stuck on |
+| Reports | `.ai digest` | Supporter | Send the weekly summary to staff now |
+| User data | `.ai forget @user` | Supporter | Delete everything stored about one person |
+| User data | `.ai training [n]` | Supporter | Chats people agreed could be kept |
+| User data | `.ai ticket VLG-XXXXXX` | Supporter | Resolve a reference to its conversation |
+| Developer | `.ai version` | Supporter | Which build is running, down to the commit |
+| Developer | `.ai verbose` | Administrator | Log why the assistant handed a chat over |
+| Developer | `.ai devmode` | Administrator | Show or hide the developer commands |
 
 ### Developer mode
 
-`.ai devmode on` / `off`, owner only. Off by default.
+`.ai devmode` toggles. It takes no arguments — run it again to turn it back off.
 
-While it is off, developer tooling is **absent from the command list** — not
-greyed out, not permission-gated, simply not printed, in `.ai`, in `.ai
-features`, and in Modmail's own `?help ai`. The commands still work if you type
-them; they are just not advertised to staff who have no reason to run them.
+The split is *who needs this*: an admin running their own copy needs to know the
+assistant is answering well and to action an erasure request. They do not need a
+git commit hash or the raw JSON the model returned. Those are developer tools and
+are off by default.
 
-`devmode` itself is never listed, on or off. It is the one command you have to
-already know about.
+While devmode is **off**, developer commands are:
 
-One exception, deliberately: a developer tool that is currently **on** stays
-listed whatever devmode says. Otherwise `verbose` could sit there writing
-message content to the log with nothing on screen admitting it.
+- **not listed** — absent from `.ai`, from `.ai features`, and from Modmail's own
+  `?help ai`; the Developer category itself does not appear
+- **not runnable** — typing one directly refuses with an explanation, rather than
+  quietly working. Hiding a command from a list is not a gate on its own.
 
-`.ai forget` is the only way to action an erasure request. There is no consent
+While devmode is **on**, everything appears in both `.ai` and `?help ai`, and
+`.ai status` and `.ai ask` grow their technical sections.
+
+Two deliberate exceptions:
+
+- `.ai devmode` itself always runs, whatever it is set to. It is the way back in,
+  so it cannot be gated behind itself.
+- A developer tool that is currently **on** stays listed and runnable even with
+  devmode off. Otherwise `verbose` could sit there writing message content to the
+  log with no way to reach the command that turns it off.
+
+`.ai forget` is the only way to action an erasure request.`.ai forget` is the only way to action an erasure request. There is no consent
 to withdraw any more, and the disclosure now links only to the privacy policy, so
 requests will arrive by whatever route that page describes — but the transcripts
 still exist until their expiry (`retentiondays`, 7 by default) and nothing else
@@ -196,6 +215,22 @@ is still on the built-in default.
 | `ticketprefix` | VLG | Prefix on ticket references, e.g. `VLG-A3K9PQ` |
 | `greeting` | "Hola! I'm {brand}'s…" | The assistant's opening line; `{brand}` is substituted |
 | `yesemoji` / `noemoji` | guild emoji | Emoji on the "connect me to a human" buttons |
+| `iconurl` | unset | Image shown as the icon on the assistant's messages |
+| `legacyaliases` | on | Whether `.vlg` and `.nas` still work alongside `.ai` |
+
+`iconurl` unset means the bot's own Discord avatar is used, which is usually
+right. Set it when the avatar and the logo you want on messages differ — note
+the Developer Portal's *App Icon* and *Bot* avatar are two different images, and
+only the Bot one reaches messages, which is the usual reason for wanting this.
+`.ai set iconurl default` goes back to the avatar.
+
+`legacyaliases off` makes `.vlg` and `.nas` refuse with a note pointing at
+`.ai`. It is stored per install like every other setting, so turning it off here
+does not affect anyone else running this plugin.
+
+A custom emoji only works if the bot is in the server that owns it. If it is
+not, the buttons fall back to plain unicode automatically rather than failing to
+send — `.ai status` tells you when that has happened.
 
 **Everything else:**
 
@@ -298,6 +333,19 @@ warning about writing message content to the log. It is the same setting, and
 like the command it is hidden from this list while devmode is off — unless it is
 currently on, in which case it stays visible so it cannot be left running
 unnoticed.
+
+### `.ai status`
+
+Two views, depending on devmode.
+
+**Default** — written for whoever runs the bot, not whoever wrote it. Is it
+seeing messages, is the AI connected, how long has it been up, which features
+are on, and a plain-language list of anything that needs fixing with the command
+to fix it. No commit hashes, no collection names.
+
+**With devmode on** — the full technical view: DM hook, partition, commit,
+index state, document counts, emoji resolution, and the configuration checks
+below.
 
 ### Config sanity
 
