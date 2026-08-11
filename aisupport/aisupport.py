@@ -660,31 +660,10 @@ PARTNERSHIP_FAILED = (
 PARTNERSHIP_CHANNEL_ID = 0
 
 
-def _env_channel_id(name: str, default: int) -> int:
-    """A channel id from the environment, falling back rather than raising.
-
-    A typo in `.env` must not take the plugin down at import; `.ai status`
-    reports what these actually resolved to.
-    """
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.error("%s is not a channel id (%r); falling back to %s.", name, raw, default)
-        return default
-
-
 # Where staff notifications land: the low-rating alert and the weekly digest.
-# Defaults to the partnership channel, which is already known to be visible to
-# the bot.
-#
-# This is now only the *default* for the `staffchannel` setting. It still reads
-# the environment so an install that set VLG_STAFF_CHANNEL_ID before there was a
-# `.ai set` keeps working untouched, but `.ai set staffchannel` overrides it
-# and is the documented way to change it.
-STAFF_CHANNEL_ID = _env_channel_id("VLG_STAFF_CHANNEL_ID", PARTNERSHIP_CHANNEL_ID)
+# Unset until `.ai setup` or `.ai set staffchannel` picks one; zero resolves to
+# nothing, which the status check reports rather than failing silently.
+STAFF_CHANNEL_ID = 0
 
 # A headline score at or below this raises an alert as soon as it is submitted.
 LOW_RATING_THRESHOLD = 2
@@ -820,6 +799,7 @@ class Setting:
         example: str = "",
         menu: typing.Optional[str] = None,
         pattern: typing.Optional[typing.Tuple[typing.Pattern, str]] = None,
+        dev: bool = False,
     ):
         self.key = key
         self.kind = kind
@@ -831,6 +811,8 @@ class Setting:
         self.example = example
         # (compiled regex, the message shown when a value does not match).
         self.pattern = pattern
+        # Listed and settable only while devmode is on.
+        self.dev = dev
         # Which command lists it. Booleans belong in `features` by default,
         # because that is what "an optional feature" means — but a few switches
         # configure the plugin itself rather than the assistant's behaviour, and
@@ -860,6 +842,17 @@ class Setting:
             if lowered in _FALSE_WORDS:
                 return False
             raise ValueError("say `on` or `off`.")
+
+        if self.kind == "secret":
+            # No echoing the value, not even to say what was wrong with it: the
+            # error goes to a channel, and a rejected key is still a key.
+            if not raw or raw.isspace():
+                raise ValueError("that looked empty.")
+            if len(raw.split()) > 1:
+                raise ValueError("that has spaces in it, so it does not look like a key.")
+            if len(raw) > 200:
+                raise ValueError("that is too long to be a key.")
+            return raw
 
         if self.kind == "knowledge":
             cleaned = sanitise_knowledge(raw)
@@ -924,6 +917,9 @@ class Setting:
             # Shown as the emoji itself; a custom one renders, a dead id does not,
             # which is the fastest way to see that it is wrong.
             return str(value)
+        if self.kind == "secret":
+            # The only representation of a secret anywhere in this plugin.
+            return "**set**" if value else "*not set*"
         if self.kind == "knowledge":
             if not value:
                 return "*empty*"
@@ -1031,6 +1027,15 @@ VALUE_SETTINGS = (
         "Leave unset to use the bot's own Discord avatar.",
         maximum=400,
         example="https://example.com/logo.png",
+    ),
+    Setting(
+        "groqkey",
+        "secret",
+        lambda: "",
+        "The API key the assistant answers with. Setting it here means nobody "
+        "needs shell access to the machine. Stored in this bot's own database, "
+        "never shown back, and it wins over any GROQ_API_KEY in `.env`.",
+        dev=True,
     ),
     Setting(
         "extraaliases",
@@ -2047,6 +2052,46 @@ class AISupport(commands.Cog):
             return self._settings[key]
         return SETTINGS[key].default
 
+    async def _delete_invoking_message(self, ctx) -> typing.Optional[bool]:
+        """Remove the message a secret was typed into.
+
+        True if it is gone, False if it could not be removed and the user needs
+        telling, None if there was nothing to delete. Best effort by nature —
+        the bot may lack Manage Messages, and in a DM it cannot delete anyone
+        else's message at all — so the caller says so rather than pretending.
+        """
+        message = getattr(ctx, "message", None)
+        if message is None:
+            return None
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            logger.warning("Could not delete a message containing a secret in %s.", ctx.channel)
+            return False
+        except Exception:
+            logger.warning("Could not delete a message containing a secret.", exc_info=False)
+            return False
+        return True
+
+    def _api_key(self) -> typing.Tuple[str, str]:
+        """The API key in force, and where it came from.
+
+        The stored one wins. This setting exists so somebody without shell
+        access can configure the bot, and a key they set that was silently
+        ignored in favour of a stale `.env` would be a trap — especially since
+        the person who cannot reach `.env` is also the person who cannot fix it.
+
+        Returns ("", "") when there is none. The first element is the secret, so
+        it goes nowhere near a log line or an embed.
+        """
+        stored = str(self.setting("groqkey") or "").strip()
+        if stored:
+            return stored, "set in Discord"
+        env = (os.getenv("GROQ_API_KEY") or "").strip()
+        if env:
+            return env, "from .env"
+        return "", ""
+
     def _system_prompt(self) -> str:
         """The prompt as currently configured, knowledge included."""
         return build_system_prompt(
@@ -2055,17 +2100,6 @@ class AISupport(commands.Cog):
             sanitise_knowledge(self.setting("pricing")),
             sanitise_knowledge(self.setting("neveranswer")),
         )
-
-    def _using_sample_knowledge(self) -> bool:
-        """True when this install is still answering from the shipped example.
-
-        Only a problem once the brand name says this is somebody else — the
-        install it was written for is legitimately using its own text, and
-        nagging it forever would train people to ignore the warning.
-        """
-        if self._setting_source("knowledge") == "set":
-            return False
-        return str(self.setting("brandname")).strip().casefold() != BRAND_NAME.casefold()
 
     def _cmd(self, sub: str = "") -> str:
         """How to type a command in this plugin, for use in user-facing text.
@@ -2632,9 +2666,9 @@ class AISupport(commands.Cog):
             logger.error("groq package is not installed; AI pre-screen disabled.")
             return None
 
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key, _ = self._api_key()
         if not api_key:
-            logger.error("GROQ_API_KEY is not set; AI pre-screen disabled.")
+            logger.error("No API key is configured; AI pre-screen disabled.")
             return None
 
         self._groq_client = AsyncGroq(api_key=api_key, timeout=GROQ_TIMEOUT_SECONDS)
@@ -3999,7 +4033,7 @@ class AISupport(commands.Cog):
         """Whether the assistant can answer at all, and why not if it cannot."""
         if AsyncGroq is None:
             return False, "the `groq` package is not installed"
-        if not os.getenv("GROQ_API_KEY"):
+        if not self._api_key()[0]:
             return False, "no API key is configured"
         return True, ""
 
@@ -4119,13 +4153,9 @@ class AISupport(commands.Cog):
         # facts about a different company. Listed first because everything else
         # here is a feature not working, and this one is the assistant working
         # perfectly and being wrong.
-        if self._using_sample_knowledge():
-            problems.append(
-                "**The assistant is still answering from the built-in example, which describes "
-                f"a different company.** It will state those facts confidently. Replace them "
-                f"with `{self._cmd('setup')}` or `{self._cmd('knowledge')}`."
-            )
-        elif not str(self.setting("knowledge")).strip():
+        # Not an error — an assistant that knows nothing escalates everything,
+        # which is safe. It is just not doing the job it was installed for.
+        if not str(self.setting("knowledge")).strip():
             problems.append(
                 "The assistant has not been told anything about your business, so it hands "
                 f"every question to a human. Fix that with `{self._cmd('setup')}`."
@@ -4396,34 +4426,21 @@ class AISupport(commands.Cog):
             )
         )
 
-        # The env var is still read, but only as the default for an unset
-        # setting, so a stale one is confusing rather than wrong. Say which is
-        # actually in force.
-        raw_staff = (os.getenv("VLG_STAFF_CHANNEL_ID") or "").strip()
-        if raw_staff:
-            overridden = "staffchannel" in self._settings
-            checks.append(
-                (
-                    True,
-                    "VLG_STAFF_CHANNEL_ID",
-                    (
-                        f"`{raw_staff}` — **ignored**, `{self._cmd()} set staffchannel` " "takes precedence"
-                        if overridden
-                        else f"`{raw_staff}` — in use as the default"
-                        + ("" if raw_staff.isdigit() else ", but **it is not a channel id**")
-                    ),
-                )
-            )
-
-        key_set = bool(os.getenv("GROQ_API_KEY"))
+        key, key_source = self._api_key()
+        key_set = bool(key)
         checks.append(
             (
                 key_set and AsyncGroq is not None,
-                "GROQ_API_KEY",
+                "API key",
                 (
-                    "set"
+                    # Source only. The key itself is never rendered anywhere.
+                    f"set ({key_source})"
                     if key_set and AsyncGroq is not None
-                    else ("groq package missing" if key_set else "**not set** — every request escalates")
+                    else (
+                        f"set ({key_source}), but the `groq` package is missing"
+                        if key_set
+                        else f"**not set** — every request escalates. `{self._cmd()} set groqkey`"
+                    )
                 ),
             )
         )
@@ -4919,6 +4936,22 @@ class AISupport(commands.Cog):
                 )
             return await ctx.send(embed=self._unknown_setting_embed(key, VALUE_SETTINGS, "set"))
 
+        if setting.dev and not self.setting("devmode"):
+            # Above the query form as well, so reading it is gated like setting
+            # it. Says what it is rather than pretending it does not exist: an
+            # admin can turn devmode on anyway, so hiding it here would only
+            # obstruct somebody who had read the documentation.
+            return await ctx.send(
+                embed=self._embed(
+                    title="That one is a developer setting",
+                    description=(
+                        f"`{key}` is not part of normal configuration, so it is turned off "
+                        f"here.\n\nRun `{self._cmd('devmode')}` if you need it."
+                    ),
+                    color=self.bot.error_color,
+                )
+            )
+
         if value is None:
             current = setting.render(self.setting(key))
             return await ctx.send(
@@ -4959,12 +4992,43 @@ class AISupport(commands.Cog):
         await self.set_setting(key, parsed)
         if key in ("commandname", "legacyaliases"):
             self._apply_command_name()
-        logger.info("%s set %s to %r.", ctx.author, key, parsed)
+        if key == "groqkey":
+            # The client caches the key it was built with, so without this the
+            # old key stays in use until the next reload.
+            self._groq_client = None
+
+        # A secret typed into a channel sits in history until something removes
+        # it. Done before the confirmation is sent, so the two do not race.
+        deleted = None
+        if setting.kind == "secret":
+            deleted = await self._delete_invoking_message(ctx)
+        # Never `%r` the value: a secret would land in the bot log, which is the
+        # one place this feature exists to keep it out of.
+        logger.info(
+            "%s set %s to %s.",
+            ctx.author,
+            key,
+            "a new value" if setting.kind == "secret" else repr(parsed),
+        )
 
         embed = self._embed(
             title=f"{key} updated",
             description=f"Now {setting.render(parsed)}.\n\n{setting.summary}",
         )
+
+        if deleted is False:
+            embed.color = self.bot.error_color
+            embed.add_field(
+                name="\N{WARNING SIGN} Delete your message",
+                value=(
+                    "The value is saved, but I could not delete the message you typed it "
+                    "in — I need **Manage Messages** here. Delete it yourself, and treat "
+                    "the value as exposed until you do."
+                ),
+                inline=False,
+            )
+        elif deleted is True:
+            embed.set_footer(text="Your message was deleted so the value is not left in history")
 
         # A channel the bot cannot see accepts silently and then never delivers
         # anything, which is exactly the failure this command exists to prevent.
@@ -5014,6 +5078,9 @@ class AISupport(commands.Cog):
             footer="Stored in the database — these survive reloads and restarts",
         )
         for setting in VALUE_SETTINGS:
+            # Developer settings follow the same rule as developer commands.
+            if setting.dev and not self.setting("devmode"):
+                continue
             embed.add_field(
                 name=f"{setting.key} — {setting.render(self.setting(setting.key))}",
                 value=f"{setting.summary} *({self._setting_source(setting.key)})*",
@@ -5022,11 +5089,12 @@ class AISupport(commands.Cog):
         return embed
 
     def _unknown_setting_embed(self, key: str, pool, command: str) -> discord.Embed:
+        visible = [s for s in pool if not s.dev or self.setting("devmode")]
         return self._embed(
             title=f"No setting called {key}",
             description=(
                 "The ones you can change here are:\n"
-                + "\n".join(f"• `{s.key}`" for s in pool)
+                + "\n".join(f"• `{s.key}`" for s in visible)
                 + f"\n\nRun `{self._cmd()} {command}` to see them with their values."
             ),
             color=self.bot.error_color,
@@ -5438,12 +5506,12 @@ class AISupport(commands.Cog):
                 embed=self._embed(
                     title=f"{chosen} reset",
                     description=(
-                        "Back to its default. "
+                        "That section is now empty."
                         + (
-                            "That is the built-in example, which describes a different company — "
-                            f"replace it with `{self._cmd('setup')}`."
-                            if chosen == "knowledge" and self._using_sample_knowledge()
-                            else "That section is now empty."
+                            " The assistant will hand every question to a human until it is "
+                            f"filled in again — `{self._cmd('setup')}` walks through it."
+                            if chosen == "knowledge"
+                            else ""
                         )
                     ),
                 )
@@ -5467,10 +5535,6 @@ class AISupport(commands.Cog):
 
         line = sanitise_knowledge(text)
         current = str(self.setting(chosen))
-        # Replacing the sample outright rather than appending to it: adding your
-        # own fact to a leftover example is worse than either alone.
-        if chosen == "knowledge" and self._setting_source("knowledge") != "set":
-            current = ""
 
         updated = (current.rstrip() + "\n" + ("" if line.startswith("-") else "- ") + line).strip()
         cap = SETTINGS[chosen].maximum
@@ -5519,13 +5583,13 @@ class AISupport(commands.Cog):
                 f"safe direction.\n\nAdd a line with `{self._cmd('knowledge add')} <fact>`."
             ),
         )
-        if self._using_sample_knowledge():
+        if not str(self.setting("knowledge")).strip():
             embed.color = self.bot.error_color
             embed.add_field(
-                name="\N{WARNING SIGN} This is the built-in example",
+                name="\N{WARNING SIGN} Nothing here yet",
                 value=(
-                    "It describes a different company, and the assistant is stating those facts "
-                    f"to your users right now. Replace it with `{self._cmd('setup')}`."
+                    "The assistant has not been told anything, so every question goes to a "
+                    f"human. `{self._cmd('setup')}` walks through filling this in."
                 ),
                 inline=False,
             )

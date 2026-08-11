@@ -46,13 +46,22 @@ All of it is optional and switchable from Discord.
 ?plugin add aavxx/norwegian/aisupport@main
 ```
 
-Then add your API key to the bot's `.env`, alongside Modmail's own values:
+Then give it a Groq API key. Either in the bot's `.env`, alongside Modmail's own
+values:
 
 ```
 GROQ_API_KEY=gsk_...
 ```
 
-Restart the bot, then run:
+or, if you do not have shell access to the machine, from Discord:
+
+```
+?ai devmode
+?ai set groqkey gsk_...
+```
+
+The key set in Discord wins, is stored in your own database, is never displayed
+or logged, and the message you typed it into is deleted. Then run:
 
 ```
 ?ai setup
