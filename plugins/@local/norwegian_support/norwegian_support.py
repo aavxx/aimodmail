@@ -10,6 +10,16 @@ fallthrough, so a user is never left without a response.
 
 The handoff summary and ticket reference (stage 5) slot into `_gate` at the
 marked seam.
+
+Almost everything here is configured from inside Discord rather than from this
+file or from `.env`: `.vlg set` for settings that carry a value, `.vlg features`
+for the optional behaviour that is simply on or off. Both are stored in the
+plugin partition, so they survive reloads, restarts and a `git pull`. The
+constants below are the defaults those settings fall back to. See the Settings
+section for the registry.
+
+Credentials — the bot token, GROQ_API_KEY, the Mongo URI — stay in `.env`. Those
+are secrets rather than settings.
 """
 
 import asyncio
@@ -92,6 +102,10 @@ SWEEP_INTERVAL_MINUTES = 5
 
 # Inactivity in the pre-screen conversation only. Modmail's own thread_auto_close
 # governs open tickets and is untouched by any of this.
+#
+# Defaults for the `inactivitywarning` / `inactivityclose` settings, which are
+# stored in minutes; these are the only place the durations are written as
+# timedeltas.
 INACTIVITY_WARNING_AFTER = timedelta(hours=1)
 INACTIVITY_CLOSE_AFTER = timedelta(hours=3)
 
@@ -249,6 +263,25 @@ GROQ_TIMEOUT_SECONDS = 20
 
 # Turns of prior context sent back to Groq. Caps token spend on long chats.
 AI_HISTORY_LIMIT = 12
+
+# An answer longer than this is split into two messages before it is sent. The
+# prompt already asks the model to do this itself, but it obeys inconsistently
+# and a long answer arriving as one wall of text is exactly the case that needed
+# splitting, so the same rule is enforced here rather than left to the model.
+#
+# Sized against the FAQ answers: two or three sentences land under this and are
+# left alone, four or more go over it and are broken up.
+#
+# Deliberately on the eager side. The complaint this exists to fix is long
+# answers arriving as one block, and the cost of the two failure modes is not
+# symmetric: an over-split reply is two short messages, which is how the rest of
+# this conversation already reads, while an under-split one is the wall of text
+# nobody wanted.
+REPLY_SPLIT_THRESHOLD = 240
+
+# A split is only worth making if both halves are substantial. Below this, the
+# break lands near one end and produces a stray one-line message.
+REPLY_SPLIT_MIN_PART = 80
 
 # Assistant identity. The author row goes on every embed the plugin builds; the
 # footer caveat does not, because it is a statement about model output and would
@@ -419,10 +452,19 @@ _CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
 # on Discord's default grey.
 AI_ICON_URL: typing.Optional[str] = None
 
-# How long the typing indicator runs before each message. Every send in the
-# pre-screen pauses for this, so a greeted question costs roughly three of these
-# plus the Groq round trip before the user sees an answer.
-TYPING_DELAY_SECONDS = 2.5
+# How long the typing indicator runs before each message the assistant composes.
+# Overridable with `.vlg set typingdelay`; this is the default.
+#
+# The two opening disclosures deliberately do not use this — see
+# DISCLOSURE_GAP_SECONDS.
+TYPING_DELAY_SECONDS = 1.5
+
+# The gap between the two opening disclosures, which are sent with no typing
+# indicator at all. They are fixed legal text that was written long before the
+# user said anything, so showing them being "typed" is both slow and a small
+# lie about what is happening. They go out back to back, just far enough apart
+# to read as two messages rather than one.
+DISCLOSURE_GAP_SECONDS = 1.0
 
 # Sent once when a user opens a new pre-screen conversation, ahead of their first
 # message being processed. Two separate messages, each with its own typing pause.
@@ -567,7 +609,12 @@ def _env_channel_id(name: str, default: int) -> int:
 
 # Where staff notifications land: the low-rating alert and the weekly digest.
 # Defaults to the partnership channel, which is already known to be visible to
-# the bot — set VLG_STAFF_CHANNEL_ID to send them somewhere quieter.
+# the bot.
+#
+# This is now only the *default* for the `staffchannel` setting. It still reads
+# the environment so an install that set VLG_STAFF_CHANNEL_ID before there was a
+# `.vlg set` keeps working untouched, but `.vlg set staffchannel` overrides it
+# and is the documented way to change it.
 STAFF_CHANNEL_ID = _env_channel_id("VLG_STAFF_CHANNEL_ID", PARTNERSHIP_CHANNEL_ID)
 
 # A headline score at or below this raises an alert as soon as it is submitted.
@@ -643,6 +690,287 @@ URGENCY_PATTERNS = [
 ]
 
 _URGENCY_RE = [re.compile(p, re.IGNORECASE) for p in URGENCY_PATTERNS]
+
+
+# ----------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------
+#
+# Everything below is set from inside Discord and stored in the plugin
+# partition, so somebody installing this configures it by talking to the bot
+# rather than by editing this file or an `.env` on the box. It follows the same
+# pattern the verbose toggle already used: one document per setting under
+# TYPE_META, read into a cache on load.
+#
+# The constants above are the defaults. An unset setting reads its constant, so
+# an existing install behaves exactly as it did before anything was set, and
+# `.vlg set <key> default` puts it back.
+#
+# Real credentials — the bot token, the Groq key, the Mongo URI — stay in
+# `.env`. Those are secrets rather than settings, and nothing here touches them.
+
+# Accepted spellings for a boolean. Anything else is rejected rather than
+# guessed at: silently reading an unrecognised word as "off" would turn a
+# feature off while telling the user it was on.
+_TRUE_WORDS = {"on", "yes", "true", "enable", "enabled", "y", "1"}
+_FALSE_WORDS = {"off", "no", "false", "disable", "disabled", "n", "0"}
+
+# Matches "<#123>" as well as a bare id.
+_CHANNEL_MENTION_RE = re.compile(r"^<#(\d+)>$")
+
+
+class Setting:
+    """One configurable setting: how to parse it, how to show it, its default.
+
+    `default` is read at call time from the module constant rather than copied
+    here, so the two cannot drift apart.
+    """
+
+    def __init__(
+        self,
+        key: str,
+        kind: str,
+        default: typing.Callable[[], typing.Any],
+        summary: str,
+        *,
+        minimum: typing.Optional[float] = None,
+        maximum: typing.Optional[float] = None,
+        unit: str = "",
+        example: str = "",
+    ):
+        self.key = key
+        self.kind = kind
+        self._default = default
+        self.summary = summary
+        self.minimum = minimum
+        self.maximum = maximum
+        self.unit = unit
+        self.example = example
+
+    @property
+    def default(self) -> typing.Any:
+        return self._default()
+
+    @property
+    def is_feature(self) -> bool:
+        return self.kind == "bool"
+
+    def parse(self, raw: str, guild: typing.Optional[discord.Guild]) -> typing.Any:
+        """Turn what someone typed into a stored value, or raise ValueError.
+
+        The ValueError message is shown to whoever typed it, so it says what a
+        good value looks like rather than naming the type that failed.
+        """
+        raw = raw.strip()
+
+        if self.kind == "bool":
+            lowered = raw.lower()
+            if lowered in _TRUE_WORDS:
+                return True
+            if lowered in _FALSE_WORDS:
+                return False
+            raise ValueError("say `on` or `off`.")
+
+        if self.kind == "channel":
+            mention = _CHANNEL_MENTION_RE.match(raw)
+            if mention:
+                return int(mention.group(1))
+            if raw.isdigit():
+                return int(raw)
+            # A plain name, with or without the leading hash. Only resolvable
+            # against the server the command was run in.
+            if guild is not None:
+                wanted = raw.lstrip("#").casefold()
+                for channel in guild.text_channels:
+                    if channel.name.casefold() == wanted:
+                        return channel.id
+            raise ValueError("mention a channel like `#staff`, or paste its id.")
+
+        try:
+            value = int(raw) if self.kind == "int" else float(raw)
+        except ValueError:
+            raise ValueError("that needs to be a number.") from None
+
+        if self.minimum is not None and value < self.minimum:
+            raise ValueError(f"that cannot be below `{self._number(self.minimum)}`.")
+        if self.maximum is not None and value > self.maximum:
+            raise ValueError(f"that cannot be above `{self._number(self.maximum)}`.")
+        return value
+
+    @staticmethod
+    def _number(value: float) -> str:
+        """Render a number without a trailing `.0` on whole values."""
+        return f"{value:g}"
+
+    def render(self, value: typing.Any) -> str:
+        """The stored value, written for someone reading `.vlg set`."""
+        if self.kind == "bool":
+            return "on" if value else "off"
+        if self.kind == "channel":
+            return f"<#{value}>"
+        return f"`{self._number(value)}`{self.unit}"
+
+
+# Settings that carry a value. These are what `.vlg set` lists and changes.
+VALUE_SETTINGS = (
+    Setting(
+        "staffchannel",
+        "channel",
+        lambda: STAFF_CHANNEL_ID,
+        "Where the weekly digest and low-rating alerts are posted.",
+        example="#staff-alerts",
+    ),
+    Setting(
+        "partnershipchannel",
+        "channel",
+        lambda: PARTNERSHIP_CHANNEL_ID,
+        "Where submitted partnership applications are posted for staff to claim.",
+        example="#partnership-leads",
+    ),
+    Setting(
+        "retentiondays",
+        "int",
+        lambda: TRANSCRIPT_RETENTION_DAYS,
+        "How many days a conversation with the assistant is kept before it is "
+        "deleted automatically. Your privacy policy should say the same number.",
+        minimum=1,
+        maximum=365,
+        unit=" days",
+    ),
+    Setting(
+        "typingdelay",
+        "float",
+        lambda: TYPING_DELAY_SECONDS,
+        "How long the assistant shows a typing indicator before each message. "
+        "Higher feels more human, lower feels quicker.",
+        minimum=0,
+        maximum=10,
+        unit="s",
+    ),
+    Setting(
+        "lowratingthreshold",
+        "int",
+        lambda: LOW_RATING_THRESHOLD,
+        "A survey score of this or below raises an alert in the staff channel. "
+        "Only used when low-rating alerts are on.",
+        minimum=1,
+        maximum=5,
+    ),
+    Setting(
+        "profanitystrikes",
+        "int",
+        lambda: PROFANITY_STRIKES,
+        "How many times someone can swear in one chat before it is closed. The "
+        "first one is a warning. Only used when profanity moderation is on.",
+        minimum=1,
+        maximum=10,
+    ),
+    Setting(
+        "inactivitywarning",
+        "int",
+        lambda: int(INACTIVITY_WARNING_AFTER.total_seconds() // 60),
+        "How many quiet minutes before the assistant asks whether the user is " "still there.",
+        minimum=1,
+        maximum=10080,
+        unit=" min",
+    ),
+    Setting(
+        "inactivityclose",
+        "int",
+        lambda: int(INACTIVITY_CLOSE_AFTER.total_seconds() // 60),
+        "How many quiet minutes before the assistant closes the chat. Should be "
+        "larger than the warning above.",
+        minimum=1,
+        maximum=10080,
+        unit=" min",
+    ),
+    Setting(
+        "digestday",
+        "int",
+        lambda: DIGEST_WEEKDAY,
+        "Which day the weekly digest is posted: 0 is Monday, 6 is Sunday.",
+        minimum=0,
+        maximum=6,
+    ),
+    Setting(
+        "digesthour",
+        "int",
+        lambda: DIGEST_HOUR_UTC,
+        "What hour (UTC, 24-hour clock) the weekly digest is posted.",
+        minimum=0,
+        maximum=23,
+    ),
+)
+
+# Anything that is simply on or off. These are what `.vlg features` lists.
+# Wording is for whoever runs the bot, not for whoever wrote it: each line says
+# what turning it off actually stops happening.
+FEATURE_SETTINGS = (
+    Setting(
+        "survey",
+        "bool",
+        lambda: True,
+        "Ask the user to rate the chat after it ends. Turning this off also "
+        "stops the training question and low-rating alerts, since both come "
+        "from the survey.",
+    ),
+    Setting(
+        "training",
+        "bool",
+        lambda: True,
+        "Ask the user, in that survey, whether their chat may be kept to improve "
+        "the AI. Off means the question is never asked and no chat is ever "
+        "stored for training.",
+    ),
+    Setting(
+        "profanity",
+        "bool",
+        lambda: True,
+        "Warn someone who swears at the assistant, and close the chat if they " "keep going.",
+    ),
+    Setting(
+        "lowratingalerts",
+        "bool",
+        lambda: True,
+        "Post an alert in the staff channel as soon as someone leaves a bad " "survey score.",
+    ),
+    Setting(
+        "digest",
+        "bool",
+        lambda: True,
+        "Post a weekly summary in the staff channel of the questions the "
+        "assistant could not answer, so you know what to add to the FAQ.",
+    ),
+    Setting(
+        "partnershipform",
+        "bool",
+        lambda: True,
+        "Offer a partnership application form when someone asks about "
+        "partnering or collaborating. Off means those go to a human like any "
+        "other question.",
+    ),
+    Setting(
+        "urgencytags",
+        "bool",
+        lambda: True,
+        "Tag a ticket as urgent when the user sounds angry or in a hurry. Only "
+        "staff see the tag; it never changes what the user is told.",
+    ),
+    Setting(
+        "verbose",
+        "bool",
+        lambda: False,
+        "Write extra diagnostics to the bot log, including message content. For "
+        "debugging only — leave this off in normal use.",
+    ),
+)
+
+SETTINGS: typing.Dict[str, Setting] = {s.key: s for s in VALUE_SETTINGS + FEATURE_SETTINGS}
+
+# TYPE_META also holds bookkeeping that is not a setting. Reserved so a future
+# setting cannot be given a key that would overwrite one of them.
+_RESERVED_META_KEYS = {"user_id_salt", "last_digest_at"}
+assert not (SETTINGS.keys() & _RESERVED_META_KEYS), "a setting key collides with stored bookkeeping"
 
 # Escalation phrases, matched on word boundaries so "management" does not trip
 # "agent" and "humanity" does not trip "human". Extend freely; each entry is a
@@ -822,10 +1150,14 @@ Respond with a single json object with exactly these keys:
   "status": one of "answered", "chat", "unclear", "escalate"
   "reply": either a string, or an array of two strings
 
-Use the array form when the answer reads better as two messages: a short or
-blunt answer followed by the warm offer of further help described above, or a
-direct answer followed by a related pointer. A single string is fine when the
-reply is already conversational.
+Use the array form whenever the answer runs to more than about three sentences.
+A long answer arriving as one block is hard to read on a phone, which is where
+most of these are read, so break it into two messages: the direct answer first,
+then the detail, the caveat, or the related pointer. Split at a natural pause —
+never mid-sentence, and never with a markdown link straddling the two parts.
+
+A single string is for genuinely short replies: a one or two sentence answer, or
+anything conversational. If you are unsure which you have, use two.
 """
 
 
@@ -906,22 +1238,28 @@ class SurveyModal(discord.ui.Modal):
             self.add_item(discord.ui.Label(text=label, description=description, component=select))
             self.ratings[key] = select
 
-        self.training = discord.ui.Select(
-            custom_id="vlg-survey-training",
-            placeholder="Yes or no",
-            options=[
-                discord.SelectOption(label="Yes, use it to improve the AI", value="yes"),
-                discord.SelectOption(label="No, do not keep it", value="no"),
-            ],
-            required=True,
-        )
-        self.add_item(
-            discord.ui.Label(
-                text=SURVEY_TRAINING_QUESTION,
-                description=SURVEY_TRAINING_NOTE,
-                component=self.training,
+        # Asked only when training collection is on. Off means the question is
+        # never put to the user at all, rather than asked and then ignored —
+        # asking permission for something that cannot happen is worse than not
+        # asking, and `on_submit` reads a missing component as a no.
+        self.training: typing.Optional[discord.ui.Select] = None
+        if cog.setting("training"):
+            self.training = discord.ui.Select(
+                custom_id="vlg-survey-training",
+                placeholder="Yes or no",
+                options=[
+                    discord.SelectOption(label="Yes, use it to improve the AI", value="yes"),
+                    discord.SelectOption(label="No, do not keep it", value="no"),
+                ],
+                required=True,
             )
-        )
+            self.add_item(
+                discord.ui.Label(
+                    text=SURVEY_TRAINING_QUESTION,
+                    description=SURVEY_TRAINING_NOTE,
+                    component=self.training,
+                )
+            )
 
     async def on_submit(self, interaction: discord.Interaction):
         ratings = {}
@@ -936,7 +1274,9 @@ class SurveyModal(discord.ui.Modal):
                     await interaction.response.send_message(SURVEY_FAILED, ephemeral=True)
                 return
 
-        consented = bool(self.training.values) and self.training.values[0] == "yes"
+        consented = (
+            self.training is not None and bool(self.training.values) and self.training.values[0] == "yes"
+        )
         await self.cog.record_survey(
             interaction,
             transcript_id=self.transcript_id,
@@ -1073,7 +1413,10 @@ class NorwegianSupport(commands.Cog):
         self._ready = asyncio.Event()
         self._groq_client = None
         self._user_salt: typing.Optional[str] = None
-        self._verbose = False
+        # Stored settings, by key. Only keys that have actually been set appear
+        # here; anything missing falls back to its default, so this starting
+        # empty is the same as everything being at its default.
+        self._settings: typing.Dict[str, typing.Any] = {}
         self._loaded_at: typing.Optional[datetime] = None
         # user_id -> {summary, reason, urgent}, handed to on_thread_ready once
         # the channel exists.
@@ -1090,7 +1433,7 @@ class NorwegianSupport(commands.Cog):
         self._loaded_at = datetime.now(timezone.utc)
         self._install_dm_hook()
         self.bot.loop.create_task(self._ensure_indexes())
-        self.bot.loop.create_task(self._load_verbose())
+        self.bot.loop.create_task(self._load_settings())
         # Kept so cog_unload can stop it. A persistent view outlives the cog
         # otherwise, and after a reload the old one would still be serving form
         # buttons through the previous, unhooked instance.
@@ -1101,24 +1444,75 @@ class NorwegianSupport(commands.Cog):
         self.bot.add_dynamic_items(SurveyButton)
         self.maintenance_sweep.start()
 
-    async def _load_verbose(self) -> None:
-        """Restore the diagnostics toggle.
+    async def _load_settings(self) -> None:
+        """Restore every stored setting into the cache.
 
         Held in the partition rather than memory: a plugin reload builds a new
         cog instance and a restart loses the old one, so an in-memory flag
-        silently reverts to off exactly when someone is mid-diagnosis.
+        silently reverts to its default exactly when someone is relying on it.
+
+        Read once here rather than per use, because these are read on the hot
+        path — every message the assistant sends checks the typing delay — and a
+        database round trip per send is not worth it for values that only change
+        when somebody runs a command.
         """
         await self.bot.wait_for_connected()
         try:
-            doc = await self.db.find_one({"_type": TYPE_META, "key": "verbose"})
+            docs = await self.db.find({"_type": TYPE_META, "key": {"$in": list(SETTINGS)}}).to_list(
+                length=len(SETTINGS)
+            )
         except Exception:
-            logger.error("Could not read the verbose flag; defaulting to off.", exc_info=True)
+            logger.error("Could not read stored settings; using defaults.", exc_info=True)
             return
-        self._verbose = bool(doc and doc.get("value"))
-        if self._verbose:
+
+        for doc in docs:
+            key = doc.get("key")
+            if key in SETTINGS and doc.get("value") is not None:
+                self._settings[key] = doc["value"]
+
+        if self._settings:
+            logger.info(
+                "Restored %s stored setting(s): %s.",
+                len(self._settings),
+                ", ".join(sorted(self._settings)),
+            )
+        if self.setting("verbose"):
             logger.info(
                 "Verbose diagnostics are ON (restored). Turn off with %svlg verbose off.", self.bot.prefix
             )
+
+    def setting(self, key: str) -> typing.Any:
+        """The current value of a setting, or its default when unset."""
+        if key in self._settings:
+            return self._settings[key]
+        return SETTINGS[key].default
+
+    async def set_setting(self, key: str, value: typing.Any) -> None:
+        """Store a setting and update the cache.
+
+        The cache is only updated once the write succeeds, so a failed write
+        leaves the bot behaving the way `.vlg set` will still report.
+        """
+        await self.db.update_one(
+            {"_type": TYPE_META, "key": key},
+            {"$set": {"value": value}},
+            upsert=True,
+        )
+        self._settings[key] = value
+
+    async def clear_setting(self, key: str) -> None:
+        """Put a setting back to its default by forgetting it entirely.
+
+        Deleted rather than rewritten with the default, so a later change to the
+        default in code reaches installs that never overrode it.
+        """
+        await self.db.delete_one({"_type": TYPE_META, "key": key})
+        self._settings.pop(key, None)
+
+    @property
+    def _verbose(self) -> bool:
+        """Kept as an attribute because `_diag` reads it on every deferral."""
+        return bool(self.setting("verbose"))
 
     async def cog_unload(self) -> None:
         self._remove_dm_hook()
@@ -1173,11 +1567,13 @@ class NorwegianSupport(commands.Cog):
         this point entirely and is governed by Modmail's `thread_auto_close`.
         """
         now = datetime.now(timezone.utc)
+        warn_after = timedelta(minutes=self.setting("inactivitywarning"))
+        close_after = timedelta(minutes=self.setting("inactivityclose"))
 
         # Closing is handled before warning, so a conversation idle past both
         # thresholds closes rather than being warned and closed a tick later.
         stale = await self.db.find(
-            {"_type": TYPE_SESSION, "last_activity_at": {"$lte": now - INACTIVITY_CLOSE_AFTER}}
+            {"_type": TYPE_SESSION, "last_activity_at": {"$lte": now - close_after}}
         ).to_list(length=200)
         for session in stale:
             user_id = session["user_id"]
@@ -1193,7 +1589,7 @@ class NorwegianSupport(commands.Cog):
             {
                 "_type": TYPE_SESSION,
                 "warned_at": None,
-                "last_activity_at": {"$lte": now - INACTIVITY_WARNING_AFTER},
+                "last_activity_at": {"$lte": now - warn_after},
             }
         ).to_list(length=200)
         for session in quiet:
@@ -1221,8 +1617,11 @@ class NorwegianSupport(commands.Cog):
         stored timestamp rather than an in-memory one, so a restart mid-week
         neither skips a digest nor sends a second.
         """
+        if not self.setting("digest"):
+            return
+
         now = datetime.now(timezone.utc)
-        if now.weekday() != DIGEST_WEEKDAY or now.hour < DIGEST_HOUR_UTC:
+        if now.weekday() != self.setting("digestday") or now.hour < self.setting("digesthour"):
             return
 
         doc = await self.db.find_one({"_type": TYPE_META, "key": "last_digest_at"})
@@ -1270,7 +1669,8 @@ class NorwegianSupport(commands.Cog):
         embed = self._embed(
             title="Weekly digest — what the assistant could not answer",
             description=(
-                f"**{gaps['total']}** conversation(s) in the last {TRANSCRIPT_RETENTION_DAYS} days. "
+                f"**{gaps['total']}** conversation(s) in the last "
+                f"{self.setting('retentiondays')} days. "
                 f"**{gaps['deferred']}** ended with the assistant unable to answer "
                 f"(**{gaps['deferral_rate']:.0f}%** of finished conversations).\n\n"
                 "Each FAQ entry written for something below removes a handoff."
@@ -1298,13 +1698,15 @@ class NorwegianSupport(commands.Cog):
 
     async def _post_to_staff(self, embed: discord.Embed, *, what: str) -> typing.Optional[discord.Message]:
         """Send one notification to the staff channel. None if it did not land."""
-        channel = self._guild_channel(STAFF_CHANNEL_ID)
+        channel_id = self.setting("staffchannel")
+        channel = self._guild_channel(channel_id)
         if channel is None:
             logger.error(
                 "Staff channel %s is not visible to this bot, so the %s was not sent. "
-                "Check VLG_STAFF_CHANNEL_ID.",
-                STAFF_CHANNEL_ID,
+                "Set one with %svlg set staffchannel.",
+                channel_id,
                 what,
+                self.bot.prefix,
             )
             return None
         try:
@@ -1575,8 +1977,19 @@ class NorwegianSupport(commands.Cog):
         turns rather than one wall of text.
         """
         async with safe_typing(channel):
-            await asyncio.sleep(TYPING_DELAY_SECONDS)
+            await asyncio.sleep(self.setting("typingdelay"))
         return await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
+
+    @staticmethod
+    async def _send_plain(channel, embed: discord.Embed):
+        """Send with no typing indicator and no pause before it.
+
+        For text the assistant is not composing: the opening disclosures are
+        fixed and were written long before this conversation started, so showing
+        them being typed is both slower than it needs to be and a small
+        misrepresentation of what is happening.
+        """
+        return await channel.send(embed=embed)
 
     async def _send_buttons(self, channel, view: discord.ui.View):
         """Send a message carrying only the buttons. None if it could not go out.
@@ -1587,7 +2000,7 @@ class NorwegianSupport(commands.Cog):
         that would have left the message empty.
         """
         async with safe_typing(channel):
-            await asyncio.sleep(TYPING_DELAY_SECONDS)
+            await asyncio.sleep(self.setting("typingdelay"))
         try:
             return await channel.send(content=BUTTON_SPACER, view=view)
         except discord.HTTPException:
@@ -1601,9 +2014,19 @@ class NorwegianSupport(commands.Cog):
         shown once and remembered: processing rests on the contractual
         relationship, not consent, so there is no per-user decision to store and
         nothing to look up. Nothing here waits for input.
+
+        The two halves are paced differently on purpose. The disclosures are
+        fixed text and go out back to back with no typing indicator, because
+        making somebody watch a bot pretend to compose a privacy notice is slow
+        and faintly dishonest. The greeting that follows is the assistant
+        actually addressing them, so it gets the typing indicator and the normal
+        delay, and so does the question after it.
         """
-        for part in DISCLOSURE_PARTS:
-            await self._send_with_typing(channel, self._plain_embed(part))
+        for index, part in enumerate(DISCLOSURE_PARTS):
+            if index:
+                # Between the disclosures only, so the first one is immediate.
+                await asyncio.sleep(DISCLOSURE_GAP_SECONDS)
+            await self._send_plain(channel, self._plain_embed(part))
         for part in GREETING_PARTS:
             await self._send_with_typing(channel, self._plain_embed(part))
 
@@ -1658,7 +2081,7 @@ class NorwegianSupport(commands.Cog):
         count = (transcript or {}).get("profanity_count", 1)
         logger.info("Profanity %r from %s (%s), strike %s.", matched, user, user.id, count)
 
-        if count < PROFANITY_STRIKES:
+        if count < self.setting("profanitystrikes"):
             with contextlib.suppress(discord.HTTPException):
                 await self._send_with_typing(message.channel, self._ai_embed(PROFANITY_WARNING_TEXT))
             return True
@@ -1694,7 +2117,7 @@ class NorwegianSupport(commands.Cog):
         # Only the conversation that this call actually closed gets a survey. A
         # None here means something else closed it first, and offering a second
         # survey for the same chat would collect the same answer twice.
-        if closed is None:
+        if closed is None or not self.setting("survey"):
             return
 
         try:
@@ -1819,7 +2242,7 @@ class NorwegianSupport(commands.Cog):
         """
         if str(payload.emoji) != CLAIM_EMOJI:
             return
-        if payload.channel_id != PARTNERSHIP_CHANNEL_ID:
+        if payload.channel_id != self.setting("partnershipchannel"):
             return
         if payload.user_id == getattr(self.bot.user, "id", None):
             return
@@ -1913,14 +2336,17 @@ class NorwegianSupport(commands.Cog):
         for field, (label, _, _) in zip(answers, PARTNERSHIP_QUESTIONS):
             embed.add_field(name=label, value=truncate(str(field.value).strip() or "—", 1000), inline=False)
 
-        channel = self._guild_channel(PARTNERSHIP_CHANNEL_ID)
+        partnership_channel_id = self.setting("partnershipchannel")
+        channel = self._guild_channel(partnership_channel_id)
 
         delivered = False
         if channel is None:
             logger.error(
-                "Partnership channel %s in guild %s is not visible to this bot.",
-                PARTNERSHIP_CHANNEL_ID,
+                "Partnership channel %s in guild %s is not visible to this bot. "
+                "Set one with %svlg set partnershipchannel.",
+                partnership_channel_id,
                 PARTNERSHIP_GUILD_ID,
+                self.bot.prefix,
             )
         else:
             try:
@@ -2009,7 +2435,7 @@ class NorwegianSupport(commands.Cog):
                     "created_at": now,
                     # TTL index on this field expires the transcript 7 days
                     # after it started. Only transcripts carry it.
-                    "expires_at": now + timedelta(days=TRANSCRIPT_RETENTION_DAYS),
+                    "expires_at": now + timedelta(days=self.setting("retentiondays")),
                 },
             },
             upsert=True,
@@ -2116,6 +2542,14 @@ class NorwegianSupport(commands.Cog):
     ) -> None:
         """Store the answers and, on a yes, the copy kept for review."""
         now = datetime.now(timezone.utc)
+
+        # Checked again here, not just when the modal was built. A form opened
+        # before collection was turned off is still submittable minutes later,
+        # and "never store anything for training" has to hold for that one too.
+        if consented and not self.setting("training"):
+            logger.info("Training consent ignored: collection is turned off.")
+            consented = False
+
         # Kept alongside the per-question scores so one number still means
         # something without unpacking the dict: it is what `.vlg stats` reports,
         # what the low-rating alert fires on, and what answers stored before
@@ -2220,7 +2654,12 @@ class NorwegianSupport(commands.Cog):
         # Fired last and never allowed to affect the user's reply: they have
         # already been thanked, and a staff notification failing is not their
         # problem.
-        if stored_rating and headline is not None and headline <= LOW_RATING_THRESHOLD:
+        if (
+            stored_rating
+            and self.setting("lowratingalerts")
+            and headline is not None
+            and headline <= self.setting("lowratingthreshold")
+        ):
             try:
                 await self._alert_low_rating(oid, ratings, consented=consented)
             except Exception:
@@ -2303,7 +2742,58 @@ class NorwegianSupport(commands.Cog):
         if status not in STATUSES or not replies:
             raise ValueError(f"unusable Groq payload: {payload!r}")
 
-        return status, replies[:2], raw
+        replies = replies[:2]
+
+        # The prompt asks for two messages on a long answer and the model obliges
+        # only sometimes, so the rule is applied here as well. Only ever to a
+        # single long reply: two parts are already what was wanted.
+        if len(replies) == 1:
+            replies = self._split_long_reply(replies[0])
+
+        return status, replies, raw
+
+    @staticmethod
+    def _link_spans(text: str) -> typing.List[typing.Tuple[int, int]]:
+        """Character ranges covered by a markdown link, so a split can avoid them."""
+        return [match.span() for match in re.finditer(r"\[[^\]]*\]\([^)]*\)", text)]
+
+    @classmethod
+    def _split_long_reply(cls, text: str) -> typing.List[str]:
+        """Break one long answer into two messages, or leave it alone.
+
+        Returns one or two parts. Splits only at a paragraph break or the end of
+        a sentence, preferring whichever candidate sits closest to the middle, so
+        the result reads as two deliberate messages rather than a truncation.
+
+        Never splits inside a markdown link: the FAQ answers are full of them and
+        half a link in each message renders as neither.
+        """
+        if len(text) <= REPLY_SPLIT_THRESHOLD:
+            return [text]
+
+        spans = cls._link_spans(text)
+
+        def usable(index: int) -> bool:
+            # Both halves have to be worth sending on their own.
+            if index < REPLY_SPLIT_MIN_PART or len(text) - index < REPLY_SPLIT_MIN_PART:
+                return False
+            return not any(start < index < end for start, end in spans)
+
+        # A blank line is the author's own break and beats any sentence end.
+        # Sentence ends are the fallback, and require the whitespace so a period
+        # inside "vuelingrbx.vercel.app" is never mistaken for one.
+        candidates = [match.end() for match in re.finditer(r"\n\s*\n", text)]
+        if not any(usable(index) for index in candidates):
+            candidates = [match.end() for match in re.finditer(r"(?<=[.!?])\s+", text)]
+
+        usable_candidates = [index for index in candidates if usable(index)]
+        if not usable_candidates:
+            # Nowhere clean to break: one long message beats a mangled pair.
+            return [text]
+
+        midpoint = len(text) / 2
+        best = min(usable_candidates, key=lambda index: abs(index - midpoint))
+        return [text[:best].strip(), text[best:].strip()]
 
     async def _ai_prescreen(self, message: discord.Message) -> bool:
         """Try to resolve the message without a human.
@@ -2333,13 +2823,14 @@ class NorwegianSupport(commands.Cog):
         # After the opening, so a first message that swears still gets the
         # disclosure, and before everything else, so no other route can answer
         # a message that is about to be moderated.
-        swore = self._profanity_match(content)
-        if swore:
-            return await self._handle_profanity(message, swore)
+        if self.setting("profanity"):
+            swore = self._profanity_match(content)
+            if swore:
+                return await self._handle_profanity(message, swore)
 
         # Noted for the ticket tag, not acted on. Checked on every message
         # because the temper usually arrives a few turns in, not at the top.
-        if self._urgency_match(content):
+        if self.setting("urgencytags") and self._urgency_match(content):
             await self._flag_urgency(user.id)
 
         # Only once a conversation is already running: "bye" as an opening line
@@ -2364,7 +2855,7 @@ class NorwegianSupport(commands.Cog):
         # Ahead of the escalation check on purpose: "can we partner?" is a
         # request the form answers better than a human retyping the same five
         # questions, even when it is phrased as wanting to speak to someone.
-        partnership = self._partnership_match(content)
+        partnership = self._partnership_match(content) if self.setting("partnershipform") else None
         if partnership:
             logger.info("Partnership intent %r from %s (%s).", partnership, user, user.id)
             await self._append_transcript(user.id, content, PARTNERSHIP_INTRO, status=STATUS_ANSWERED)
@@ -2841,18 +3332,23 @@ class NorwegianSupport(commands.Cog):
 
         # The form is offered from the DM but delivered to a staff channel, so
         # the half that can silently break is not visible from the DM side.
+        partnership_channel_id = self.setting("partnershipchannel")
         guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
-        channel = guild.get_channel(PARTNERSHIP_CHANNEL_ID) if guild else None
+        channel = guild.get_channel(partnership_channel_id) if guild else None
         if channel is None:
-            channel = self.bot.get_channel(PARTNERSHIP_CHANNEL_ID)
+            channel = self.bot.get_channel(partnership_channel_id)
         embed.add_field(
             name="Partnership form",
             value=(
                 (
-                    f"submissions go to {channel.mention} in **{channel.guild}**"
-                    if channel is not None
-                    else f"**channel `{PARTNERSHIP_CHANNEL_ID}` is not visible to this bot** — "
-                    "submissions cannot be delivered, and the user is told so and handed to a human"
+                    "**off** — partnership questions go to a human like any other"
+                    if not self.setting("partnershipform")
+                    else (
+                        f"submissions go to {channel.mention} in **{channel.guild}**"
+                        if channel is not None
+                        else f"**channel `{partnership_channel_id}` is not visible to this bot** — "
+                        "submissions cannot be delivered, and the user is told so and handed to a human"
+                    )
                 )
                 + f"\nTriggered by: {', '.join(f'`{p}`' for p in PARTNERSHIP_PATTERNS)}"
                 + f"\nCheck a specific message with `{self.bot.prefix}vlg ask <message>`."
@@ -2860,12 +3356,15 @@ class NorwegianSupport(commands.Cog):
             inline=False,
         )
 
+        # A glance at what is on, so a feature nobody remembers turning off is
+        # visible from the one command people already run.
+        on, off = "\N{WHITE HEAVY CHECK MARK}", "\N{CROSS MARK}"
         embed.add_field(
-            name="Verbose diagnostics",
+            name="Features",
             value=(
-                "`on` — deferrals log the message and Groq's raw response at INFO"
-                if self._verbose
-                else "`off` — defer reasons only appear at DEBUG"
+                " ".join(f"{on if self.setting(f.key) else off}`{f.key}`" for f in FEATURE_SETTINGS)
+                + f"\n{self.bot.prefix}vlg features to change these, "
+                + f"{self.bot.prefix}vlg set for values."
             ),
             inline=False,
         )
@@ -2924,30 +3423,46 @@ class NorwegianSupport(commands.Cog):
             )
         )
 
-        staff = self._guild_channel(STAFF_CHANNEL_ID)
-        configured = "set" if os.getenv("VLG_STAFF_CHANNEL_ID") else "defaulted to the partnership channel"
+        staff_id = self.setting("staffchannel")
+        staff = self._guild_channel(staff_id)
+        configured = self._setting_source("staffchannel")
+        # Only worth flagging when something actually sends there.
+        staff_needed = bool(self.setting("digest") or self.setting("lowratingalerts"))
         checks.append(
             (
-                staff is not None,
+                staff is not None or not staff_needed,
                 "Staff notifications",
                 (
                     f"{staff.mention} ({configured}) — digest and low-rating alerts"
                     if staff is not None
-                    else f"`{STAFF_CHANNEL_ID}` not visible ({configured}) — "
-                    "**alerts and the weekly digest will not arrive**"
+                    else f"`{staff_id}` not visible ({configured}) — "
+                    + (
+                        "**alerts and the weekly digest will not arrive**. Set one with "
+                        f"`{self.bot.prefix}vlg set staffchannel #channel`"
+                        if staff_needed
+                        else "nothing posts there right now, both features are off"
+                    )
                 ),
             )
         )
 
-        # Set but unparseable falls back silently by design, so say so here.
+        # The env var is still read, but only as the default for an unset
+        # setting, so a stale one is confusing rather than wrong. Say which is
+        # actually in force.
         raw_staff = (os.getenv("VLG_STAFF_CHANNEL_ID") or "").strip()
         if raw_staff:
-            parseable = raw_staff.isdigit()
+            overridden = "staffchannel" in self._settings
             checks.append(
                 (
-                    parseable,
+                    True,
                     "VLG_STAFF_CHANNEL_ID",
-                    f"`{raw_staff}`" if parseable else f"`{raw_staff}` is not a channel id — **ignored**",
+                    (
+                        f"`{raw_staff}` — **ignored**, `{self.bot.prefix}vlg set staffchannel` "
+                        "takes precedence"
+                        if overridden
+                        else f"`{raw_staff}` — in use as the default"
+                        + ("" if raw_staff.isdigit() else ", but **it is not a channel id**")
+                    ),
                 )
             )
 
@@ -2980,10 +3495,10 @@ class NorwegianSupport(commands.Cog):
                 expiry_set,
                 "Retention",
                 (
-                    f"transcripts {TRANSCRIPT_RETENTION_DAYS}d, ticket logs "
+                    f"transcripts {self.setting('retentiondays')}d, ticket logs "
                     f"`{isodate.duration_isoformat(expiry)}`"
                     if expiry_set
-                    else f"transcripts {TRANSCRIPT_RETENTION_DAYS}d, ticket logs **never expire**"
+                    else f"transcripts {self.setting('retentiondays')}d, ticket logs **never expire**"
                 ),
             )
         )
@@ -3137,7 +3652,9 @@ class NorwegianSupport(commands.Cog):
 
         # Before escalation, exactly as the live route has it: a partnership
         # request phrased as wanting to speak to someone still gets the form.
-        partnership = self._partnership_match(question)
+        # Gated on the same setting, so a dry run cannot promise a form that the
+        # live route would not offer.
+        partnership = self._partnership_match(question) if self.setting("partnershipform") else None
         if partnership:
             return await ctx.send(
                 embed=self._embed(
@@ -3242,7 +3759,7 @@ class NorwegianSupport(commands.Cog):
                     title="Vueling AI — stats",
                     description=(
                         "No conversations on record yet.\n\nTranscripts are deleted after "
-                        f"{TRANSCRIPT_RETENTION_DAYS} days, so this is always a rolling window."
+                        f"{self.setting('retentiondays')} days, so this is always a rolling window."
                     ),
                 )
             )
@@ -3253,7 +3770,7 @@ class NorwegianSupport(commands.Cog):
             title="Vueling AI — stats",
             description=(
                 f"**{gaps['total']}** conversation(s) on record, **{gaps['still_open']}** still open.\n"
-                f"Transcripts are deleted after {TRANSCRIPT_RETENTION_DAYS} days, so this is "
+                f"Transcripts are deleted after {self.setting('retentiondays')} days, so this is "
                 "a rolling window, not all time."
             ),
         )
@@ -3408,20 +3925,274 @@ class NorwegianSupport(commands.Cog):
                 return entry["content"]
         return None
 
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+
+    def _setting_source(self, key: str) -> str:
+        """Whether a setting was set here or is still on its default."""
+        return "set" if key in self._settings else "default"
+
+    @vlg.command(name="set")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def vlg_set(self, ctx, key: str = None, *, value: str = None):
+        """Show or change a setting that carries a value.
+
+        `.vlg set` on its own lists everything with its current value.
+        `.vlg set staffchannel #staff` changes one.
+        `.vlg set staffchannel default` puts it back to the built-in default.
+        """
+        if key is None:
+            return await ctx.send(embed=self._settings_overview())
+
+        key = key.lower().lstrip("-")
+        setting = SETTINGS.get(key)
+
+        if setting is None or setting.is_feature:
+            # A feature name typed here is a near miss, not a mistake worth a
+            # bare error: say where it actually lives.
+            if setting is not None:
+                return await ctx.send(
+                    embed=self._embed(
+                        title="That one is a feature, not a value",
+                        description=(
+                            f"`{key}` is on or off rather than a value, so it lives in "
+                            f"`{self.bot.prefix}vlg features`.\n\n"
+                            f"Try `{self.bot.prefix}vlg features {key} on`."
+                        ),
+                        color=self.bot.error_color,
+                    )
+                )
+            return await ctx.send(embed=self._unknown_setting_embed(key, VALUE_SETTINGS, "set"))
+
+        if value is None:
+            current = setting.render(self.setting(key))
+            return await ctx.send(
+                embed=self._embed(
+                    title=key,
+                    description=(
+                        f"{setting.summary}\n\n**Currently:** {current} "
+                        f"({self._setting_source(key)})\n\n"
+                        f"Change it with `{self.bot.prefix}vlg set {key} "
+                        f"{setting.example or '<value>'}`."
+                    ),
+                )
+            )
+
+        if value.strip().lower() in ("default", "reset", "clear"):
+            await self.clear_setting(key)
+            logger.info("%s reset setting %s to its default.", ctx.author, key)
+            return await ctx.send(
+                embed=self._embed(
+                    title=f"{key} reset",
+                    description=f"Back to the default: {setting.render(setting.default)}.",
+                )
+            )
+
+        try:
+            parsed = setting.parse(value, ctx.guild)
+        except ValueError as e:
+            return await ctx.send(
+                embed=self._embed(
+                    title=f"Could not set {key}",
+                    description=f"{e}\n\n{setting.summary}",
+                    color=self.bot.error_color,
+                )
+            )
+
+        await self.set_setting(key, parsed)
+        logger.info("%s set %s to %r.", ctx.author, key, parsed)
+
+        embed = self._embed(
+            title=f"{key} updated",
+            description=f"Now {setting.render(parsed)}.\n\n{setting.summary}",
+        )
+
+        # A channel the bot cannot see accepts silently and then never delivers
+        # anything, which is exactly the failure this command exists to prevent.
+        if setting.kind == "channel" and self._guild_channel(parsed) is None:
+            embed.color = self.bot.error_color
+            embed.add_field(
+                name="\N{WARNING SIGN} Cannot see that channel",
+                value=(
+                    "The setting is saved, but this bot cannot currently see that "
+                    "channel, so nothing will be posted there. Check it exists and "
+                    "that the bot has permission to view and send messages in it."
+                ),
+                inline=False,
+            )
+
+        # Both halves of a pair only make sense relative to each other.
+        if key == "inactivitywarning" and parsed >= self.setting("inactivityclose"):
+            embed.add_field(
+                name="\N{WARNING SIGN} Warning is not before the close",
+                value=(
+                    f"`inactivityclose` is {self.setting('inactivityclose')} min, so the "
+                    "chat closes before anyone is warned. Set the warning lower."
+                ),
+                inline=False,
+            )
+        if key == "inactivityclose" and parsed <= self.setting("inactivitywarning"):
+            embed.add_field(
+                name="\N{WARNING SIGN} Close is not after the warning",
+                value=(
+                    f"`inactivitywarning` is {self.setting('inactivitywarning')} min, so the "
+                    "chat closes before anyone is warned. Set the close higher."
+                ),
+                inline=False,
+            )
+
+        await ctx.send(embed=embed)
+
+    def _settings_overview(self) -> discord.Embed:
+        """Every value setting, its current value, and what it is for."""
+        embed = self._embed(
+            title="Settings",
+            description=(
+                f"Change one with `{self.bot.prefix}vlg set <name> <value>`, or put it "
+                f"back with `{self.bot.prefix}vlg set <name> default`.\n"
+                f"On/off features are in `{self.bot.prefix}vlg features`."
+            ),
+            footer="Stored in the database — these survive reloads and restarts",
+        )
+        for setting in VALUE_SETTINGS:
+            embed.add_field(
+                name=f"{setting.key} — {setting.render(self.setting(setting.key))}",
+                value=f"{setting.summary} *({self._setting_source(setting.key)})*",
+                inline=False,
+            )
+        return embed
+
+    def _unknown_setting_embed(self, key: str, pool, command: str) -> discord.Embed:
+        return self._embed(
+            title=f"No setting called {key}",
+            description=(
+                "The ones you can change here are:\n"
+                + "\n".join(f"• `{s.key}`" for s in pool)
+                + f"\n\nRun `{self.bot.prefix}vlg {command}` to see them with their values."
+            ),
+            color=self.bot.error_color,
+        )
+
+    @vlg.command(name="features", aliases=["feature"])
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def vlg_features(self, ctx, key: str = None, state: str = None):
+        """Turn optional features on and off.
+
+        `.vlg features` lists everything with its current state.
+        `.vlg features digest off` turns one off.
+        `.vlg features digest` flips whatever it is now.
+        """
+        if key is None:
+            return await ctx.send(embed=self._features_overview())
+
+        key = key.lower().lstrip("-")
+        setting = SETTINGS.get(key)
+
+        if setting is None or not setting.is_feature:
+            if setting is not None:
+                return await ctx.send(
+                    embed=self._embed(
+                        title="That one carries a value",
+                        description=(
+                            f"`{key}` is not simply on or off, so it lives in "
+                            f"`{self.bot.prefix}vlg set`.\n\n"
+                            f"Try `{self.bot.prefix}vlg set {key}`."
+                        ),
+                        color=self.bot.error_color,
+                    )
+                )
+            return await ctx.send(embed=self._unknown_setting_embed(key, FEATURE_SETTINGS, "features"))
+
+        if state is None:
+            new_value = not self.setting(key)
+        else:
+            try:
+                new_value = setting.parse(state, ctx.guild)
+            except ValueError as e:
+                return await ctx.send(
+                    embed=self._embed(
+                        title=f"Could not change {key}",
+                        description=f"{e}",
+                        color=self.bot.error_color,
+                    )
+                )
+
+        await self.set_setting(key, new_value)
+        logger.info("%s turned %s %s.", ctx.author, key, "on" if new_value else "off")
+
+        embed = self._embed(
+            title=f"{key} is now {'on' if new_value else 'off'}",
+            description=setting.summary,
+            color=None if new_value else self.bot.error_color,
+        )
+
+        # Turning the parent off leaves the children stored as on but inert, so
+        # say that rather than letting the list read as though they still work.
+        if key == "survey" and not new_value:
+            dependents = [k for k in ("training", "lowratingalerts") if self.setting(k)]
+            if dependents:
+                embed.add_field(
+                    name="Also stopped",
+                    value=(
+                        "These come from the survey, so they stop too until it is back on: "
+                        + ", ".join(f"`{k}`" for k in dependents)
+                    ),
+                    inline=False,
+                )
+        if key in ("training", "lowratingalerts") and new_value and not self.setting("survey"):
+            embed.add_field(
+                name="\N{WARNING SIGN} The survey is off",
+                value=(
+                    "This needs the survey, which is currently off, so nothing will "
+                    f"happen yet. Turn it on with `{self.bot.prefix}vlg features survey on`."
+                ),
+                inline=False,
+            )
+        if key in ("digest", "lowratingalerts") and new_value:
+            if self._guild_channel(self.setting("staffchannel")) is None:
+                embed.add_field(
+                    name="\N{WARNING SIGN} No staff channel",
+                    value=(
+                        "This posts to the staff channel, which this bot cannot "
+                        f"currently see. Set one with `{self.bot.prefix}vlg set "
+                        "staffchannel #channel`."
+                    ),
+                    inline=False,
+                )
+
+        await ctx.send(embed=embed)
+
+    def _features_overview(self) -> discord.Embed:
+        """Every optional feature, on or off, in plain words."""
+        embed = self._embed(
+            title="Features",
+            description=(
+                f"Turn one on or off with `{self.bot.prefix}vlg features <name> on|off`.\n"
+                f"Settings that carry a value are in `{self.bot.prefix}vlg set`."
+            ),
+            footer="Stored in the database — these survive reloads and restarts",
+        )
+        on, off = "\N{WHITE HEAVY CHECK MARK}", "\N{CROSS MARK}"
+        for setting in FEATURE_SETTINGS:
+            enabled = bool(self.setting(setting.key))
+            embed.add_field(
+                name=f"{on if enabled else off} {setting.key} — {'on' if enabled else 'off'}",
+                value=f"{setting.summary} *({self._setting_source(setting.key)})*",
+                inline=False,
+            )
+        return embed
+
     @vlg.command(name="verbose")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     async def vlg_verbose(self, ctx, enabled: bool = None):
         """Promote this plugin's diagnostics to INFO without a bot restart.
 
         Logs the message that caused a defer and Groq's verbatim response.
+        Kept as its own command because the warning below is worth showing;
+        it is the same setting as `.vlg features verbose`.
         """
-        self._verbose = (not self._verbose) if enabled is None else enabled
-
-        await self.db.update_one(
-            {"_type": TYPE_META, "key": "verbose"},
-            {"$set": {"value": self._verbose}},
-            upsert=True,
-        )
+        await self.set_setting("verbose", (not self._verbose) if enabled is None else enabled)
 
         if self._verbose:
             # Write a line immediately so the log itself confirms the toggle
@@ -3434,8 +4205,9 @@ class NorwegianSupport(commands.Cog):
                 "response at INFO.\n\nA confirmation line has just been written to "
                 "the log — if you cannot see it, the log level itself is the "
                 "problem, not this toggle.\n\nThis writes ticket message content "
-                "to the bot log, which is not on the 7-day deletion path. Turn it "
-                f"off with `{self.bot.prefix}vlg verbose off` once you are done."
+                f"to the bot log, which is not on the {self.setting('retentiondays')}-day "
+                f"deletion path. Turn it off with `{self.bot.prefix}vlg verbose off` "
+                "once you are done."
             )
         else:
             logger.info("Verbose diagnostics disabled by %s.", ctx.author)
@@ -3515,17 +4287,29 @@ class NorwegianSupport(commands.Cog):
             )
 
         sent = await self._post_to_staff(embed, what="weekly digest")
-        await ctx.send(
-            embed=self._embed(
-                description=(
-                    f"Digest posted to <#{STAFF_CHANNEL_ID}>."
-                    if sent is not None
-                    else f"**Could not post to <#{STAFF_CHANNEL_ID}>** (`{STAFF_CHANNEL_ID}`). "
-                    "Check the bot can see that channel, or set `VLG_STAFF_CHANNEL_ID`."
-                ),
-                color=None if sent is not None else self.bot.error_color,
-            )
+        result = self._embed(
+            description=(
+                f"Digest posted to <#{self.setting('staffchannel')}>."
+                if sent is not None
+                else f"**Could not post to <#{self.setting('staffchannel')}>** "
+                f"(`{self.setting('staffchannel')}`). Check the bot can see that channel, "
+                f"or set one with `{self.bot.prefix}vlg set staffchannel #channel`."
+            ),
+            color=None if sent is not None else self.bot.error_color,
         )
+        # Sending on demand deliberately still works with the feature off — this
+        # is the command you reach for to check the channel — but it would read
+        # as proof the weekly one is running, so say that it is not.
+        if not self.setting("digest"):
+            result.add_field(
+                name="The weekly digest is off",
+                value=(
+                    "This one was sent because you asked for it. No digest will arrive "
+                    f"on its own until `{self.bot.prefix}vlg features digest on`."
+                ),
+                inline=False,
+            )
+        await ctx.send(embed=result)
 
     @vlg.command(name="training")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
@@ -3540,15 +4324,23 @@ class NorwegianSupport(commands.Cog):
 
         total = await self.db.count_documents({"_type": TYPE_TRAINING})
         if not total:
-            return await ctx.send(
-                embed=self._embed(
-                    description=(
-                        "Nothing kept yet. Conversations appear here when a user answers "
-                        "yes to the training question in the survey after a chat ends."
-                    ),
-                    color=self.bot.error_color,
-                )
+            reason = (
+                "Nothing kept yet. Conversations appear here when a user answers "
+                "yes to the training question in the survey after a chat ends."
             )
+            if not self.setting("training"):
+                reason = (
+                    "Training data collection is **off**, so the question is never "
+                    "asked and nothing is being kept.\n\nTurn it on with "
+                    f"`{self.bot.prefix}vlg features training on`."
+                )
+            elif not self.setting("survey"):
+                reason = (
+                    "The post-chat survey is **off**, and the training question is part "
+                    "of it, so nothing is being kept.\n\nTurn it on with "
+                    f"`{self.bot.prefix}vlg features survey on`."
+                )
+            return await ctx.send(embed=self._embed(description=reason, color=self.bot.error_color))
 
         answered = await self.db.count_documents({"_type": TYPE_SURVEY})
         recent = (

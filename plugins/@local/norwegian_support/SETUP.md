@@ -25,6 +25,8 @@ and ticket log retention must not read `Never`.
 
 | Command | Permission | Purpose |
 |---|---|---|
+| `.vlg set` | Administrator | Show or change settings that carry a value |
+| `.vlg features` | Administrator | Turn optional features on and off |
 | `.vlg status` | Administrator | Wiring, storage counts, config sanity |
 | `.vlg version` | Supporter | What code is running, and whether it is current |
 | `.vlg stats` | Supporter | Deferral rate, feedback, and what to add to the FAQ |
@@ -40,7 +42,8 @@ The group is `.vlg` (`?nas` still works as an alias, so nothing breaks mid-rollo
 `.vlg forget` is the only way to action an erasure request. There is no consent
 to withdraw any more, and the disclosure now links only to the privacy policy, so
 requests will arrive by whatever route that page describes — but the transcripts
-still exist until their 7 day expiry and nothing else deletes them on request.
+still exist until their expiry (`retentiondays`, 7 by default) and nothing else
+deletes them on request.
 `.vlg revoke` still works as an alias. It also removes anything the user agreed
 to leave behind in the training set — see *The post-chat survey*, which is the
 one thing here with no expiry of its own.
@@ -140,24 +143,97 @@ export needed. `.vlg status` reports whether the key and the `groq` package are
 both present. Without either, every request simply escalates to a human; nothing
 breaks.
 
-Optional, and worth setting:
+That is the only thing this plugin needs from `.env`. Everything else is set
+from inside Discord — see *Settings* below.
+
+`VLG_STAFF_CHANNEL_ID` is still read, but only as the *default* for the
+`staffchannel` setting, so an install that set it before `.vlg set` existed keeps
+working untouched. Once you run `.vlg set staffchannel`, the stored setting wins
+and `.vlg status` says so.
+
+## Settings
+
+Everything configurable lives behind two commands, and is stored in the database
+rather than in `.env` or in the plugin source, so it survives reloads, restarts
+and a `git pull`. Nothing here needs a redeploy.
+
+Only real credentials stay in `.env`: the bot token, `GROQ_API_KEY`, and the
+Mongo URI. Those are secrets rather than settings.
+
+### `.vlg set` — settings that carry a value
+
+`.vlg set` on its own lists every setting with its current value and whether it
+is still on the built-in default.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `staffchannel` | the partnership channel | Where the weekly digest and low-rating alerts are posted |
+| `partnershipchannel` | the built-in id | Where partnership applications are posted for staff to claim |
+| `retentiondays` | 7 | Days a conversation is kept before automatic deletion |
+| `typingdelay` | 1.5s | How long the typing indicator runs before each composed message |
+| `lowratingthreshold` | 2 | A survey score at or below this raises an alert |
+| `profanitystrikes` | 2 | Swears allowed in one chat before it closes; the first is a warning |
+| `inactivitywarning` | 60 min | Quiet minutes before the assistant asks if the user is still there |
+| `inactivityclose` | 180 min | Quiet minutes before the chat closes |
+| `digestday` | 0 (Monday) | Day of the week the digest posts |
+| `digesthour` | 9 | Hour (UTC) the digest posts |
 
 ```
-VLG_STAFF_CHANNEL_ID=...
+.vlg set staffchannel #staff-alerts
+.vlg set retentiondays 14
+.vlg set staffchannel default
 ```
 
-Where the weekly digest and low-rating alerts land. **It defaults to the
-partnership channel**, because that one is already known to be visible to the
-bot — which also means that without this set, leads and alerts share a channel.
-Point it somewhere of its own. A value that is not a number is ignored with a
-warning rather than taking the plugin down, and `.vlg status` says which of the
-two is in effect.
+A channel can be a mention, a raw id, or a plain name in the server you run the
+command in. Numbers are range-checked and a bad value is refused with a message
+saying what a good one looks like, rather than being stored and silently
+misbehaving. Setting a channel the bot cannot see is accepted but warned about
+loudly, because that is the failure that otherwise shows up as "the digest never
+arrived". `default` puts a setting back.
+
+If `retentiondays` is changed, **the privacy policy the opening disclosure links
+to should say the same number.** Nothing checks that for you.
+
+### `.vlg features` — things that are just on or off
+
+`.vlg features` lists every optional feature, its state, and a plain description
+of what turning it off actually stops.
+
+| Feature | Default | What it does |
+|---|---|---|
+| `survey` | on | Ask the user to rate the chat after it ends |
+| `training` | on | Ask, in that survey, whether the chat may be kept to improve the AI |
+| `profanity` | on | Warn on swearing, and close the chat if it continues |
+| `lowratingalerts` | on | Alert staff as soon as a bad score is left |
+| `digest` | on | Post the weekly summary of unanswered questions |
+| `partnershipform` | on | Offer the application form when someone asks about partnering |
+| `urgencytags` | on | Tag a ticket as urgent when the user sounds angry or rushed |
+| `verbose` | off | Extra diagnostics in the bot log, including message content |
+
+```
+.vlg features
+.vlg features digest off
+.vlg features digest        # flips whatever it is now
+```
+
+`training` off means the question is never put to the user at all, and nothing
+is ever written to the training set — not asked-and-ignored. A form opened just
+before you turned it off is re-checked on submit, so it cannot slip through.
+
+`survey` is the parent of `training` and `lowratingalerts`: turning it off stops
+both, and the command says so rather than leaving them reading as on. Turning
+`digest` or `lowratingalerts` on while the staff channel is unreachable warns
+you at the point you turn it on.
+
+`verbose` also has its own `.vlg verbose` command, which carries a longer
+warning about writing message content to the log. It is the same setting.
 
 ### Config sanity
 
 `.vlg status` now ends with a **Configuration** block: one line per setting that
 can be wrong without anything visibly breaking — both guild IDs, the staff
-channel, `GROQ_API_KEY`, `log_url`, and retention. A bad `.env` value does not
+channel, `GROQ_API_KEY`, `log_url`, and retention. It also carries a **Features**
+line showing what is on and off at a glance. A bad value does not
 raise anywhere; it just means a notification silently never arrives, so this is
 the place that says so. The heading counts the problems, so a healthy bot is one
 glance rather than a read.
@@ -343,6 +419,24 @@ off once you are done:
 Every conversation opens with two fixed, informational messages before the
 greeting: the data-processing notice and the AI-tool notice (`DISCLOSURE_PARTS`).
 Nothing waits for input and nothing is stored per user.
+
+The opening is paced in two halves, on purpose:
+
+| Message | Typing indicator | Delay before it |
+|---|---|---|
+| Data-processing notice | no | none |
+| AI-tool notice | no | 1s (`DISCLOSURE_GAP_SECONDS`) |
+| Greeting ("Hola! ...") | yes | 1.5s (`typingdelay`) |
+| Follow-up ("How can I help you? ...") | yes | 1.5s (`typingdelay`) |
+
+The two disclosures are fixed legal text that was written long before the user
+said anything, so showing a typing indicator for them is both slow and a small
+misrepresentation of what is happening — they go out back to back. The greeting
+and the question after it are the assistant actually addressing the user, so
+they get the indicator and the normal delay.
+
+Every other message the assistant composes uses the same `typingdelay`, so the
+whole conversation reads at one pace. Change it with `.vlg set typingdelay`.
 
 It repeats on **every** new conversation rather than being shown once, on the
 same open/closed boundary as the greeting. See *Ending a conversation* below for
@@ -586,7 +680,8 @@ The loop-closer: it tells you which FAQ entries to write next.
   listed separately when they occur, and the most recent unanswered questions are
   shown verbatim.
 
-Everything is a **rolling window**: transcripts are deleted after 7 days, so this
+Everything is a **rolling window**: transcripts are deleted after `retentiondays`
+(7 by default), so this
 is never all-time. The embed says so, because a stats screen that silently means
 "last week" is worse than no stats.
 
@@ -714,13 +809,26 @@ labels**: an emoji-only choice is fine for "shall I fetch a human", not for
 accepting a privacy policy.
 
 The model may return `reply` as a string or as an array of two strings, and each
-element is sent as its own message. It is told to split only when an answer
-genuinely reads better in two parts.
+element is sent as its own message. The prompt asks it to use the array form
+whenever an answer runs past about three sentences.
+
+Because it obeys that inconsistently, the same rule is **also enforced in code**:
+a single reply longer than `REPLY_SPLIT_THRESHOLD` (240 characters) is split into
+two messages by `_split_long_reply`. It breaks at a blank line if there is one,
+otherwise at the sentence end nearest the middle, and never inside a markdown
+link — the FAQ answers are full of links and half of one in each message renders
+as neither. If there is no clean break, or either half would come out under
+`REPLY_SPLIT_MIN_PART` (80 characters), the reply is left whole: one long message
+beats a mangled pair.
+
+The threshold is deliberately eager. The failure it exists to fix is a long
+answer arriving as one block, and an over-split reply is just two short messages,
+which is how the rest of the conversation already reads.
 
 A conversation ends when a human takes over: the handoff stamps `handed_off_at`
 on the transcript, so the next time that user writes in they are greeted afresh.
 A conversation the assistant resolved stays open, so follow-up questions do not
-re-greet; it lapses naturally when the transcript expires after 7 days.
+re-greet; it lapses naturally when the transcript expires after `retentiondays`.
 
 ### Branding, mid-rebrand
 
@@ -833,7 +941,7 @@ MongoDB and are separated by a `_type` field:
 | `_type`        | Fields                                                     | Retention |
 |----------------|------------------------------------------------------------|-----------|
 | `consent`      | `user_id`, `accepted_at`, `policy_version`                   | until withdrawn |
-| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `closed_at`, `handed_off_at`, `handoff_reason`, `urgent`, `profanity_count` | 7 days |
+| `ai_transcript`| `user_id_hash`, `messages[]`, `resolved`, `created_at`, `expires_at`, `closed_at`, `handed_off_at`, `handoff_reason`, `urgent`, `profanity_count` | `retentiondays` (7) |
 | `session`      | `user_id`, `started_at`, `last_activity_at`, `warned_at`      | until the conversation closes |
 | `survey`       | `user_id_hash`, `transcript_id`, `ratings{}`, `rating`, `training_consent`, `answered_at` | kept |
 | `training_transcript` | `user_id_hash`, `transcript_id`, `messages[]`, `message_count`, `ratings{}`, `rating`, `handoff_reason`, `consented_at`, `conversation_started_at`, `conversation_ended_at` | **kept indefinitely** |
