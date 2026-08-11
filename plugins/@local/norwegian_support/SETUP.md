@@ -54,37 +54,97 @@ it:
 
 ### `.ai setup` — the first-run wizard
 
-Not listed anywhere by default. It is a one-time thing rather than a daily one,
-and listing it permanently would put a "set this up" button in front of people
-whose install is already set up.
+Not listed anywhere by default. It is a one-time thing, and listing it
+permanently would put a "set this up" prompt in front of installs that are
+already set up.
 
 ```
 .ai setup
 ```
 
-Two steps, and nothing saves until you submit each one:
+It asks **14 questions, one at a time, in the channel**. You answer by sending
+an ordinary message. At any question you can type **skip** to leave a setting
+alone, **clear** to put it back to its default, or **cancel** to stop.
 
-1. **A form** — command name, your organisation's name, what the assistant calls
-   itself, your privacy policy link, and an icon. Every field is pre-filled with
-   what is currently in force, so this doubles as a way to read the current
-   configuration. Leave a field alone to keep it; clear an optional one to put it
-   back to its default.
-2. **Channel pickers** — the staff channel and the partnership channel, as real
-   Discord pickers rather than asking you to paste an id. Both are skippable.
+Every answer is saved as it is given, so cancelling or timing out keeps what you
+already answered — running it again picks up from the top with your answers
+already in place as the "currently" value.
 
-It finishes by listing anything still wrong and where to change things later.
-One field is validated per field rather than all-or-nothing: a mistyped link is
-reported by name and everything else in the same form still saves.
+A rejected answer re-asks the same question rather than moving on, so you cannot
+end up believing you configured something you did not.
 
-The one thing the wizard cannot do is the API key. `GROQ_API_KEY` belongs in
-`.env` because it is a credential, not a setting.
+What it covers, in order: command name, organisation name, assistant name,
+ticket prefix, privacy policy link, retention days, **what the assistant knows**,
+prices, what to always escalate, staff channel, whether to offer the partnership
+form (and its channel, only if yes), whether to ask users about keeping chats
+for training, and an icon.
+
+The one thing it cannot do is the API key. `GROQ_API_KEY` belongs in `.env`
+because it is a credential, not a setting.
 
 Changing the **command name** takes effect immediately — the group is
-re-registered under the new name, with the previous names kept as aliases. If the
-name you pick is already taken by another command, the rename is refused and
-logged rather than leaving the plugin unreachable.
+re-registered under the new name, with the previous names kept as aliases.
 
-### Developer mode
+## What the assistant knows
+
+This is the most important thing to configure and the easiest to get wrong. The
+assistant may only answer from what is here; anything else goes to a human,
+which is the safe direction — a missing fact costs a handoff, a wrong one gets
+stated to a customer as though it were true.
+
+Three sections, all set in `.ai setup` and editable afterwards:
+
+| Section | For |
+|---|---|
+| `knowledge` | General facts about your business |
+| `pricing` | Prices, products, fare classes — separate because it changes most and is worst to get wrong |
+| `neveranswer` | Topics to always escalate, whatever the other two say |
+
+```
+.ai knowledge                              show all three
+.ai knowledge add <fact>                   append one line
+.ai knowledge pricing add <fact>           append to prices
+.ai knowledge neveranswer add <topic>      always escalate it
+.ai knowledge pricing clear                empty a section
+```
+
+Each section caps at 1900 characters (900 for `neveranswer`) so a whole section
+fits in one Discord message; `add` is how it grows past a single sitting.
+
+### Why this is not raw prompt editing
+
+The instructions — how to behave, when to escalate, the output format — stay in
+code. What you supply is **facts**, and they are put into the prompt as fenced
+data with an explicit note that nothing inside the fence is an instruction. Four
+things guard it:
+
+1. **A read-back.** Setup shows what you typed and asks you to confirm before
+   saving. This catches the paste that went in twice and the half-finished
+   sentence far more often than it catches anything malicious.
+2. **The fence is stripped from input.** The one string that could let typed
+   text escape the data block is removed from anything you write.
+3. **Instruction-shaped text is flagged.** Phrases like "ignore all previous
+   instructions" or "system prompt" are pointed out at the moment you enter
+   them. It still saves — a real business might legitimately mention them — but
+   you are told.
+4. **The rules are restated after the reference**, so the last thing the model
+   reads is the instruction to escalate anything not covered.
+
+None of that makes a wrong fact safe. It makes a wrong fact *yours*, entered
+deliberately, and visible in `.ai knowledge`.
+
+### The built-in example
+
+The plugin ships with the original install's airline facts as the default. On any
+other install those are confidently wrong answers waiting to happen, so as soon
+as `brandname` says this is a different organisation, `.ai status` reports it as
+the first thing needing attention, and `.ai knowledge` says so at the top.
+
+The first `.ai knowledge add` on an unconfigured install **replaces** the example
+rather than appending to it — adding your own fact to somebody else's airline is
+worse than either alone.
+
+### Developer mode### Developer mode
 
 `.ai devmode` toggles. It takes no arguments — run it again to turn it back off.
 
@@ -317,9 +377,9 @@ baked into the code any more. On a fresh install:
 
 1. `GROQ_API_KEY` in `.env`, alongside Modmail's own values. That is the only
    thing this plugin needs from the environment.
-2. **`.ai setup`** — walks through the command name, your organisation's name,
-   the assistant's name, your privacy policy link, an icon, and the staff
-   channels. That is most of it.
+2. **`.ai setup`** — 14 questions covering the command name, your names, the
+   privacy policy link, retention, **what the assistant knows**, the staff
+   channels, and the optional features. That is nearly all of it.
 3. `.ai set ticketprefix` and `greeting` if you want them, and `.ai set yesemoji`
    / `noemoji` — the built-in emoji ids belong to another server, so they
    resolve to nothing and the buttons fall back to plain unicode automatically.
@@ -329,14 +389,10 @@ Staff channels are looked up in the server `PARTNERSHIP_GUILD_ID` names, and
 then in whatever Modmail's own `GUILD_ID` is set to. A fresh install matches the
 second, so channel lookup works without touching the constant.
 
-Two things stay in code, on purpose, because neither belongs in a chat command:
-
-- **`FAQ_KNOWLEDGE`** — the reference the assistant answers from. It is long,
-  needs care, and a wrong entry becomes a confidently wrong answer. Edit it in
-  the file and reload.
-- **`SYSTEM_PROMPT`** (via `build_system_prompt`) — your organisation's name is
-  substituted into it from `brandname`, but the instructions themselves are
-  tuned prose rather than configuration.
+The assistant's **knowledge** is configuration now — see *What the assistant
+knows*. What stays in code is the prompt's *instructions*: how to behave, when to
+escalate, the output format. Those are tuned prose rather than settings, and
+keeping them out of reach is what makes supplied knowledge safe to accept.
 
 Embed colours are Modmail's, not this plugin's: `?config set main_color`,
 `error_color` and `mod_color` already govern every embed here.
