@@ -15,7 +15,7 @@ Reload after editing during development:
 Verify wiring, storage and config with:
 
 ```
-.vlg status
+.ai status
 ```
 
 The DM hook must read `installed`, `confirm_thread_creation` must read `off`,
@@ -23,28 +23,49 @@ and ticket log retention must not read `Never`.
 
 ## Staff commands
 
-| Command | Permission | Purpose |
-|---|---|---|
-| `.vlg set` | Administrator | Show or change settings that carry a value |
-| `.vlg features` | Administrator | Turn optional features on and off |
-| `.vlg status` | Administrator | Wiring, storage counts, config sanity |
-| `.vlg version` | Supporter | What code is running, and whether it is current |
-| `.vlg stats` | Supporter | Deferral rate, feedback, and what to add to the FAQ |
-| `.vlg ask <question>` | Supporter | Dry-run the pre-screen, no conversation created |
-| `.vlg verbose` | Administrator | Log why the AI deferred (see below) |
-| `.vlg forget @user` | Supporter | Delete a user's stored assistant conversations |
-| `.vlg training [n]` | Supporter | Conversations kept for review: count and samples |
-| `.vlg digest` | Supporter | Send the weekly digest now, for testing the channel |
-| `.vlg ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
+The group is **`.ai`**. `.ai` and `.nas` are still aliases, so anything typed
+from memory or saved in a macro keeps working — but `.ai` is the name shown
+everywhere, and the one a fresh install sees.
 
-The group is `.vlg` (`?nas` still works as an alias, so nothing breaks mid-rollout).
+Running `.ai` on its own prints the command list grouped by what you are trying
+to do, rather than one flat alphabetical dump:
 
-`.vlg forget` is the only way to action an erasure request. There is no consent
+| Group | Command | Permission | Purpose |
+|---|---|---|---|
+| General | `.ai status` | Administrator | Is everything wired up and working |
+| General | `.ai version` | Supporter | What code is actually running |
+| General | `.ai ask <question>` | Supporter | Dry-run a question, no conversation created |
+| Settings | `.ai set` | Administrator | Settings that carry a value |
+| Settings | `.ai features` | Administrator | Turn optional features on and off |
+| Reports | `.ai stats` | Supporter | Deferral rate, feedback, what to add to the FAQ |
+| Reports | `.ai digest` | Supporter | Send the weekly digest now, for testing the channel |
+| User data | `.ai forget @user` | Supporter | Delete everything stored about one user |
+| User data | `.ai training [n]` | Supporter | Chats kept for review: count and samples |
+| User data | `.ai ticket VLG-XXXXXX` | Supporter | Resolve a reference to its Modmail log |
+| Developer | `.ai verbose` | Administrator | Log why the AI handed over (see below) |
+
+### Developer mode
+
+`.ai devmode on` / `off`, owner only. Off by default.
+
+While it is off, developer tooling is **absent from the command list** — not
+greyed out, not permission-gated, simply not printed, in `.ai`, in `.ai
+features`, and in Modmail's own `?help ai`. The commands still work if you type
+them; they are just not advertised to staff who have no reason to run them.
+
+`devmode` itself is never listed, on or off. It is the one command you have to
+already know about.
+
+One exception, deliberately: a developer tool that is currently **on** stays
+listed whatever devmode says. Otherwise `verbose` could sit there writing
+message content to the log with nothing on screen admitting it.
+
+`.ai forget` is the only way to action an erasure request. There is no consent
 to withdraw any more, and the disclosure now links only to the privacy policy, so
 requests will arrive by whatever route that page describes — but the transcripts
 still exist until their expiry (`retentiondays`, 7 by default) and nothing else
 deletes them on request.
-`.vlg revoke` still works as an alias. It also removes anything the user agreed
+`.ai revoke` still works as an alias. It also removes anything the user agreed
 to leave behind in the training set — see *The post-chat survey*, which is the
 one thing here with no expiry of its own.
 
@@ -95,7 +116,7 @@ setting.**
 during its first run if `log_expiration` is unset, and never restarts within
 that process — so setting this on a running bot has no effect until a restart.
 
-Confirm it took with `.vlg status`, which reports the effective retention.
+Confirm it took with `.ai status`, which reports the effective retention.
 
 ### DM receipt emoji
 
@@ -139,7 +160,7 @@ GROQ_API_KEY=gsk_...
 ```
 
 `core/config.py` calls `load_dotenv()` at import, so `.env` is enough — no
-export needed. `.vlg status` reports whether the key and the `groq` package are
+export needed. `.ai status` reports whether the key and the `groq` package are
 both present. Without either, every request simply escalates to a human; nothing
 breaks.
 
@@ -147,9 +168,9 @@ That is the only thing this plugin needs from `.env`. Everything else is set
 from inside Discord — see *Settings* below.
 
 `VLG_STAFF_CHANNEL_ID` is still read, but only as the *default* for the
-`staffchannel` setting, so an install that set it before `.vlg set` existed keeps
-working untouched. Once you run `.vlg set staffchannel`, the stored setting wins
-and `.vlg status` says so.
+`staffchannel` setting, so an install that set it before `.ai set` existed keeps
+working untouched. Once you run `.ai set staffchannel`, the stored setting wins
+and `.ai status` says so.
 
 ## Settings
 
@@ -160,10 +181,23 @@ and a `git pull`. Nothing here needs a redeploy.
 Only real credentials stay in `.env`: the bot token, `GROQ_API_KEY`, and the
 Mongo URI. Those are secrets rather than settings.
 
-### `.vlg set` — settings that carry a value
+### `.ai set` — settings that carry a value
 
-`.vlg set` on its own lists every setting with its current value and whether it
+`.ai set` on its own lists every setting with its current value and whether it
 is still on the built-in default.
+
+**Identity** — what you change first when installing this on another bot:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `brandname` | Vueling | Your organisation's name, as users see it |
+| `assistantname` | Vueling AI | What the assistant calls itself |
+| `privacyurl` | the Vueling policy | The privacy policy linked in the opening notice |
+| `ticketprefix` | VLG | Prefix on ticket references, e.g. `VLG-A3K9PQ` |
+| `greeting` | "Hola! I'm {brand}'s…" | The assistant's opening line; `{brand}` is substituted |
+| `yesemoji` / `noemoji` | guild emoji | Emoji on the "connect me to a human" buttons |
+
+**Everything else:**
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -179,9 +213,9 @@ is still on the built-in default.
 | `digesthour` | 9 | Hour (UTC) the digest posts |
 
 ```
-.vlg set staffchannel #staff-alerts
-.vlg set retentiondays 14
-.vlg set staffchannel default
+.ai set staffchannel #staff-alerts
+.ai set retentiondays 14
+.ai set staffchannel default
 ```
 
 A channel can be a mention, a raw id, or a plain name in the server you run the
@@ -194,9 +228,43 @@ arrived". `default` puts a setting back.
 If `retentiondays` is changed, **the privacy policy the opening disclosure links
 to should say the same number.** Nothing checks that for you.
 
-### `.vlg features` — things that are just on or off
+`ticketprefix` only affects references issued from then on. Codes already handed
+to users keep the prefix they were given, and `.ai ticket` still resolves them.
 
-`.vlg features` lists every optional feature, its state, and a plain description
+## Installing this on another bot
+
+The plugin ships configured for one specific server, but nothing about that is
+baked into the code any more. On a fresh install:
+
+1. `GROQ_API_KEY` in `.env`, alongside Modmail's own values. That is the only
+   thing this plugin needs from the environment.
+2. `.ai set brandname`, `assistantname`, `privacyurl`, `ticketprefix`, and
+   `greeting` — the identity block above.
+3. `.ai set staffchannel` and `partnershipchannel` to channels on your server.
+4. `.ai set yesemoji` / `noemoji`, or leave them: the built-in ids belong to
+   another server, so they resolve to nothing and the buttons fall back to plain
+   unicode automatically. `.ai status` says when that has happened.
+5. `.ai status` — the Configuration block names anything still wrong.
+
+Staff channels are looked up in the server `PARTNERSHIP_GUILD_ID` names, and
+then in whatever Modmail's own `GUILD_ID` is set to. A fresh install matches the
+second, so channel lookup works without touching the constant.
+
+Two things stay in code, on purpose, because neither belongs in a chat command:
+
+- **`FAQ_KNOWLEDGE`** — the reference the assistant answers from. It is long,
+  needs care, and a wrong entry becomes a confidently wrong answer. Edit it in
+  the file and reload.
+- **`SYSTEM_PROMPT`** (via `build_system_prompt`) — your organisation's name is
+  substituted into it from `brandname`, but the instructions themselves are
+  tuned prose rather than configuration.
+
+Embed colours are Modmail's, not this plugin's: `?config set main_color`,
+`error_color` and `mod_color` already govern every embed here.
+
+### `.ai features` — things that are just on or off
+
+`.ai features` lists every optional feature, its state, and a plain description
 of what turning it off actually stops.
 
 | Feature | Default | What it does |
@@ -211,9 +279,9 @@ of what turning it off actually stops.
 | `verbose` | off | Extra diagnostics in the bot log, including message content |
 
 ```
-.vlg features
-.vlg features digest off
-.vlg features digest        # flips whatever it is now
+.ai features
+.ai features digest off
+.ai features digest        # flips whatever it is now
 ```
 
 `training` off means the question is never put to the user at all, and nothing
@@ -225,12 +293,15 @@ both, and the command says so rather than leaving them reading as on. Turning
 `digest` or `lowratingalerts` on while the staff channel is unreachable warns
 you at the point you turn it on.
 
-`verbose` also has its own `.vlg verbose` command, which carries a longer
-warning about writing message content to the log. It is the same setting.
+`verbose` also has its own `.ai verbose` command, which carries a longer
+warning about writing message content to the log. It is the same setting, and
+like the command it is hidden from this list while devmode is off — unless it is
+currently on, in which case it stays visible so it cannot be left running
+unnoticed.
 
 ### Config sanity
 
-`.vlg status` now ends with a **Configuration** block: one line per setting that
+`.ai status` now ends with a **Configuration** block: one line per setting that
 can be wrong without anything visibly breaking — both guild IDs, the staff
 channel, `GROQ_API_KEY`, `log_url`, and retention. It also carries a **Features**
 line showing what is on and off at a glance. A bad value does not
@@ -316,7 +387,7 @@ to a form rather than a conversation, **before** the escalation check. The stems
 are open-ended (`\bpartner\w*`), so "partnered" and "collaborating" match as well
 as "partnership"; the one exception is the bare noun after a possessive — "my
 partner is on the flight" is a passenger, not a proposal, and is left to the
-assistant. `.vlg ask "…"` reports the partnership route, so any wording can be
+assistant. `.ai ask "…"` reports the partnership route, so any wording can be
 checked without DMing the bot. The five
 questions are what a human would ask anyway, so collecting them up front beats a
 ticket that opens by asking them one at a time — even when the request is phrased
@@ -326,7 +397,7 @@ The reply offers a button, the button opens a Discord modal, and the submission
 is posted to the configured staff channel. `PARTNERSHIP_GUILD_ID` and
 `PARTNERSHIP_CHANNEL_ID` are where it lands; if the bot cannot see that channel
 the user is told the submission failed and offered a human, rather than being
-thanked for something that never arrived. `.vlg status` resolves that channel and
+thanked for something that never arrived. `.ai status` resolves that channel and
 names it, so a form that would fail on submission is visible before anyone uses
 it.
 
@@ -400,7 +471,7 @@ needs a full restart and turns on discord.py's own debug firehose too. To avoid
 both:
 
 ```
-.vlg verbose on
+.ai verbose on
 ```
 
 That promotes only these two lines to INFO, takes effect immediately, and
@@ -411,7 +482,7 @@ by the privacy notice but the log is not on the 7-day deletion path, so turn it
 off once you are done:
 
 ```
-.vlg verbose off
+.ai verbose off
 ```
 
 ### The opening disclosure
@@ -436,7 +507,7 @@ and the question after it are the assistant actually addressing the user, so
 they get the indicator and the normal delay.
 
 Every other message the assistant composes uses the same `typingdelay`, so the
-whole conversation reads at one pace. Change it with `.vlg set typingdelay`.
+whole conversation reads at one pace. Change it with `.ai set typingdelay`.
 
 It repeats on **every** new conversation rather than being shown once, on the
 same open/closed boundary as the greeting. See *Ending a conversation* below for
@@ -446,11 +517,11 @@ There is deliberately no accept/decline step. The disclosure states that
 processing rests on the contractual relationship, not on consent, so there is no
 decision to capture and nothing to look up or withdraw. Data rights are exercised
 through the linked privacy policy rather than in chat; staff action an erasure
-with `.vlg forget`.
+with `.ai forget`.
 
 Documents written by the removed consent gate are not deleted automatically.
-`.vlg status` counts them under *obsolete consent records* if any remain, and
-`.vlg forget` clears them per user. To drop them all at once:
+`.ai status` counts them under *obsolete consent records* if any remain, and
+`.ai forget` clears them per user. To drop them all at once:
 
 ```js
 db.getCollection("plugins.NorwegianSupport").deleteMany({_type: "consent"})
@@ -489,7 +560,7 @@ ratings plus the yes/no leaves room for one more question, no more. That limit
 is asserted at import alongside the label and description caps.
 
 `SURVEY_HEADLINE_KEY` (`overall`) is the score that stands for the conversation:
-what `.vlg stats` averages first and what the low-rating alert fires on. Each
+what `.ai stats` averages first and what the low-rating alert fires on. Each
 answer stores the full `ratings` map *and* that one score as `rating`, so
 answers submitted when there was only one question still read correctly.
 
@@ -508,14 +579,14 @@ raised after the user has already been thanked and can never affect their reply.
 
 Monday 09:00 UTC (`DIGEST_WEEKDAY`, `DIGEST_HOUR_UTC`), posted to the same
 channel: the deferral rate, survey averages, and the same FAQ-gap analysis
-`.vlg stats` prints. Both call `_faq_gaps`, so the digest cannot drift from what
+`.ai stats` prints. Both call `_faq_gaps`, so the digest cannot drift from what
 someone running the command by hand sees.
 
 It rides the existing 5-minute maintenance sweep rather than a second timer, and
 is gated on a timestamp in the database, so a restart mid-week neither skips a
 digest nor sends two. The first ever run seeds that timestamp and sends nothing —
 otherwise loading the plugin on a Monday morning would fire a digest covering a
-few hours. `.vlg digest` sends one on demand without moving the schedule.
+few hours. `.ai digest` sends one on demand without moving the schedule.
 
 Closing is a single atomic update, so a conversation the inactivity sweep and a
 goodbye both reach is closed, and surveyed, exactly once.
@@ -527,11 +598,11 @@ goodbye both reach is closed, and surveyed, exactly once.
 **No** copies nothing. The rating is stored either way, with no conversation
 content — set `KEEP_RATINGS_WITHOUT_CONSENT = False` to drop even that on a no.
 
-Read them with `.vlg training` (count, plus recent conversations rendered
-inline). `.vlg status` counts both under *survey answers* and *kept for review*.
+Read them with `.ai training` (count, plus recent conversations rendered
+inline). `.ai status` counts both under *survey answers* and *kept for review*.
 
-**Nothing acts on this data automatically.** `.vlg training` is a reading list.
-The FAQ and prompt are edited by hand, the same way `.vlg stats` gaps are fixed
+**Nothing acts on this data automatically.** `.ai training` is a reading list.
+The FAQ and prompt are edited by hand, the same way `.ai stats` gaps are fixed
 today.
 
 #### Two things to check before going live
@@ -542,7 +613,7 @@ today.
    day transcript retention is a separate purpose with a separate lawful basis —
    the user's explicit yes — and that page should say so. The in-chat question is
    where consent is captured; the policy page is where it is explained.
-2. **`.vlg forget` reaches the training set**, which is why the copy keeps
+2. **`.ai forget` reaches the training set**, which is why the copy keeps
    `user_id_hash` rather than nothing at all. A copy nobody can find is a copy
    nobody can delete, and this is the one that outlives the others. The hash is
    the same keyed HMAC used everywhere else — not reversible without the salt,
@@ -609,7 +680,7 @@ check and the edit are separated by awaits and both would otherwise be told they
 had it. Removing the losing reaction needs *Manage Messages*; without it the
 claim still works and the extra reaction just stays.
 
-### `.vlg ask`
+### `.ai ask`
 
 Runs a question through the pre-screen and prints the raw `{resolved, reply}`
 plus which route it took. Creates no conversation, no transcript, no session,
@@ -627,10 +698,10 @@ in a real conversation those never reach Groq either.
 bot is running; only `?plugin reload @local/norwegian_support` (or a restart)
 does. Until then the bot keeps serving the previous version, which looks exactly
 like the new one being broken — the old button emoji, the old routing, no
-partnership form. `.vlg status` now leads with a red warning when the file on
+partnership form. `.ai status` now leads with a red warning when the file on
 disk is newer than the running code, for that reason.
 
-`.vlg version` answers it in detail. The field that matters is the comparison between
+`.ai version` answers it in detail. The field that matters is the comparison between
 **file last modified** and **plugin loaded**: editing or pulling the file changes
 nothing until the plugin is reloaded, and every other signal looks healthy while
 stale code keeps running. If the file is newer, it says so in red and gives the
@@ -642,7 +713,7 @@ repo commit when the checkout is a git one.
 
 ### Buttons not appearing
 
-`.vlg status` answers this directly. Two independent causes:
+`.ai status` answers this directly. Two independent causes:
 
 - **Confirmation Yes/No** — the guild emoji are resolved through `bot.get_emoji`
   and reported as usable or not, naming the server that owns them when they are.
@@ -655,7 +726,7 @@ repo commit when the checkout is a git one.
 
   **So plain ✅ / ❌ on the buttons is the symptom, not the setting.** It means
   the bot is not in the server that owns `BUTTON_YES_EMOJI` /
-  `BUTTON_NO_EMOJI` — `.vlg status` says which of the two failed. Fix it by
+  `BUTTON_NO_EMOJI` — `.ai status` says which of the two failed. Fix it by
   inviting the bot to that server, or by putting ids from a server it is already
   in into those two constants and reloading. Both are swapped as a pair: one
   guild emoji beside one unicode mark reads as a rendering fault.
@@ -664,7 +735,7 @@ repo commit when the checkout is a git one.
   transcripts have no `answer_message_ids`, so a click could not be attributed to
   them even if the buttons were there.
 
-### `.vlg stats`
+### `.ai stats`
 
 The loop-closer: it tells you which FAQ entries to write next.
 
@@ -694,7 +765,7 @@ Supporter-gated, same exposure as reading a ticket.
 
 ### Conversation history
 
-The live gate replays the transcript into every Groq call; `.vlg ask` passes an
+The live gate replays the transcript into every Groq call; `.ai ask` passes an
 empty history. That was the *only* difference between them, and it made real
 conversations answer worse than dry runs after the first turn:
 
@@ -711,7 +782,7 @@ every assistant turn is valid against the schema. The dropped turns stay in the
 transcript for summaries and stats; only the replay is filtered.
 
 A test asserts a first live message produces a byte-identical payload to
-`.vlg ask`, so the two cannot silently diverge again.
+`.ai ask`, so the two cannot silently diverge again.
 
 ### Ending a conversation
 
@@ -835,7 +906,7 @@ re-greet; it lapses naturally when the transcript expires after `retentiondays`.
 Three surfaces say Vueling by explicit instruction: the greeting, the embed
 title (`Vueling AI`), and the caveat footer. Everything else is deliberately
 untouched pending the full rebrand pass — bot identity, the repo name, the
-`.vlg` command group, and the `NorwegianSupport` cog class (whose name *is* the
+`.ai` command group, and the `NorwegianSupport` cog class (whose name *is* the
 partition name, so renaming it orphans every stored document).
 
 Ticket references are now `VLG-XXXXXX`. The stored field is still called
@@ -852,14 +923,14 @@ old consent, as it does for any renewal.
 does nothing on its own — re-run the `?config set` on the live bot.
 
 Also still Norwegian Air Shuttle, but internal only and left for the rebrand
-pass: the module docstring, the `.vlg` command group help text, the
+pass: the module docstring, the `.ai` command group help text, the
 `norwegian_support` plugin/folder name, and the `NorwegianSupport` cog class
 (whose name is the storage partition, so it needs a data migration).
 
 ### Embed icon
 
 The author-row icon comes from `bot.user.display_avatar`, so it follows the
-Developer Portal without a redeploy. `.vlg status` prints the URL it resolves to.
+Developer Portal without a redeploy. `.ai status` prints the URL it resolves to.
 
 If it is not the logo you expect, check *which* Portal image you set: **App Icon**
 on General Information and **Bot avatar** on the Bot tab are separate images, and

@@ -12,7 +12,7 @@ The handoff summary and ticket reference (stage 5) slot into `_gate` at the
 marked seam.
 
 Almost everything here is configured from inside Discord rather than from this
-file or from `.env`: `.vlg set` for settings that carry a value, `.vlg features`
+file or from `.env`: `.ai set` for settings that carry a value, `.ai features`
 for the optional behaviour that is simply on or off. Both are stored in the
 plugin partition, so they survive reloads, restarts and a `git pull`. The
 constants below are the defaults those settings fall back to. See the Settings
@@ -52,20 +52,52 @@ except ImportError:  # pragma: no cover - dependency install failed
 
 logger = getLogger(__name__)
 
-# Shown at the start of every conversation, before the greeting. Informational
-# only: processing is on the basis of the contractual relationship, not consent,
-# so there is nothing to accept and nothing stored per user. Data rights are
-# exercised through the linked privacy policy, not in chat.
-DISCLOSURE_PARTS = (
-    "Vueling will process your data to provide you with the services you have "
-    "requested and improve your experience with Vueling, based on the execution "
-    "of a contractual relationship. For more information, see our "
-    "[privacy policy](https://vuelingrbx.vercel.app/privacy).",
-    "This chatbot uses an Artificial Intelligence tool to identify the most "
-    "relevant answers to frequently asked questions.",
-)
+# The command group. `ai` is the primary name, so a fresh install on any bot
+# reads as `.ai status` rather than as somebody else's branding.
+#
+# The legacy names stay as aliases: this plugin was `nas` and then `vlg` before
+# it was `ai`, and typing either still works. Aliases do not appear in the help
+# listing, so a new install sees only `.ai` while existing muscle memory and any
+# saved command still resolve.
+GROUP_NAME = "ai"
+LEGACY_ALIASES = ("vlg", "nas")
 
-# Human-facing ticket reference prefix, mapped to Modmail's own log key.
+# Default identity. Both are settings (`brandname` / `assistantname`), and every
+# user-facing string that names either reads the setting rather than a constant,
+# so installing this on another bot is a rename rather than an edit.
+#
+# BRAND_NAME is the organisation ("Vueling"); ASSISTANT_NAME is what the bot
+# calls itself ("Vueling AI"). They are separate because the disclosure is about
+# the company while the embed author row is about the bot.
+BRAND_NAME = "Vueling"
+ASSISTANT_NAME = "Vueling AI"
+
+# Linked from the opening disclosure. Per-install and legally load-bearing: it
+# is the only route by which a user exercises their data rights, so it is a
+# setting rather than something to remember to edit.
+PRIVACY_POLICY_URL = "https://vuelingrbx.vercel.app/privacy"
+
+
+def disclosure_parts(brand: str, privacy_url: str) -> typing.Tuple[str, str]:
+    """Shown at the start of every conversation, before the greeting.
+
+    Informational only: processing is on the basis of the contractual
+    relationship, not consent, so there is nothing to accept and nothing stored
+    per user. Data rights are exercised through the linked privacy policy, not
+    in chat.
+    """
+    return (
+        f"{brand} will process your data to provide you with the services you "
+        f"have requested and improve your experience with {brand}, based on the "
+        "execution of a contractual relationship. For more information, see our "
+        f"[privacy policy]({privacy_url}).",
+        "This chatbot uses an Artificial Intelligence tool to identify the most "
+        "relevant answers to frequently asked questions.",
+    )
+
+
+# Human-facing ticket reference prefix, mapped to Modmail's own log key. The
+# default for the `ticketprefix` setting.
 TICKET_PREFIX = "VLG"
 
 # Reference body alphabet. No O/0 or I/1, so a code read aloud or retyped from
@@ -114,13 +146,16 @@ INACTIVITY_WARNING_TEXT = (
     "else — just send a message and I'll keep helping. \N{SMILING FACE WITH SMILING EYES}"
 )
 
-# Three separate messages when a conversation ends, however it ended.
-CLOSING_PARTS = (
-    "Thanks for chatting with me today, I hope I was able to help! " "\N{SMILING FACE WITH SMILING EYES}",
-    "Bye for now! \N{SMILING FACE WITH SMILING EYES}",
-    "You have been disconnected from Vueling AI. Whenever you need us again, just "
-    "send a message here and a new conversation will start.",
-)
+
+def closing_parts(assistant: str) -> typing.Tuple[str, str, str]:
+    """Three separate messages when a conversation ends, however it ended."""
+    return (
+        "Thanks for chatting with me today, I hope I was able to help! " "\N{SMILING FACE WITH SMILING EYES}",
+        "Bye for now! \N{SMILING FACE WITH SMILING EYES}",
+        f"You have been disconnected from {assistant}. Whenever you need us again, "
+        "just send a message here and a new conversation will start.",
+    )
+
 
 # Phrases that end the conversation, checked only once it is already open so a
 # conversation cannot be closed by its own first message. Word-boundary anchored.
@@ -173,7 +208,7 @@ SURVEY_RATING_QUESTIONS = (
     ),
 )
 
-# The one whose score is the headline: what `.vlg stats` reports and what the
+# The one whose score is the headline: what `.ai stats` reports and what the
 # low-rating alert fires on. Must be a key in SURVEY_RATING_QUESTIONS.
 SURVEY_HEADLINE_KEY = "overall"
 
@@ -219,7 +254,7 @@ SURVEY_FAILED = "Sorry, we could not save that. Please try again."
 # copy of the chat. Set to False to discard ratings from anyone who said no.
 KEEP_RATINGS_WITHOUT_CONSENT = True
 
-# Samples shown by `.vlg training` when no count is given.
+# Samples shown by `.ai training` when no count is given.
 TRAINING_SAMPLE_DEFAULT = 3
 TRAINING_SAMPLE_MAX = 10
 
@@ -252,7 +287,7 @@ TYPE_SURVEY = "survey"
 TYPE_TRAINING = "training_transcript"
 
 # No longer written. Documents from the removed consent gate may still exist;
-# `.vlg forget` clears them alongside a user's transcripts.
+# `.ai forget` clears them alongside a user's transcripts.
 TYPE_LEGACY_CONSENT = "consent"
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -283,13 +318,18 @@ REPLY_SPLIT_THRESHOLD = 240
 # break lands near one end and produces a stray one-line message.
 REPLY_SPLIT_MIN_PART = 80
 
+
 # Assistant identity. The author row goes on every embed the plugin builds; the
 # footer caveat does not, because it is a statement about model output and would
-# misattribute fixed plugin copy.
-AI_TITLE = "Vueling AI"
-AI_FOOTER = "Vueling AI can make mistakes. Please double check responses."
+# misattribute fixed plugin copy. Both read the `assistantname` setting.
+def ai_footer(assistant: str) -> str:
+    return f"{assistant} can make mistakes. Please double check responses."
 
-# Handoff confirmation buttons: guild emoji, no label.
+
+# Handoff confirmation buttons: guild emoji, no label. Defaults for the
+# `yesemoji` / `noemoji` settings — these ids belong to one specific server, so
+# on any other install they resolve to nothing and the prompt falls back to
+# plain unicode. Setting them is how another install gets its own.
 BUTTON_YES_EMOJI = "<:yes:1534231866888945764>"
 BUTTON_NO_EMOJI = "<:no:1534231863319593172>"
 
@@ -453,7 +493,7 @@ _CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
 AI_ICON_URL: typing.Optional[str] = None
 
 # How long the typing indicator runs before each message the assistant composes.
-# Overridable with `.vlg set typingdelay`; this is the default.
+# Overridable with `.ai set typingdelay`; this is the default.
 #
 # The two opening disclosures deliberately do not use this — see
 # DISCLOSURE_GAP_SECONDS.
@@ -466,14 +506,38 @@ TYPING_DELAY_SECONDS = 1.5
 # to read as two messages rather than one.
 DISCLOSURE_GAP_SECONDS = 1.0
 
-# Sent once when a user opens a new pre-screen conversation, ahead of their first
-# message being processed. Two separate messages, each with its own typing pause.
-GREETING_PARTS = (
-    "Hola! I'm Vueling's virtual assistant. I'm new and still learning but "
-    "there are a lot of things I can do for you.",
-    "How can I help you? Please, try to be as brief as possible so I can "
-    "understand you \N{SMILING FACE WITH SMILING EYES}",
+# The opening line of the greeting. A setting, because it is the first thing
+# anyone reads and the one piece of copy most likely to want changing per
+# install — "Hola!" in particular is Vueling's voice, not a neutral default.
+# {brand} is substituted; a greeting with no placeholder in it is used as-is.
+GREETING_OPENER = (
+    "Hola! I'm {brand}'s virtual assistant. I'm new and still learning but "
+    "there are a lot of things I can do for you."
 )
+
+# The question after it. Fixed: it explains how to talk to the assistant rather
+# than saying anything about the brand, so there is nothing per-install in it.
+GREETING_PROMPT = (
+    "How can I help you? Please, try to be as brief as possible so I can "
+    "understand you \N{SMILING FACE WITH SMILING EYES}"
+)
+
+
+def greeting_parts(brand: str, opener: str) -> typing.Tuple[str, str]:
+    """Sent once when a user opens a new pre-screen conversation.
+
+    Two separate messages, each with its own typing pause, ahead of their first
+    message being processed.
+    """
+    try:
+        opening = opener.format(brand=brand)
+    except (KeyError, IndexError, ValueError):
+        # Someone put a stray brace in a custom greeting. Their words verbatim
+        # beat refusing to greet anyone.
+        logger.warning("Greeting opener has an unusable placeholder; using it as written.")
+        opening = opener
+    return (opening, GREETING_PROMPT)
+
 
 # Asked when the user opens with nothing to act on, and the greeting has already
 # been sent earlier in the conversation.
@@ -563,6 +627,10 @@ PARTNERSHIP_INTRO = (
     "Certainly, we'd be glad to hear about it! Tap the button below and fill in a "
     "few details about your group and I'll pass it straight to the team."
 )
+# Deliberately still says "vlg" after the rename to `.ai`, as do the survey
+# custom_ids below. A custom_id is baked into every button already posted in
+# Discord; renaming these would orphan every live partnership post and survey
+# invitation, which is a real cost for a string no user ever sees.
 PARTNERSHIP_BUTTON_ID = "vlg-partnership"
 PARTNERSHIP_BUTTON_LABEL = "Request a partnership"
 PARTNERSHIP_MODAL_TITLE = "Partnership request"
@@ -586,7 +654,9 @@ PARTNERSHIP_FAILED = (
     "you it arrived when it hasn't. Let me put you through to someone instead."
 )
 
-# Where submitted applications land.
+# Where submitted applications land. The guild is the first guess only — see
+# `_home_guild`, which falls back to Modmail's own configured server, so a fresh
+# install elsewhere resolves channels without touching this.
 PARTNERSHIP_GUILD_ID = 1532428044822642808
 PARTNERSHIP_CHANNEL_ID = 1534233033085948074
 
@@ -594,7 +664,7 @@ PARTNERSHIP_CHANNEL_ID = 1534233033085948074
 def _env_channel_id(name: str, default: int) -> int:
     """A channel id from the environment, falling back rather than raising.
 
-    A typo in `.env` must not take the plugin down at import; `.vlg status`
+    A typo in `.env` must not take the plugin down at import; `.ai status`
     reports what these actually resolved to.
     """
     raw = (os.getenv(name) or "").strip()
@@ -613,7 +683,7 @@ def _env_channel_id(name: str, default: int) -> int:
 #
 # This is now only the *default* for the `staffchannel` setting. It still reads
 # the environment so an install that set VLG_STAFF_CHANNEL_ID before there was a
-# `.vlg set` keeps working untouched, but `.vlg set staffchannel` overrides it
+# `.ai set` keeps working untouched, but `.ai set staffchannel` overrides it
 # and is the documented way to change it.
 STAFF_CHANNEL_ID = _env_channel_id("VLG_STAFF_CHANNEL_ID", PARTNERSHIP_CHANNEL_ID)
 
@@ -704,7 +774,7 @@ _URGENCY_RE = [re.compile(p, re.IGNORECASE) for p in URGENCY_PATTERNS]
 #
 # The constants above are the defaults. An unset setting reads its constant, so
 # an existing install behaves exactly as it did before anything was set, and
-# `.vlg set <key> default` puts it back.
+# `.ai set <key> default` puts it back.
 #
 # Real credentials — the bot token, the Groq key, the Mongo URI — stay in
 # `.env`. Those are secrets rather than settings, and nothing here touches them.
@@ -717,6 +787,18 @@ _FALSE_WORDS = {"off", "no", "false", "disable", "disabled", "n", "0"}
 
 # Matches "<#123>" as well as a bare id.
 _CHANNEL_MENTION_RE = re.compile(r"^<#(\d+)>$")
+
+
+def _looks_like_unicode_emoji(raw: str) -> bool:
+    """A rough check that something is a single unicode emoji.
+
+    Deliberately loose. Discord accepts far more than any list here would cover,
+    and the cost of being wrong is only a rejected setting, so this rules out
+    obvious mistakes — a word, a sentence — rather than trying to be exhaustive.
+    """
+    if len(raw) > 8 or not raw:
+        return False
+    return not raw.isascii()
 
 
 class Setting:
@@ -771,6 +853,17 @@ class Setting:
                 return False
             raise ValueError("say `on` or `off`.")
 
+        if self.kind in ("text", "url", "emoji"):
+            if not raw:
+                raise ValueError("that cannot be empty.")
+            if self.maximum is not None and len(raw) > self.maximum:
+                raise ValueError(f"keep that under {int(self.maximum)} characters.")
+            if self.kind == "url" and not raw.lower().startswith(("http://", "https://")):
+                raise ValueError("that needs to be a full link starting with `https://`.")
+            if self.kind == "emoji" and not (_CUSTOM_EMOJI_RE.match(raw) or _looks_like_unicode_emoji(raw)):
+                raise ValueError("send a single emoji, or a custom one like `<:yes:123>`.")
+            return raw
+
         if self.kind == "channel":
             mention = _CHANNEL_MENTION_RE.match(raw)
             if mention:
@@ -803,16 +896,85 @@ class Setting:
         return f"{value:g}"
 
     def render(self, value: typing.Any) -> str:
-        """The stored value, written for someone reading `.vlg set`."""
+        """The stored value, written for someone reading the settings list."""
         if self.kind == "bool":
             return "on" if value else "off"
         if self.kind == "channel":
             return f"<#{value}>"
+        if self.kind == "emoji":
+            # Shown as the emoji itself; a custom one renders, a dead id does not,
+            # which is the fastest way to see that it is wrong.
+            return str(value)
+        if self.kind in ("text", "url"):
+            return f"`{truncate(str(value), 80)}`"
         return f"`{self._number(value)}`{self.unit}"
 
 
-# Settings that carry a value. These are what `.vlg set` lists and changes.
+# Settings that carry a value. These are what `.ai set` lists and changes.
+#
+# The identity block comes first on purpose: it is what someone installing this
+# on a different bot has to change, and listing it above the tuning knobs makes
+# that the obvious first move.
 VALUE_SETTINGS = (
+    Setting(
+        "brandname",
+        "text",
+        lambda: BRAND_NAME,
+        "Your organisation's name, as users see it. Used in the opening privacy "
+        "notice, the greeting, and what the AI is told it works for.",
+        maximum=60,
+        example="Vueling",
+    ),
+    Setting(
+        "assistantname",
+        "text",
+        lambda: ASSISTANT_NAME,
+        "What the assistant calls itself. Shown on every message it sends and in "
+        "the goodbye when a chat ends.",
+        maximum=60,
+        example="Vueling AI",
+    ),
+    Setting(
+        "privacyurl",
+        "url",
+        lambda: PRIVACY_POLICY_URL,
+        "The privacy policy linked in the opening notice. This is the only route "
+        "a user has to exercise their data rights, so point it at a real page.",
+        maximum=300,
+        example="https://example.com/privacy",
+    ),
+    Setting(
+        "ticketprefix",
+        "text",
+        lambda: TICKET_PREFIX,
+        "The prefix on ticket references, e.g. `VLG` gives `VLG-A3K9PQ`. Existing "
+        "references keep the prefix they were issued with.",
+        maximum=10,
+        example="VLG",
+    ),
+    Setting(
+        "greeting",
+        "text",
+        lambda: GREETING_OPENER,
+        "The first thing the assistant says. Write `{brand}` where you want your "
+        "organisation's name to appear.",
+        maximum=400,
+    ),
+    Setting(
+        "yesemoji",
+        "emoji",
+        lambda: BUTTON_YES_EMOJI,
+        "The emoji on the 'yes, connect me to a human' button. A custom emoji only "
+        "works if this bot is in the server that owns it.",
+        maximum=60,
+    ),
+    Setting(
+        "noemoji",
+        "emoji",
+        lambda: BUTTON_NO_EMOJI,
+        "The emoji on the 'no thanks' button, same rules as above.",
+        maximum=60,
+    ),
     Setting(
         "staffchannel",
         "channel",
@@ -902,7 +1064,7 @@ VALUE_SETTINGS = (
     ),
 )
 
-# Anything that is simply on or off. These are what `.vlg features` lists.
+# Anything that is simply on or off. These are what `.ai features` lists.
 # Wording is for whoever runs the bot, not for whoever wrote it: each line says
 # what turning it off actually stops happening.
 FEATURE_SETTINGS = (
@@ -965,7 +1127,81 @@ FEATURE_SETTINGS = (
     ),
 )
 
-SETTINGS: typing.Dict[str, Setting] = {s.key: s for s in VALUE_SETTINGS + FEATURE_SETTINGS}
+# Stored like any other setting, but deliberately in neither list above, so it
+# appears in neither `.ai set` nor `.ai features`. Turning developer tooling on
+# should require knowing it exists; putting it in the menu that advertises every
+# other toggle would defeat the point of gating anything behind it.
+DEVMODE_SETTING = Setting(
+    "devmode",
+    "bool",
+    lambda: False,
+    "Show the developer commands in the command list.",
+)
+
+SETTINGS: typing.Dict[str, Setting] = {
+    s.key: s for s in VALUE_SETTINGS + FEATURE_SETTINGS + (DEVMODE_SETTING,)
+}
+
+
+# ----------------------------------------------------------------------
+# Command listing
+# ----------------------------------------------------------------------
+#
+# What a bare `.ai` prints. Grouped by what someone is trying to do rather than
+# alphabetically, and each line says what the command is *for* — the audience is
+# a person who has just installed this and has had nothing explained to them.
+#
+# Kept next to the settings rather than beside the commands because it is the
+# same kind of thing: the plugin's front door, written for a stranger.
+COMMAND_CATEGORIES = (
+    (
+        "General",
+        (
+            ("status", "Is everything wired up and working? Start here when something looks wrong."),
+            ("version", "Which version of the plugin is actually running right now."),
+            ("ask", "Try a question against the assistant privately, without opening a real chat."),
+        ),
+    ),
+    (
+        "Settings",
+        (
+            ("set", "Change a setting that has a value — channels, timings, your organisation's name."),
+            ("features", "Turn optional features on and off."),
+        ),
+    ),
+    (
+        "Reports",
+        (
+            ("stats", "How well the assistant is doing, and what to add to the FAQ next."),
+            ("digest", "Send this week's summary to the staff channel now, instead of waiting."),
+        ),
+    ),
+    (
+        "User data",
+        (
+            ("forget", "Delete everything stored about one user. Use this for erasure requests."),
+            ("training", "Read the chats users agreed could be kept to improve the assistant."),
+            ("ticket", "Look up a ticket reference and find its transcript."),
+        ),
+    ),
+    (
+        "Developer",
+        (("verbose", "Log why the assistant handed a chat over. Writes message content to the log."),),
+    ),
+)
+
+# Listed only while devmode is on — internal debugging rather than day-to-day
+# running. See `_command_visible` for the exception that keeps a *running* tool
+# on screen regardless.
+DEV_COMMANDS = frozenset({"verbose"})
+
+# Never listed, at all. `devmode` is deliberately undiscoverable: it is the
+# switch you have to have been told about.
+HIDDEN_COMMANDS = frozenset({"devmode"})
+
+assert DEV_COMMANDS <= {
+    name for _, entries in COMMAND_CATEGORIES for name, _ in entries
+}, "a dev command is missing from the listing, so devmode could never reveal it"
 
 # TYPE_META also holds bookkeeping that is not a setting. Reserved so a future
 # setting cannot be given a key that would overwrite one of them.
@@ -1034,8 +1270,16 @@ Moderation
   whether a specific ban or appeal was justified.
 """
 
-SYSTEM_PROMPT = f"""\
-You are the first-line automated support assistant for Vueling, a virtual
+
+def build_system_prompt(brand: str) -> str:
+    """The system prompt, with the brand name substituted in.
+
+    Built per call rather than at import because `brandname` is a setting: a
+    module-level constant would freeze whatever the brand was when the plugin
+    loaded and quietly ignore a later rename.
+    """
+    return f"""\
+You are the first-line automated support assistant for {brand}, a virtual
 airline group on Roblox. You answer straightforward questions from passengers
 and staff.
 
@@ -1478,8 +1722,13 @@ class NorwegianSupport(commands.Cog):
             )
         if self.setting("verbose"):
             logger.info(
-                "Verbose diagnostics are ON (restored). Turn off with %svlg verbose off.", self.bot.prefix
+                "Verbose diagnostics are ON (restored). Turn off with %s off.",
+                self._cmd("verbose"),
             )
+
+        # Settings arrive after the cog is added, so the decorators' own
+        # `hidden` values are whatever the class declared. Reconcile them now.
+        self._apply_devmode_visibility()
 
     def setting(self, key: str) -> typing.Any:
         """The current value of a setting, or its default when unset."""
@@ -1487,11 +1736,20 @@ class NorwegianSupport(commands.Cog):
             return self._settings[key]
         return SETTINGS[key].default
 
+    def _cmd(self, sub: str = "") -> str:
+        """How to type a command in this plugin, for use in user-facing text.
+
+        Always the primary name, never the alias someone happened to type, so
+        the help text teaches one name rather than echoing whichever legacy one
+        is still in muscle memory.
+        """
+        return f"{self.bot.prefix}{GROUP_NAME}{' ' + sub if sub else ''}"
+
     async def set_setting(self, key: str, value: typing.Any) -> None:
         """Store a setting and update the cache.
 
         The cache is only updated once the write succeeds, so a failed write
-        leaves the bot behaving the way `.vlg set` will still report.
+        leaves the bot behaving the way `.ai set` will still report.
         """
         await self.db.update_one(
             {"_type": TYPE_META, "key": key},
@@ -1678,18 +1936,28 @@ class NorwegianSupport(commands.Cog):
         )
         await self._add_rating_field(embed)
         self._add_gap_fields(embed, gaps)
-        embed.set_footer(text=f"Runs weekly • {self.bot.prefix}vlg stats for this on demand")
+        embed.set_footer(text=f"Runs weekly • {self._cmd()} stats for this on demand")
         return embed
+
+    def _home_guild(self) -> typing.Optional[discord.Guild]:
+        """The server staff channels are looked up in.
+
+        PARTNERSHIP_GUILD_ID names one specific server, which is right for the
+        install this was written for and meaningless on any other, so it is only
+        the first guess. Modmail's own configured guild is the fallback, which is
+        the correct answer for a fresh install and needs nothing set.
+        """
+        return self.bot.get_guild(PARTNERSHIP_GUILD_ID) or getattr(self.bot, "guild", None)
 
     def _guild_channel(self, channel_id: int):
         """A staff channel by id, or None if this bot cannot see it.
 
-        Tries the configured guild first so an id that also exists elsewhere
-        cannot be resolved to the wrong server, then falls back to a global
-        lookup for a channel in a guild the constant does not name.
+        Tries the home guild first so an id that also exists elsewhere cannot be
+        resolved to the wrong server, then falls back to a global lookup for a
+        channel in a guild neither of those names.
         """
         try:
-            guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+            guild = self._home_guild()
             channel = guild.get_channel(channel_id) if guild else None
             return channel or self.bot.get_channel(channel_id)
         except Exception:
@@ -1702,11 +1970,10 @@ class NorwegianSupport(commands.Cog):
         channel = self._guild_channel(channel_id)
         if channel is None:
             logger.error(
-                "Staff channel %s is not visible to this bot, so the %s was not sent. "
-                "Set one with %svlg set staffchannel.",
+                "Staff channel %s is not visible to this bot, so the %s was not sent. " "Set one with %s.",
                 channel_id,
                 what,
-                self.bot.prefix,
+                self._cmd("set staffchannel"),
             )
             return None
         try:
@@ -2022,12 +2289,12 @@ class NorwegianSupport(commands.Cog):
         actually addressing them, so it gets the typing indicator and the normal
         delay, and so does the question after it.
         """
-        for index, part in enumerate(DISCLOSURE_PARTS):
+        for index, part in enumerate(disclosure_parts(self.setting("brandname"), self.setting("privacyurl"))):
             if index:
                 # Between the disclosures only, so the first one is immediate.
                 await asyncio.sleep(DISCLOSURE_GAP_SECONDS)
             await self._send_plain(channel, self._plain_embed(part))
-        for part in GREETING_PARTS:
+        for part in greeting_parts(self.setting("brandname"), self.setting("greeting")):
             await self._send_with_typing(channel, self._plain_embed(part))
 
     @staticmethod
@@ -2104,7 +2371,7 @@ class NorwegianSupport(commands.Cog):
     async def _close_conversation(self, user_id: int, channel, *, reason: str) -> None:
         """Send the closing messages and the survey, then end the conversation."""
         try:
-            for part in CLOSING_PARTS:
+            for part in closing_parts(self.setting("assistantname")):
                 await self._send_with_typing(channel, self._plain_embed(part))
         except discord.HTTPException:
             # Closing still has to happen, or the user is stuck in a conversation
@@ -2158,12 +2425,11 @@ class NorwegianSupport(commands.Cog):
             # so the user would silently get no buttons at all. Retry with plain
             # unicode rather than escalating over a decoration.
             logger.error(
-                "Handoff buttons rejected for %s, retrying with unicode instead of %s / %s. "
-                "Check `%svlg status`.",
+                "Handoff buttons rejected for %s, retrying with unicode instead of %s / %s. " "Check `%s`.",
                 user,
-                BUTTON_YES_EMOJI,
-                BUTTON_NO_EMOJI,
-                self.bot.prefix,
+                self.setting("yesemoji"),
+                self.setting("noemoji"),
+                self._cmd("status"),
             )
             view = YesNoView(timeout=HANDOFF_CONFIRM_TIMEOUT_SECONDS).with_choices(
                 BUTTON_YES_FALLBACK, BUTTON_NO_FALLBACK
@@ -2219,18 +2485,18 @@ class NorwegianSupport(commands.Cog):
         second net, not the mechanism. Falls back as a pair — one guild emoji
         beside one unicode mark looks like a rendering fault.
         """
-        for raw in (BUTTON_YES_EMOJI, BUTTON_NO_EMOJI):
+        for raw in (self.setting("yesemoji"), self.setting("noemoji")):
             if _CUSTOM_EMOJI_RE.match(raw.strip()) and self._resolve_emoji(raw) is None:
                 logger.warning(
                     "Confirmation emoji %s is not usable by this bot, so the buttons fall back to "
-                    "%s / %s. The bot is not in the server that owns it. Check `%svlg status`.",
+                    "%s / %s. The bot is not in the server that owns it. Check `%s`.",
                     raw,
                     BUTTON_YES_FALLBACK,
                     BUTTON_NO_FALLBACK,
-                    self.bot.prefix,
+                    self._cmd("status"),
                 )
                 return BUTTON_YES_FALLBACK, BUTTON_NO_FALLBACK
-        return BUTTON_YES_EMOJI, BUTTON_NO_EMOJI
+        return self.setting("yesemoji"), self.setting("noemoji")
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
@@ -2342,11 +2608,11 @@ class NorwegianSupport(commands.Cog):
         delivered = False
         if channel is None:
             logger.error(
-                "Partnership channel %s in guild %s is not visible to this bot. "
-                "Set one with %svlg set partnershipchannel.",
+                "Partnership channel %s is not visible to this bot in %s. "
+                "Set one with %s set partnershipchannel.",
                 partnership_channel_id,
-                PARTNERSHIP_GUILD_ID,
-                self.bot.prefix,
+                self._home_guild(),
+                self._cmd(),
             )
         else:
             try:
@@ -2385,7 +2651,7 @@ class NorwegianSupport(commands.Cog):
         return None
 
     def _diag(self, msg: str, *args) -> None:
-        """Diagnostic line: debug normally, info while `.vlg verbose` is on.
+        """Diagnostic line: debug normally, info while `.ai verbose` is on.
 
         Modmail applies log_level once at startup, so turning on global debug
         needs a restart and brings discord.py's own debug noise with it. The
@@ -2551,7 +2817,7 @@ class NorwegianSupport(commands.Cog):
             consented = False
 
         # Kept alongside the per-question scores so one number still means
-        # something without unpacking the dict: it is what `.vlg stats` reports,
+        # something without unpacking the dict: it is what `.ai stats` reports,
         # what the low-rating alert fires on, and what answers stored before
         # there was more than one question already hold.
         headline = ratings.get(SURVEY_HEADLINE_KEY)
@@ -2707,7 +2973,7 @@ class NorwegianSupport(commands.Cog):
 
     async def _groq_answer(self, history: list, user_text: str) -> typing.Tuple[str, list, str]:
         """Ask Groq to answer or defer. Raises on any failure."""
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": build_system_prompt(self.setting("brandname"))}]
         messages.extend(self._replay(history))
         messages.append({"role": "user", "content": user_text})
 
@@ -2968,7 +3234,7 @@ class NorwegianSupport(commands.Cog):
         return self._embed(
             description=reply,
             color=self.bot.mod_color,
-            footer=AI_FOOTER,
+            footer=ai_footer(self.setting("assistantname")),
             footer_icon=False,
         )
 
@@ -3018,7 +3284,7 @@ class NorwegianSupport(commands.Cog):
         """A VLG-XXXXXX code, unique against the partition."""
         for _ in range(10):
             body = "".join(secrets.choice(TICKET_ALPHABET) for _ in range(TICKET_BODY_LENGTH))
-            reference = f"{TICKET_PREFIX}-{body}"
+            reference = f'{self.setting("ticketprefix")}-{body}'
             if await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference}) is None:
                 return reference
         # 32^6 codes makes this essentially unreachable, but never hand back a
@@ -3169,7 +3435,7 @@ class NorwegianSupport(commands.Cog):
 
         # Icon follows whatever avatar is set in the Developer Portal, so it
         # tracks the bot's account without a redeploy.
-        embed.set_author(name=AI_TITLE, icon_url=self._bot_avatar())
+        embed.set_author(name=self.setting("assistantname"), icon_url=self._bot_avatar())
 
         if footer is not None:
             embed.set_footer(
@@ -3195,15 +3461,63 @@ class NorwegianSupport(commands.Cog):
     # Diagnostics
     # ------------------------------------------------------------------
 
-    @commands.group(name="vlg", aliases=["nas"], invoke_without_command=True)
+    @commands.group(name=GROUP_NAME, aliases=list(LEGACY_ALIASES), invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def vlg(self, ctx):
-        """Vueling support plugin."""
-        await ctx.send_help(ctx.command)
+    async def ai(self, ctx):
+        """The AI support assistant: settings, reports and data tools."""
+        await ctx.send(embed=self._command_overview())
 
-    @vlg.command(name="status")
+    def _command_overview(self) -> discord.Embed:
+        """The grouped command list shown by a bare `.ai`.
+
+        Written for someone who has never seen this plugin: grouped by what you
+        would be trying to do, and described in terms of what each command is
+        for rather than what it technically does. Modmail's own help formatter
+        gives one flat alphabetical list of docstrings, which is accurate and
+        tells a newcomer nothing.
+        """
+        embed = self._embed(
+            title=f"{self.setting('assistantname')} — commands",
+            description=(
+                f"Type `{self._cmd('<command>')}` to run one, or "
+                f"`{self.bot.prefix}help {GROUP_NAME} <command>` for the full detail on it."
+            ),
+            footer="Settings are stored in the database and survive restarts",
+        )
+
+        for category, entries in COMMAND_CATEGORIES:
+            visible = [(name, blurb) for name, blurb in entries if self._command_visible(name)]
+            if not visible:
+                continue
+            embed.add_field(
+                name=category,
+                value="\n".join(f"`{name}` — {blurb}" for name, blurb in visible),
+                inline=False,
+            )
+
+        return embed
+
+    def _command_visible(self, name: str) -> bool:
+        """Whether a command belongs in the listing right now.
+
+        `devmode` is never listed: it is the one thing you have to already know
+        about. The rest of the developer tools are listed only while devmode is
+        on — with one exception. A tool that is currently *running* is always
+        listed, however devmode is set, because the alternative is `verbose`
+        quietly writing message content to the log with nothing on screen
+        admitting it.
+        """
+        if name in HIDDEN_COMMANDS:
+            return False
+        if name not in DEV_COMMANDS:
+            return True
+        if self.setting("devmode"):
+            return True
+        return bool(self._settings.get(name))
+
+    @ai.command(name="status")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def vlg_status(self, ctx):
+    async def ai_status(self, ctx):
         """Show plugin wiring, storage and config state."""
         hooked = getattr(self.bot.process_dm_modmail, "__nas_wrapped__", False)
 
@@ -3229,12 +3543,12 @@ class NorwegianSupport(commands.Cog):
         # where all of this can read healthy and none of it is what is live.
         stale = self._is_stale()
         embed = self._embed(
-            title="Vueling support — status",
+            title=f"{self.setting('assistantname')} — status",
             description=(
                 "**The file on disk is newer than the running code, so none of this "
                 "reflects what is live.** Reload with "
                 f"`{self.bot.prefix}plugin reload @local/norwegian_support`, then run this again. "
-                f"See `{self.bot.prefix}vlg version`."
+                f"See `{self._cmd()} version`."
                 if stale
                 else None
             ),
@@ -3250,7 +3564,7 @@ class NorwegianSupport(commands.Cog):
             value=f"`{self.db.name}`",
             inline=True,
         )
-        # First-class here, not just in `.vlg version`: after a deploy this is
+        # First-class here, not just in `.ai version`: after a deploy this is
         # the one line that answers "did the restart actually pick up the new
         # code" without anyone having to guess from behaviour.
         commit = self._git_head()
@@ -3300,7 +3614,7 @@ class NorwegianSupport(commands.Cog):
         # confirmation prompt never appears.
         emoji_lines = []
         unusable = False
-        for label, raw in (("yes", BUTTON_YES_EMOJI), ("no", BUTTON_NO_EMOJI)):
+        for label, raw in (("yes", self.setting("yesemoji")), ("no", self.setting("noemoji"))):
             if not _CUSTOM_EMOJI_RE.match(raw.strip()):
                 emoji_lines.append(f"`{label}` {raw} — unicode, always usable")
                 continue
@@ -3333,7 +3647,7 @@ class NorwegianSupport(commands.Cog):
         # The form is offered from the DM but delivered to a staff channel, so
         # the half that can silently break is not visible from the DM side.
         partnership_channel_id = self.setting("partnershipchannel")
-        guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+        guild = self._home_guild()
         channel = guild.get_channel(partnership_channel_id) if guild else None
         if channel is None:
             channel = self.bot.get_channel(partnership_channel_id)
@@ -3351,7 +3665,7 @@ class NorwegianSupport(commands.Cog):
                     )
                 )
                 + f"\nTriggered by: {', '.join(f'`{p}`' for p in PARTNERSHIP_PATTERNS)}"
-                + f"\nCheck a specific message with `{self.bot.prefix}vlg ask <message>`."
+                + f"\nCheck a specific message with `{self._cmd()} ask <message>`."
             ),
             inline=False,
         )
@@ -3363,8 +3677,8 @@ class NorwegianSupport(commands.Cog):
             name="Features",
             value=(
                 " ".join(f"{on if self.setting(f.key) else off}`{f.key}`" for f in FEATURE_SETTINGS)
-                + f"\n{self.bot.prefix}vlg features to change these, "
-                + f"{self.bot.prefix}vlg set for values."
+                + f"\n{self._cmd()} features to change these, "
+                + f"{self._cmd()} set for values."
             ),
             inline=False,
         )
@@ -3400,17 +3714,22 @@ class NorwegianSupport(commands.Cog):
 
         A bad channel id or an unset key does not raise anywhere — it just means
         a notification silently never arrives. Returns how many are wrong, and
-        one line per check, so a glance at `.vlg status` answers "is the
+        one line per check, so a glance at `.ai status` answers "is the
         environment right" without reading `.env` on the box.
         """
         checks: typing.List[typing.Tuple[bool, str, str]] = []
 
-        guild = self.bot.get_guild(PARTNERSHIP_GUILD_ID)
+        guild = self._home_guild()
         checks.append(
             (
                 guild is not None,
-                "Partnership guild",
-                f"**{guild}**" if guild else f"`{PARTNERSHIP_GUILD_ID}` — bot is not in this server",
+                "Home server",
+                (
+                    f"**{guild}** — staff channels are looked up here"
+                    if guild is not None
+                    else "unresolved — the bot is in neither the built-in server nor "
+                    "the one `GUILD_ID` names, so no staff channel can be found"
+                ),
             )
         )
 
@@ -3438,7 +3757,7 @@ class NorwegianSupport(commands.Cog):
                     else f"`{staff_id}` not visible ({configured}) — "
                     + (
                         "**alerts and the weekly digest will not arrive**. Set one with "
-                        f"`{self.bot.prefix}vlg set staffchannel #channel`"
+                        f"`{self._cmd()} set staffchannel #channel`"
                         if staff_needed
                         else "nothing posts there right now, both features are off"
                     )
@@ -3457,8 +3776,7 @@ class NorwegianSupport(commands.Cog):
                     True,
                     "VLG_STAFF_CHANNEL_ID",
                     (
-                        f"`{raw_staff}` — **ignored**, `{self.bot.prefix}vlg set staffchannel` "
-                        "takes precedence"
+                        f"`{raw_staff}` — **ignored**, `{self._cmd()} set staffchannel` " "takes precedence"
                         if overridden
                         else f"`{raw_staff}` — in use as the default"
                         + ("" if raw_staff.isdigit() else ", but **it is not a channel id**")
@@ -3484,7 +3802,7 @@ class NorwegianSupport(commands.Cog):
             (
                 bool(log_url),
                 "log_url",
-                f"`{log_url}`" if log_url else f"unset — `{self.bot.prefix}vlg ticket` cannot link a log",
+                f"`{log_url}`" if log_url else f"unset — `{self._cmd()} ticket` cannot link a log",
             )
         )
 
@@ -3528,9 +3846,9 @@ class NorwegianSupport(commands.Cog):
         modified = self._source_mtime()
         return modified is not None and self._loaded_at is not None and modified > self._loaded_at
 
-    @vlg.command(name="version", aliases=["updated"])
+    @ai.command(name="version", aliases=["updated"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_version(self, ctx):
+    async def ai_version(self, ctx):
         """What code is actually running, and whether it is the code on disk."""
         path = pathlib.Path(__file__).resolve()
 
@@ -3614,9 +3932,9 @@ class NorwegianSupport(commands.Cog):
             # failing the command over.
             return None
 
-    @vlg.command(name="ask")
+    @ai.command(name="ask")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_ask(self, ctx, *, question: str):
+    async def ai_ask(self, ctx, *, question: str):
         """Dry-run a question through the pre-screen and show the raw result.
 
         Touches nothing: no conversation, no transcript, no session, no
@@ -3663,7 +3981,7 @@ class NorwegianSupport(commands.Cog):
                         f"> {truncate(question, 200)}\n\n"
                         f"Matches partnership term `{partnership}`, so the form is offered and "
                         "Groq is never called. Submissions go to the channel shown in "
-                        f"`{self.bot.prefix}vlg status`."
+                        f"`{self._cmd()} status`."
                     ),
                 )
             )
@@ -3685,7 +4003,7 @@ class NorwegianSupport(commands.Cog):
             return await ctx.send(
                 embed=self._embed(
                     description="Groq is not configured, so every question escalates. "
-                    f"See `{self.bot.prefix}vlg status`.",
+                    f"See `{self._cmd()} status`.",
                     color=self.bot.error_color,
                 )
             )
@@ -3740,9 +4058,9 @@ class NorwegianSupport(commands.Cog):
         embed.set_footer(text="No history replayed, so this is a first message. Nothing was stored.")
         await ctx.send(embed=embed)
 
-    @vlg.command(name="stats")
+    @ai.command(name="stats")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_stats(self, ctx):
+    async def ai_stats(self, ctx):
         """How the assistant is doing, and what it keeps failing to answer."""
         try:
             transcripts = await self.db.find({"_type": TYPE_TRANSCRIPT}).to_list(length=2000)
@@ -3804,7 +4122,7 @@ class NorwegianSupport(commands.Cog):
 
     @staticmethod
     def _faq_gaps(transcripts: typing.List[dict]) -> dict:
-        """Reduce transcripts to the numbers `.vlg stats` and the digest report.
+        """Reduce transcripts to the numbers `.ai stats` and the digest report.
 
         Pulled out of the command so the weekly digest reports exactly what
         someone running the command by hand would see, rather than a second
@@ -3933,14 +4251,14 @@ class NorwegianSupport(commands.Cog):
         """Whether a setting was set here or is still on its default."""
         return "set" if key in self._settings else "default"
 
-    @vlg.command(name="set")
+    @ai.command(name="set")
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def vlg_set(self, ctx, key: str = None, *, value: str = None):
+    async def ai_set(self, ctx, key: str = None, *, value: str = None):
         """Show or change a setting that carries a value.
 
-        `.vlg set` on its own lists everything with its current value.
-        `.vlg set staffchannel #staff` changes one.
-        `.vlg set staffchannel default` puts it back to the built-in default.
+        `.ai set` on its own lists everything with its current value.
+        `.ai set staffchannel #staff` changes one.
+        `.ai set staffchannel default` puts it back to the built-in default.
         """
         if key is None:
             return await ctx.send(embed=self._settings_overview())
@@ -3957,8 +4275,8 @@ class NorwegianSupport(commands.Cog):
                         title="That one is a feature, not a value",
                         description=(
                             f"`{key}` is on or off rather than a value, so it lives in "
-                            f"`{self.bot.prefix}vlg features`.\n\n"
-                            f"Try `{self.bot.prefix}vlg features {key} on`."
+                            f"`{self._cmd()} features`.\n\n"
+                            f"Try `{self._cmd()} features {key} on`."
                         ),
                         color=self.bot.error_color,
                     )
@@ -3973,7 +4291,7 @@ class NorwegianSupport(commands.Cog):
                     description=(
                         f"{setting.summary}\n\n**Currently:** {current} "
                         f"({self._setting_source(key)})\n\n"
-                        f"Change it with `{self.bot.prefix}vlg set {key} "
+                        f"Change it with `{self._cmd()} set {key} "
                         f"{setting.example or '<value>'}`."
                     ),
                 )
@@ -4049,9 +4367,9 @@ class NorwegianSupport(commands.Cog):
         embed = self._embed(
             title="Settings",
             description=(
-                f"Change one with `{self.bot.prefix}vlg set <name> <value>`, or put it "
-                f"back with `{self.bot.prefix}vlg set <name> default`.\n"
-                f"On/off features are in `{self.bot.prefix}vlg features`."
+                f"Change one with `{self._cmd()} set <name> <value>`, or put it "
+                f"back with `{self._cmd()} set <name> default`.\n"
+                f"On/off features are in `{self._cmd()} features`."
             ),
             footer="Stored in the database — these survive reloads and restarts",
         )
@@ -4069,19 +4387,19 @@ class NorwegianSupport(commands.Cog):
             description=(
                 "The ones you can change here are:\n"
                 + "\n".join(f"• `{s.key}`" for s in pool)
-                + f"\n\nRun `{self.bot.prefix}vlg {command}` to see them with their values."
+                + f"\n\nRun `{self._cmd()} {command}` to see them with their values."
             ),
             color=self.bot.error_color,
         )
 
-    @vlg.command(name="features", aliases=["feature"])
+    @ai.command(name="features", aliases=["feature"])
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def vlg_features(self, ctx, key: str = None, state: str = None):
+    async def ai_features(self, ctx, key: str = None, state: str = None):
         """Turn optional features on and off.
 
-        `.vlg features` lists everything with its current state.
-        `.vlg features digest off` turns one off.
-        `.vlg features digest` flips whatever it is now.
+        `.ai features` lists everything with its current state.
+        `.ai features digest off` turns one off.
+        `.ai features digest` flips whatever it is now.
         """
         if key is None:
             return await ctx.send(embed=self._features_overview())
@@ -4096,8 +4414,8 @@ class NorwegianSupport(commands.Cog):
                         title="That one carries a value",
                         description=(
                             f"`{key}` is not simply on or off, so it lives in "
-                            f"`{self.bot.prefix}vlg set`.\n\n"
-                            f"Try `{self.bot.prefix}vlg set {key}`."
+                            f"`{self._cmd()} set`.\n\n"
+                            f"Try `{self._cmd()} set {key}`."
                         ),
                         color=self.bot.error_color,
                     )
@@ -4119,6 +4437,8 @@ class NorwegianSupport(commands.Cog):
                 )
 
         await self.set_setting(key, new_value)
+        # A developer feature toggled here changes whether it is listed.
+        self._apply_devmode_visibility()
         logger.info("%s turned %s %s.", ctx.author, key, "on" if new_value else "off")
 
         embed = self._embed(
@@ -4145,7 +4465,7 @@ class NorwegianSupport(commands.Cog):
                 name="\N{WARNING SIGN} The survey is off",
                 value=(
                     "This needs the survey, which is currently off, so nothing will "
-                    f"happen yet. Turn it on with `{self.bot.prefix}vlg features survey on`."
+                    f"happen yet. Turn it on with `{self._cmd()} features survey on`."
                 ),
                 inline=False,
             )
@@ -4155,7 +4475,7 @@ class NorwegianSupport(commands.Cog):
                     name="\N{WARNING SIGN} No staff channel",
                     value=(
                         "This posts to the staff channel, which this bot cannot "
-                        f"currently see. Set one with `{self.bot.prefix}vlg set "
+                        f"currently see. Set one with `{self._cmd()} set "
                         "staffchannel #channel`."
                     ),
                     inline=False,
@@ -4168,13 +4488,17 @@ class NorwegianSupport(commands.Cog):
         embed = self._embed(
             title="Features",
             description=(
-                f"Turn one on or off with `{self.bot.prefix}vlg features <name> on|off`.\n"
-                f"Settings that carry a value are in `{self.bot.prefix}vlg set`."
+                f"Turn one on or off with `{self._cmd()} features <name> on|off`.\n"
+                f"Settings that carry a value are in `{self._cmd()} set`."
             ),
             footer="Stored in the database — these survive reloads and restarts",
         )
         on, off = "\N{WHITE HEAVY CHECK MARK}", "\N{CROSS MARK}"
         for setting in FEATURE_SETTINGS:
+            # A developer tool is hidden here on the same rule as in the command
+            # list, so the two never disagree about what exists.
+            if not self._command_visible(setting.key):
+                continue
             enabled = bool(self.setting(setting.key))
             embed.add_field(
                 name=f"{on if enabled else off} {setting.key} — {'on' if enabled else 'off'}",
@@ -4183,16 +4507,73 @@ class NorwegianSupport(commands.Cog):
             )
         return embed
 
-    @vlg.command(name="verbose")
+    @ai.command(name="devmode", hidden=True)
+    @checks.has_permissions(PermissionLevel.OWNER)
+    async def ai_devmode(self, ctx, enabled: bool = None):
+        """Show or hide the developer commands. Undocumented on purpose."""
+        await self.set_setting("devmode", (not self.setting("devmode")) if enabled is None else enabled)
+        state = self.setting("devmode")
+        self._apply_devmode_visibility()
+
+        logger.info("Developer mode turned %s by %s.", "on" if state else "off", ctx.author)
+        await ctx.send(
+            embed=self._embed(
+                title=f"Developer mode {'on' if state else 'off'}",
+                description=(
+                    (
+                        "Developer commands are now listed in "
+                        f"`{self._cmd()}`: {', '.join(f'`{c}`' for c in sorted(DEV_COMMANDS))}."
+                    )
+                    if state
+                    else (
+                        "Developer commands are hidden from the command list again. "
+                        "They still work if you type them."
+                    )
+                ),
+                color=None if state else self.bot.error_color,
+                footer="This command is never listed, on or off",
+            )
+        )
+
+    def _apply_devmode_visibility(self) -> None:
+        """Match Modmail's own help to the grouped listing.
+
+        `.ai` builds its list from COMMAND_CATEGORIES, but `?help ai` is
+        Modmail's formatter reading `command.hidden`, and a command absent from
+        one list while present in the other is worse than not gating it at all.
+
+        The group is fetched from the bot rather than as `self.ai`, which looks
+        like the obvious way to reach it and is not: accessing a command through
+        the cog hands back a fresh copy every time, so setting `hidden` on it
+        changes an object nothing else will ever look at. `bot.get_command` is
+        the instance the dispatcher and the help formatter actually hold.
+        """
+        group = self.bot.get_command(GROUP_NAME)
+        if group is None or not hasattr(group, "commands"):
+            logger.debug("Command group %r is not registered yet; visibility not applied.", GROUP_NAME)
+            return
+
+        for command in group.commands:
+            if command.name in HIDDEN_COMMANDS:
+                command.hidden = True
+            elif command.name in DEV_COMMANDS:
+                command.hidden = not self._command_visible(command.name)
+
+    # Declared hidden so it stays hidden in the window between the cog being
+    # added and the stored settings arriving. _apply_devmode_visibility settles it.
+    @ai.command(name="verbose", hidden=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def vlg_verbose(self, ctx, enabled: bool = None):
+    async def ai_verbose(self, ctx, enabled: bool = None):
         """Promote this plugin's diagnostics to INFO without a bot restart.
 
         Logs the message that caused a defer and Groq's verbatim response.
         Kept as its own command because the warning below is worth showing;
-        it is the same setting as `.vlg features verbose`.
+        it is the same setting as `.ai features verbose`.
         """
         await self.set_setting("verbose", (not self._verbose) if enabled is None else enabled)
+        # Turning verbose on makes it visible even with devmode off, and
+        # turning it off may take it away again.
+        self._apply_devmode_visibility()
 
         if self._verbose:
             # Write a line immediately so the log itself confirms the toggle
@@ -4206,7 +4587,7 @@ class NorwegianSupport(commands.Cog):
                 "the log — if you cannot see it, the log level itself is the "
                 "problem, not this toggle.\n\nThis writes ticket message content "
                 f"to the bot log, which is not on the {self.setting('retentiondays')}-day "
-                f"deletion path. Turn it off with `{self.bot.prefix}vlg verbose off` "
+                f"deletion path. Turn it off with `{self._cmd()} verbose off` "
                 "once you are done."
             )
         else:
@@ -4222,9 +4603,9 @@ class NorwegianSupport(commands.Cog):
             )
         )
 
-    @vlg.command(name="forget", aliases=["revoke"])
+    @ai.command(name="forget", aliases=["revoke"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_forget(self, ctx, user: discord.User):
+    async def ai_forget(self, ctx, user: discord.User):
         """Delete a user's stored assistant conversations.
 
         For acting on an erasure request from the data protection page. There is
@@ -4270,9 +4651,9 @@ class NorwegianSupport(commands.Cog):
         await ctx.send(embed=self._embed(description=note))
         logger.info("Erased stored data for %s (%s) at the request of %s.", user, user.id, ctx.author)
 
-    @vlg.command(name="digest")
+    @ai.command(name="digest")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_digest(self, ctx):
+    async def ai_digest(self, ctx):
         """Send the weekly digest now, without waiting for its slot.
 
         For checking the staff channel is reachable and the content reads
@@ -4293,7 +4674,7 @@ class NorwegianSupport(commands.Cog):
                 if sent is not None
                 else f"**Could not post to <#{self.setting('staffchannel')}>** "
                 f"(`{self.setting('staffchannel')}`). Check the bot can see that channel, "
-                f"or set one with `{self.bot.prefix}vlg set staffchannel #channel`."
+                f"or set one with `{self._cmd()} set staffchannel #channel`."
             ),
             color=None if sent is not None else self.bot.error_color,
         )
@@ -4305,20 +4686,20 @@ class NorwegianSupport(commands.Cog):
                 name="The weekly digest is off",
                 value=(
                     "This one was sent because you asked for it. No digest will arrive "
-                    f"on its own until `{self.bot.prefix}vlg features digest on`."
+                    f"on its own until `{self._cmd()} features digest on`."
                 ),
                 inline=False,
             )
         await ctx.send(embed=result)
 
-    @vlg.command(name="training")
+    @ai.command(name="training")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_training(self, ctx, samples: int = TRAINING_SAMPLE_DEFAULT):
+    async def ai_training(self, ctx, samples: int = TRAINING_SAMPLE_DEFAULT):
         """Conversations users agreed we could keep, with a few read inline.
 
         A reading list, not a pipeline. Nothing here changes the assistant on
         its own — `FAQ_KNOWLEDGE` and the prompt are edited by hand, the same
-        way the gaps `.vlg stats` surfaces are fixed today.
+        way the gaps `.ai stats` surfaces are fixed today.
         """
         samples = max(0, min(samples, TRAINING_SAMPLE_MAX))
 
@@ -4332,13 +4713,13 @@ class NorwegianSupport(commands.Cog):
                 reason = (
                     "Training data collection is **off**, so the question is never "
                     "asked and nothing is being kept.\n\nTurn it on with "
-                    f"`{self.bot.prefix}vlg features training on`."
+                    f"`{self._cmd()} features training on`."
                 )
             elif not self.setting("survey"):
                 reason = (
                     "The post-chat survey is **off**, and the training question is part "
                     "of it, so nothing is being kept.\n\nTurn it on with "
-                    f"`{self.bot.prefix}vlg features survey on`."
+                    f"`{self._cmd()} features survey on`."
                 )
             return await ctx.send(embed=self._embed(description=reason, color=self.bot.error_color))
 
@@ -4398,9 +4779,9 @@ class NorwegianSupport(commands.Cog):
             lines.append(line)
         return "\n".join(lines) or "*empty*"
 
-    @vlg.command(name="ticket")
+    @ai.command(name="ticket")
     @checks.has_permissions(PermissionLevel.SUPPORTER)
-    async def vlg_ticket(self, ctx, reference: str):
+    async def ai_ticket(self, ctx, reference: str):
         """Look up a VLG-XXXXXX reference and its Modmail log."""
         doc = await self.db.find_one({"_type": TYPE_TICKET, "nas_ref": reference.upper()})
         if doc is None:
