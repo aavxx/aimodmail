@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import pathlib
@@ -254,11 +255,27 @@ KEEP_RATINGS_WITHOUT_CONSENT = True
 TRAINING_SAMPLE_DEFAULT = 3
 TRAINING_SAMPLE_MAX = 10
 
-# Caps on supplied knowledge. A Discord message tops out at 2000 characters, so
-# a section has to be enterable in one, and `.ai knowledge add` grows it a line
-# at a time past that.
-KNOWLEDGE_MAX = 1900
-KNOWLEDGE_SHORT_MAX = 900
+# Knowledge is not capped. An earlier version limited each section to what fits
+# in one Discord message, which confused a limit on *entering* text with a limit
+# on *storing* it — a real FAQ is easily longer than one message, and it is
+# entered a piece at a time regardless.
+#
+# What is real is that all of it goes into the prompt on every single request,
+# so it costs tokens per message and eventually will not fit. That is reported
+# rather than enforced: the thresholds below drive advice, never a refusal.
+
+# Context window of the model in GROQ_MODEL, in tokens.
+MODEL_CONTEXT_TOKENS = 128_000
+
+# Rough characters per token for English prose. Only used for advice, so being
+# off by a third either way changes nothing that matters.
+CHARS_PER_TOKEN = 4
+
+# Share of the context window the whole prompt may take before it is worth
+# mentioning, and before it is worth treating as a problem. The rest of the
+# window has to hold the conversation history and the reply.
+KNOWLEDGE_ADVISORY_SHARE = 0.25
+KNOWLEDGE_PROBLEM_SHARE = 0.60
 
 # Retention for AI pre-screen transcripts. Enforced by a MongoDB TTL index on
 # `expires_at`; documents without that field (sessions, ticket mappings) are
@@ -855,13 +872,8 @@ class Setting:
             return raw
 
         if self.kind == "knowledge":
-            cleaned = sanitise_knowledge(raw)
-            if self.maximum is not None and len(cleaned) > self.maximum:
-                raise ValueError(
-                    f"that is {len(cleaned)} characters; keep it under {int(self.maximum)}. "
-                    "Add the rest afterwards, a line at a time."
-                )
-            return cleaned
+            # Deliberately unbounded: see the note by MODEL_CONTEXT_TOKENS.
+            return sanitise_knowledge(raw)
 
         if self.kind in ("text", "url", "emoji"):
             if not raw:
@@ -1001,7 +1013,6 @@ VALUE_SETTINGS = (
         lambda: DEFAULT_KNOWLEDGE,
         "What the assistant knows about your business. It may only answer from "
         "this — anything not in here is handed to a human.",
-        maximum=KNOWLEDGE_MAX,
     ),
     Setting(
         "pricing",
@@ -1009,7 +1020,6 @@ VALUE_SETTINGS = (
         lambda: "",
         "Prices, products, fare classes. Kept separate from the rest because it "
         "is what changes most often and what is worst to get wrong.",
-        maximum=KNOWLEDGE_MAX,
     ),
     Setting(
         "neveranswer",
@@ -1017,7 +1027,6 @@ VALUE_SETTINGS = (
         lambda: "",
         "Topics the assistant must always hand to a human, whatever else it "
         "knows. Overrides everything above it.",
-        maximum=KNOWLEDGE_SHORT_MAX,
     ),
     Setting(
         "iconurl",
@@ -1576,6 +1585,9 @@ SETUP_SKIP_WORDS = {"skip", "keep", "next", "-"}
 SETUP_CANCEL_WORDS = {"cancel", "stop", "quit", "exit", "abort"}
 SETUP_CLEAR_WORDS = {"clear", "none", "empty", "default"}
 
+# Ends a multi-message knowledge answer.
+SETUP_DONE_WORDS = {"done", "finished", "end", "that's all", "thats all"}
+
 # Per question. Long enough to look something up or write a paragraph about your
 # business without being timed out mid-thought.
 SETUP_ANSWER_TIMEOUT = 600
@@ -1660,7 +1672,8 @@ SETUP_STEPS = (
         "Tell the assistant about your business. What should it know?",
         "Everything it is allowed to answer from. Anything not in here goes to a human, which is "
         "the safe direction — a missing fact costs you a handoff, a wrong one gets stated to a "
-        "customer as though it were true. Write plain lines, one fact each.",
+        "customer as though it were true. Write plain lines, one fact each. There is no limit: "
+        "send as many messages as you need, then say **done**.",
         kind="knowledge",
         example="- We sell handmade furniture, made to order.\n- Delivery takes 2-3 weeks.",
     ),
@@ -2072,6 +2085,47 @@ class AISupport(commands.Cog):
             logger.warning("Could not delete a message containing a secret.", exc_info=False)
             return False
         return True
+
+    def _section_size(self, key: str) -> str:
+        """A knowledge section's size, in words somebody can act on."""
+        value = str(self.setting(key) or "")
+        lines = len([x for x in value.splitlines() if x.strip()])
+        return f"{len(value):,} characters across {lines} line(s)"
+
+    def _prompt_tokens(self) -> int:
+        """Rough token count of the whole system prompt, knowledge included.
+
+        Estimated from length rather than tokenised, because the only decision
+        it drives is whether to mention the size to a human.
+        """
+        return len(self._system_prompt()) // CHARS_PER_TOKEN
+
+    def _prompt_size_advice(self) -> typing.Optional[str]:
+        """A note about prompt size, or None while there is nothing to say.
+
+        Knowledge is deliberately unlimited, so this is the honest counterweight:
+        all of it is sent on every single request, which costs tokens per message
+        and eventually will not fit in the model's context at all.
+        """
+        tokens = self._prompt_tokens()
+        share = tokens / MODEL_CONTEXT_TOKENS
+        if share < KNOWLEDGE_ADVISORY_SHARE:
+            return None
+
+        detail = (
+            f"Everything the assistant knows is sent on every message. That is now about "
+            f"**{tokens:,} tokens**, roughly {share:.0%} of what this model can hold at once."
+        )
+        if share < KNOWLEDGE_PROBLEM_SHARE:
+            return (
+                f"{detail}\n\nStill fine, but it makes every reply a little slower and more "
+                "expensive. Trimming anything the assistant never actually needs is worth doing."
+            )
+        return (
+            f"{detail}\n\n**This is close to the limit.** Past it the model refuses the "
+            "request and every message goes to a human instead. Move rarely-needed detail out, "
+            f"or check `{self._cmd('stats')}` for what is actually being asked."
+        )
 
     def _api_key(self) -> typing.Tuple[str, str]:
         """The API key in force, and where it came from.
@@ -4153,6 +4207,16 @@ class AISupport(commands.Cog):
         # facts about a different company. Listed first because everything else
         # here is a feature not working, and this one is the assistant working
         # perfectly and being wrong.
+        # Unlimited knowledge is only useful while it still fits in the request.
+        # Past the problem threshold the model refuses outright and every message
+        # escalates, which looks exactly like the AI being down.
+        if self._prompt_tokens() / MODEL_CONTEXT_TOKENS >= KNOWLEDGE_PROBLEM_SHARE:
+            problems.append(
+                f"What the assistant knows is now about {self._prompt_tokens():,} tokens, close "
+                "to the most this model can read at once. Past that every message goes to a "
+                f"human. Trim it with `{self._cmd('knowledge')}`."
+            )
+
         # Not an error — an assistant that knows nothing escalates everything,
         # which is safe. It is just not doing the job it was installed for.
         if not str(self.setting("knowledge")).strip():
@@ -5294,6 +5358,16 @@ class AISupport(commands.Cog):
             )
             if step.kind == "yesno":
                 embed.add_field(name="Answer", value="**yes** or **no**", inline=False)
+            elif step.kind == "knowledge":
+                embed.add_field(
+                    name="As long as you like",
+                    value=(
+                        "Send it over as many messages as you want — there is no limit — then "
+                        "say **done**. You can add more later with "
+                        f"`{self._cmd('knowledge add')}`."
+                    ),
+                    inline=False,
+                )
             elif step.example:
                 embed.add_field(name="For example", value=f"```\n{step.example}\n```", inline=False)
 
@@ -5352,6 +5426,13 @@ class AISupport(commands.Cog):
                         )
                     )
                     continue
+            elif step.kind == "knowledge":
+                # Collected across as many messages as they want to send, because
+                # one Discord message is 2000 characters and an FAQ is not.
+                collected = await self._collect_knowledge(ctx, answer)
+                if collected is None:
+                    return None
+                parsed = setting.parse(collected, ctx.guild)
             else:
                 try:
                     parsed = setting.parse(answer, ctx.guild)
@@ -5380,6 +5461,43 @@ class AISupport(commands.Cog):
 
             return f"`{step.key}` → {setting.render(parsed)}"
 
+    async def _collect_knowledge(self, ctx, first: str) -> typing.Optional[str]:
+        """Gather a knowledge section across however many messages it takes.
+
+        Knowledge is unlimited but a Discord message is not, so asking for it in
+        one would have capped it at 2000 characters however generous the storage
+        is. Returns the joined text, or None to cancel.
+        """
+        parts = [first]
+        while True:
+            await ctx.send(
+                embed=self._embed(
+                    description=(
+                        f"Got {sum(len(p) for p in parts):,} characters so far.\n\n"
+                        "Send more messages to add to it, or **done** when you have finished."
+                    ),
+                    footer="done · cancel",
+                )
+            )
+            try:
+                reply = await self.bot.wait_for(
+                    "message",
+                    check=lambda m: m.author.id == ctx.author.id and m.channel.id == ctx.channel.id,
+                    timeout=SETUP_ANSWER_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                # Silence after something was typed is treated as "that is all",
+                # rather than throwing away what they had already written.
+                return "\n".join(parts)
+
+            answer = (reply.content or "").strip()
+            lowered = answer.lower()
+            if lowered in SETUP_CANCEL_WORDS:
+                return None
+            if lowered in SETUP_DONE_WORDS or not answer:
+                return "\n".join(parts)
+            parts.append(answer)
+
     async def _confirm_knowledge(self, ctx, step: SetupStep, parsed: str):
         """Show typed knowledge back and make them confirm it.
 
@@ -5398,7 +5516,16 @@ class AISupport(commands.Cog):
             ),
             color=self.bot.mod_color,
         )
-        embed.add_field(name=step.key, value=f"```\n{truncate(parsed, 1000)}\n```", inline=False)
+        embed.add_field(name=step.key, value=f"```\n{truncate(parsed, 900)}\n```", inline=False)
+        if len(parsed) > 900:
+            embed.add_field(
+                name="Length",
+                value=(
+                    f"{len(parsed):,} characters — only the start is shown above. "
+                    f"`{self._cmd('knowledge')}` sends the whole thing back as a file."
+                ),
+                inline=False,
+            )
 
         # Worth saying out loud rather than silently accepting: this text goes
         # into the model's instructions, and someone pasting from a support doc
@@ -5486,7 +5613,7 @@ class AISupport(commands.Cog):
         sections = ("knowledge", "pricing", "neveranswer")
 
         if action is None:
-            return await ctx.send(embed=self._knowledge_embed())
+            return await ctx.send(embed=self._knowledge_embed(), files=self._knowledge_files())
 
         chosen = action.lower()
         if chosen in sections:
@@ -5498,7 +5625,7 @@ class AISupport(commands.Cog):
             chosen, action = "knowledge", chosen
 
         if action == "show":
-            return await ctx.send(embed=self._knowledge_embed(chosen))
+            return await ctx.send(embed=self._knowledge_embed(chosen), files=self._knowledge_files(chosen))
 
         if action == "clear":
             await self.clear_setting(chosen)
@@ -5537,23 +5664,16 @@ class AISupport(commands.Cog):
         current = str(self.setting(chosen))
 
         updated = (current.rstrip() + "\n" + ("" if line.startswith("-") else "- ") + line).strip()
-        cap = SETTINGS[chosen].maximum
-        if cap is not None and len(updated) > cap:
-            return await ctx.send(
-                embed=self._embed(
-                    description=(
-                        f"That would take `{chosen}` to {len(updated)} characters, over the "
-                        f"{int(cap)} limit. Trim it, or move some of it into another section."
-                    ),
-                    color=self.bot.error_color,
-                )
-            )
 
         await self.set_setting(chosen, updated)
         embed = self._embed(
             title=f"Added to {chosen}",
-            description=f"```\n{truncate(updated, 900)}\n```",
+            description=f"```\n{truncate(line, 900)}\n```",
+            footer=f"{chosen} is now {self._section_size(chosen)}",
         )
+        advice = self._prompt_size_advice()
+        if advice is not None:
+            embed.add_field(name="Size", value=advice, inline=False)
         odd = suspicious_knowledge(line)
         if odd is not None:
             embed.color = self.bot.error_color
@@ -5597,12 +5717,39 @@ class AISupport(commands.Cog):
             if only is not None and key != only:
                 continue
             value = str(self.setting(key)).strip()
+            if not value:
+                embed.add_field(name=f"{label}  ·  `{key}`", value="*empty*", inline=False)
+                continue
+            # An embed field caps at 1024 characters and knowledge does not, so
+            # a long section is summarised here and sent in full as a file.
+            shown = truncate(value, 900)
+            suffix = "" if len(value) <= 900 else f"\n*Showing the start of {self._section_size(key)}.*"
             embed.add_field(
                 name=f"{label}  ·  `{key}`",
-                value=f"```\n{truncate(value, 1000)}\n```" if value else "*empty*",
+                value=f"```\n{shown}\n```{suffix}",
                 inline=False,
             )
+
+        advice = self._prompt_size_advice()
+        if advice is not None:
+            embed.add_field(name="Size", value=advice, inline=False)
         return embed
+
+    def _knowledge_files(self, only: typing.Optional[str] = None) -> typing.List[discord.File]:
+        """Full text of any section too long to show inline.
+
+        Knowledge is unlimited, and knowledge you cannot read back is knowledge
+        you cannot check — which matters more here than anywhere else in the
+        plugin, because every line of it gets stated to a user as fact.
+        """
+        files = []
+        for key in ("knowledge", "pricing", "neveranswer"):
+            if only is not None and key != only:
+                continue
+            value = str(self.setting(key)).strip()
+            if len(value) > 900:
+                files.append(discord.File(io.BytesIO(value.encode("utf-8")), filename=f"{key}.txt"))
+        return files
 
     @ai.command(name="devmode", hidden=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
