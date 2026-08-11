@@ -52,6 +52,38 @@ it:
 | Developer | `.ai verbose` | Administrator | Log why the assistant handed a chat over |
 | Developer | `.ai devmode` | Administrator | Show or hide the developer commands |
 
+### `.ai setup` — the first-run wizard
+
+Not listed anywhere by default. It is a one-time thing rather than a daily one,
+and listing it permanently would put a "set this up" button in front of people
+whose install is already set up.
+
+```
+.ai setup
+```
+
+Two steps, and nothing saves until you submit each one:
+
+1. **A form** — command name, your organisation's name, what the assistant calls
+   itself, your privacy policy link, and an icon. Every field is pre-filled with
+   what is currently in force, so this doubles as a way to read the current
+   configuration. Leave a field alone to keep it; clear an optional one to put it
+   back to its default.
+2. **Channel pickers** — the staff channel and the partnership channel, as real
+   Discord pickers rather than asking you to paste an id. Both are skippable.
+
+It finishes by listing anything still wrong and where to change things later.
+One field is validated per field rather than all-or-nothing: a mistyped link is
+reported by name and everything else in the same form still saves.
+
+The one thing the wizard cannot do is the API key. `GROQ_API_KEY` belongs in
+`.env` because it is a credential, not a setting.
+
+Changing the **command name** takes effect immediately — the group is
+re-registered under the new name, with the previous names kept as aliases. If the
+name you pick is already taken by another command, the rename is refused and
+logged rather than leaving the plugin unreachable.
+
 ### Developer mode
 
 `.ai devmode` toggles. It takes no arguments — run it again to turn it back off.
@@ -71,13 +103,18 @@ While devmode is **off**, developer commands are:
 While devmode is **on**, everything appears in both `.ai` and `?help ai`, and
 `.ai status` and `.ai ask` grow their technical sections.
 
-Two deliberate exceptions:
+The whole **Developer category disappears** when devmode is off — it is not
+shown with fewer entries under it, it is absent.
 
-- `.ai devmode` itself always runs, whatever it is set to. It is the way back in,
-  so it cannot be gated behind itself.
-- A developer tool that is currently **on** stays listed and runnable even with
-  devmode off. Otherwise `verbose` could sit there writing message content to the
-  log with no way to reach the command that turns it off.
+Two deliberate exceptions, both about *running* rather than listing:
+
+- `.ai devmode` and `.ai setup` always run, whatever devmode is set to. One is
+  the way back in and cannot be gated behind itself; the other has to work on an
+  install where nobody has heard of devmode.
+- A developer tool that is currently **on** stays runnable — but not listed — so
+  turning `verbose` off does not require turning devmode on first just to reach
+  it. That it is on is reported by `.ai status` instead, under *Needs
+  attention*, which is where a warning belongs.
 
 `.ai forget` is the only way to action an erasure request.`.ai forget` is the only way to action an erasure request. There is no consent
 to withdraw any more, and the disclosure now links only to the privacy policy, so
@@ -216,7 +253,8 @@ is still on the built-in default.
 | `greeting` | "Hola! I'm {brand}'s…" | The assistant's opening line; `{brand}` is substituted |
 | `yesemoji` / `noemoji` | guild emoji | Emoji on the "connect me to a human" buttons |
 | `iconurl` | unset | Image shown as the icon on the assistant's messages |
-| `legacyaliases` | on | Whether `.vlg` and `.nas` still work alongside `.ai` |
+| `legacyaliases` | on | Whether the old names still work alongside the current one |
+| `commandname` | ai | What you type to reach the plugin — `.ai status`, `.ai set` |
 
 `iconurl` unset means the bot's own Discord avatar is used, which is usually
 right. Set it when the avatar and the logo you want on messages differ — note
@@ -224,9 +262,15 @@ the Developer Portal's *App Icon* and *Bot* avatar are two different images, and
 only the Bot one reaches messages, which is the usual reason for wanting this.
 `.ai set iconurl default` goes back to the avatar.
 
-`legacyaliases off` makes `.vlg` and `.nas` refuse with a note pointing at
-`.ai`. It is stored per install like every other setting, so turning it off here
-does not affect anyone else running this plugin.
+`commandname` re-registers the group live, no restart. The previous names stay
+registered as aliases so nothing in flight breaks. Note that Modmail keys any
+per-command permission overrides by name, so if you have set some with
+`?permissions`, they will need re-adding under the new name.
+
+`legacyaliases off` makes every name except the current one refuse with a note
+pointing at the right command. It is stored per install like every other
+setting, so turning it off here does not affect anyone else running this
+plugin.
 
 A custom emoji only works if the bot is in the server that owns it. If it is
 not, the buttons fall back to plain unicode automatically rather than failing to
@@ -273,13 +317,13 @@ baked into the code any more. On a fresh install:
 
 1. `GROQ_API_KEY` in `.env`, alongside Modmail's own values. That is the only
    thing this plugin needs from the environment.
-2. `.ai set brandname`, `assistantname`, `privacyurl`, `ticketprefix`, and
-   `greeting` — the identity block above.
-3. `.ai set staffchannel` and `partnershipchannel` to channels on your server.
-4. `.ai set yesemoji` / `noemoji`, or leave them: the built-in ids belong to
-   another server, so they resolve to nothing and the buttons fall back to plain
-   unicode automatically. `.ai status` says when that has happened.
-5. `.ai status` — the Configuration block names anything still wrong.
+2. **`.ai setup`** — walks through the command name, your organisation's name,
+   the assistant's name, your privacy policy link, an icon, and the staff
+   channels. That is most of it.
+3. `.ai set ticketprefix` and `greeting` if you want them, and `.ai set yesemoji`
+   / `noemoji` — the built-in emoji ids belong to another server, so they
+   resolve to nothing and the buttons fall back to plain unicode automatically.
+4. `.ai status` — names anything still wrong, in plain words.
 
 Staff channels are looked up in the server `PARTNERSHIP_GUILD_ID` names, and
 then in whatever Modmail's own `GUILD_ID` is set to. A fresh install matches the

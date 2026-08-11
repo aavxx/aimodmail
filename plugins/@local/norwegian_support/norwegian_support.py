@@ -822,6 +822,7 @@ class Setting:
         unit: str = "",
         example: str = "",
         menu: typing.Optional[str] = None,
+        pattern: typing.Optional[typing.Tuple[typing.Pattern, str]] = None,
     ):
         self.key = key
         self.kind = kind
@@ -831,6 +832,8 @@ class Setting:
         self.maximum = maximum
         self.unit = unit
         self.example = example
+        # (compiled regex, the message shown when a value does not match).
+        self.pattern = pattern
         # Which command lists it. Booleans belong in `features` by default,
         # because that is what "an optional feature" means — but a few switches
         # configure the plugin itself rather than the assistant's behaviour, and
@@ -870,6 +873,8 @@ class Setting:
                 raise ValueError("that needs to be a full link starting with `https://`.")
             if self.kind == "emoji" and not (_CUSTOM_EMOJI_RE.match(raw) or _looks_like_unicode_emoji(raw)):
                 raise ValueError("send a single emoji, or a custom one like `<:yes:123>`.")
+            if self.pattern is not None and not self.pattern[0].match(raw):
+                raise ValueError(self.pattern[1])
             return raw
 
         if self.kind == "channel":
@@ -926,6 +931,19 @@ class Setting:
 # on a different bot has to change, and listing it above the tuning knobs makes
 # that the obvious first move.
 VALUE_SETTINGS = (
+    Setting(
+        "commandname",
+        "text",
+        lambda: GROUP_NAME,
+        "What you type to reach this plugin. `ai` means `.ai status`, `.ai set` "
+        "and so on. Takes effect immediately, no restart.",
+        maximum=20,
+        example="ai",
+        pattern=(
+            re.compile(r"^[a-z][a-z0-9_-]*$"),
+            "use lowercase letters, digits, `-` or `_`, starting with a letter.",
+        ),
+    ),
     Setting(
         "brandname",
         "text",
@@ -1206,6 +1224,7 @@ COMMAND_CATEGORIES = (
         (
             ("set", "Names, channels, timings, and anything else with a value.", False),
             ("features", "Turn optional parts of the assistant on and off.", False),
+            ("setup", "Walk through first-run configuration one question at a time.", True),
         ),
     ),
     (
@@ -1259,9 +1278,11 @@ CATEGORY_ALIASES = {
     "debug": "developer",
 }
 
-# `devmode` is the way back in, so it can never be gated behind itself: with
-# devmode off it is unlisted, but still runs for anyone allowed to run it.
-ALWAYS_RUNNABLE = frozenset({"devmode"})
+# Unlisted, but runnable regardless of devmode. `devmode` is the way back in and
+# cannot be gated behind itself; `setup` is the opposite case — a first-run tool
+# that has to work on an install where nobody has heard of devmode, and is kept
+# off the menu only because it is a one-time thing rather than a daily one.
+ALWAYS_RUNNABLE = frozenset({"devmode", "setup"})
 
 # TYPE_META also holds bookkeeping that is not a setting. Reserved so a future
 # setting cannot be given a key that would overwrite one of them.
@@ -1468,6 +1489,174 @@ never mid-sentence, and never with a markdown link straddling the two parts.
 A single string is for genuinely short replies: a one or two sentence answer, or
 anything conversational. If you are unsure which you have, use two.
 """
+
+
+# ----------------------------------------------------------------------
+# First-run setup wizard
+# ----------------------------------------------------------------------
+#
+# The settings that turn somebody else's copy of this plugin into their own.
+# Asked as one form rather than made discoverable one `.ai set` at a time,
+# because a fresh install needs all of them and none of them are guessable.
+#
+# (setting key, label, description, required). Discord caps a modal at five
+# components, a label at 45 characters and a description at 100, all asserted
+# below. The description is used rather than a placeholder because a placeholder
+# disappears the moment somebody types, and the guidance is most needed after
+# that, not before.
+SETUP_FIELDS = (
+    ("commandname", "Command name", "What you type to reach this. `ai` gives you `.ai status`.", True),
+    ("brandname", "Your organisation's name", "As users should see it, e.g. Vueling.", True),
+    ("assistantname", "What the assistant calls itself", "Shown on every message it sends.", True),
+    ("privacyurl", "Link to your privacy policy", "Shown to every user before their first message.", True),
+    (
+        "iconurl",
+        "Icon for the assistant's messages",
+        "A direct image link. Blank uses the bot's avatar.",
+        False,
+    ),
+)
+
+assert len(SETUP_FIELDS) <= 5, "a modal holds at most 5 components"
+for _key, _label, _description, _required in SETUP_FIELDS:
+    assert len(_label) <= 45, f"modal label over 45 characters: {_label!r}"
+    assert len(_description) <= 100, f"modal description over 100 characters: {_description!r}"
+
+SETUP_INTRO = (
+    "This walks through everything needed to make this assistant yours. It takes "
+    "about a minute, and nothing is saved until you submit each step."
+)
+
+SETUP_START_LABEL = "Start setup"
+
+# Step two. Channels cannot go in the modal — Discord gives no channel picker
+# inside one, and asking somebody to paste a channel id is exactly the kind of
+# thing this wizard exists to avoid.
+SETUP_CHANNEL_PROMPT = (
+    "Now pick where staff notifications go. Both are optional — skip and the "
+    "relevant features simply stay quiet until you set them later."
+)
+
+
+class SetupModal(discord.ui.Modal):
+    """Step one: the identity settings, as one form.
+
+    Every field is pre-filled with what is currently in force, so this doubles
+    as a way to see the current configuration, and leaving one untouched keeps
+    it rather than clearing it.
+    """
+
+    def __init__(self, cog: "NorwegianSupport"):
+        super().__init__(title="Set up your assistant", timeout=900)
+        self.cog = cog
+        self.inputs: typing.List[typing.Tuple[str, discord.ui.TextInput]] = []
+
+        for key, label, description, required in SETUP_FIELDS:
+            setting = SETTINGS[key]
+            current = cog.setting(key)
+            field = discord.ui.TextInput(
+                default=str(current) if current else None,
+                required=required,
+                max_length=int(setting.maximum) if setting.maximum else 200,
+            )
+            # Wrapped in a Label rather than passing `label=` to the TextInput,
+            # which discord.py deprecates and which has nowhere to put the
+            # explanatory line.
+            self.add_item(discord.ui.Label(text=label, description=description, component=field))
+            self.inputs.append((key, field))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.apply_setup(interaction, self.inputs)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error("Setup modal failed for %s.", interaction.user, exc_info=error)
+        with contextlib.suppress(discord.HTTPException):
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Sorry, that could not be saved. Please try again.", ephemeral=True
+                )
+
+
+class _OwnedView(discord.ui.View):
+    """A view only the person who ran the command may touch.
+
+    Setup writes configuration, so a passing admin clicking someone else's
+    half-finished wizard should not be able to complete it for them.
+    """
+
+    def __init__(self, cog: "NorwegianSupport", user_id: int, timeout: float = 900):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_message(
+                "This setup was started by someone else. Run the command yourself to configure it.",
+                ephemeral=True,
+            )
+        return False
+
+
+class SetupStartView(_OwnedView):
+    """The button that opens the modal.
+
+    A modal can only be opened in response to an interaction, and a prefix
+    command is not one, so the wizard opens with a button rather than going
+    straight to the form.
+    """
+
+    @discord.ui.button(label=SETUP_START_LABEL, style=discord.ButtonStyle.primary, emoji="\N{GEAR}")
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetupModal(self.cog))
+
+
+class SetupChannelView(_OwnedView):
+    """Step two: the two staff channels, as real channel pickers."""
+
+    def __init__(self, cog: "NorwegianSupport", user_id: int):
+        super().__init__(cog, user_id)
+        self.chosen: typing.Dict[str, int] = {}
+
+        self.staff = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder="Staff notifications — alerts and the weekly summary",
+            min_values=0,
+            max_values=1,
+        )
+        self.staff.callback = self._pick("staffchannel", self.staff)
+        self.add_item(self.staff)
+
+        self.partnership = discord.ui.ChannelSelect(
+            channel_types=[discord.ChannelType.text],
+            placeholder="Partnership applications (optional)",
+            min_values=0,
+            max_values=1,
+        )
+        self.partnership.callback = self._pick("partnershipchannel", self.partnership)
+        self.add_item(self.partnership)
+
+    def _pick(self, key: str, select: discord.ui.ChannelSelect):
+        """Remember a choice without saving it, so both land together on Done."""
+
+        async def callback(interaction: discord.Interaction):
+            if select.values:
+                self.chosen[key] = select.values[0].id
+            else:
+                self.chosen.pop(key, None)
+            await interaction.response.defer()
+
+        return callback
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success, row=2)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.finish_setup(interaction, self.chosen, self)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, row=2)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.finish_setup(interaction, {}, self)
 
 
 class PartnershipModal(discord.ui.Modal):
@@ -1793,6 +1982,7 @@ class NorwegianSupport(commands.Cog):
 
         # Settings arrive after the cog is added, so the decorators' own
         # `hidden` values are whatever the class declared. Reconcile them now.
+        self._apply_command_name()
         self._apply_devmode_visibility()
         self._check_catalogue()
 
@@ -1808,8 +1998,79 @@ class NorwegianSupport(commands.Cog):
         Always the primary name, never the alias someone happened to type, so
         the help text teaches one name rather than echoing whichever legacy one
         is still in muscle memory.
+
+        Read from the registered command rather than from the setting, so that
+        if a rename ever fails to apply this prints what actually works instead
+        of what was asked for.
         """
-        return f"{self.bot.prefix}{GROUP_NAME}{' ' + sub if sub else ''}"
+        group = self._registered_group()
+        name = group.name if group is not None else str(self.setting("commandname"))
+        return f"{self.bot.prefix}{name}{' ' + sub if sub else ''}"
+
+    def _registered_group(self):
+        """This plugin's command group as the bot holds it, under any name.
+
+        Found by identity rather than by name, because the name is exactly the
+        thing that changes — looking it up by the name we expect would fail in
+        precisely the case this exists for.
+        """
+        wanted = getattr(type(self).ai, "callback", None)
+        for command in self.bot.commands:
+            if getattr(command, "callback", None) is wanted:
+                return command
+        return None
+
+    def _desired_aliases(self, primary: str) -> typing.List[str]:
+        """Every other name the group answers to.
+
+        The built-in names stay registered even when `legacyaliases` is off, so
+        typing an old one gets the explanation in `_alias_allowed` rather than
+        Discord's silence about an unknown command.
+        """
+        return [name for name in (GROUP_NAME, *LEGACY_ALIASES) if name != primary]
+
+    def _apply_command_name(self) -> None:
+        """Re-register the group under the configured name.
+
+        discord.py fixes a command's name at import, so renaming means removing
+        it from the bot and adding it back. Done defensively: a name already
+        taken by another command would raise out of `add_command` and leave this
+        plugin unreachable entirely, so the old name is restored on any failure.
+        """
+        group = self._registered_group()
+        if group is None:
+            logger.debug("Command group is not registered yet; rename not applied.")
+            return
+
+        desired = str(self.setting("commandname")).strip().lower()
+        aliases = self._desired_aliases(desired)
+        if group.name == desired and list(group.aliases) == aliases:
+            return
+
+        clash = self.bot.get_command(desired)
+        if clash is not None and clash is not group:
+            logger.error(
+                "Cannot rename to %r: %r is already a command. Staying as %r.",
+                desired,
+                desired,
+                group.name,
+            )
+            return
+
+        previous_name, previous_aliases = group.name, list(group.aliases)
+        self.bot.remove_command(previous_name)
+        group.name = desired
+        group.aliases = aliases
+        try:
+            self.bot.add_command(group)
+        except Exception:
+            logger.error("Renaming to %r failed; restoring %r.", desired, previous_name, exc_info=True)
+            group.name, group.aliases = previous_name, previous_aliases
+            with contextlib.suppress(Exception):
+                self.bot.add_command(group)
+            return
+
+        logger.info("Command group is now %r (aliases: %s).", desired, ", ".join(aliases) or "none")
 
     async def set_setting(self, key: str, value: typing.Any) -> None:
         """Store a setting and update the cache.
@@ -3559,7 +3820,7 @@ class NorwegianSupport(commands.Cog):
     def _visible_categories(self):
         """Categories with at least one command worth showing, in order."""
         for key, label, blurb, entries in COMMAND_CATEGORIES:
-            visible = [e for e in entries if self._command_visible(e[0])]
+            visible = [e for e in entries if self._command_listed(e[0])]
             if visible:
                 yield key, label, blurb, visible
 
@@ -3588,7 +3849,7 @@ class NorwegianSupport(commands.Cog):
     def _category_embed(self, category) -> typing.Optional[discord.Embed]:
         """One category's commands, or None when nothing in it is visible."""
         key, label, blurb, entries = category
-        visible = [e for e in entries if self._command_visible(e[0])]
+        visible = [e for e in entries if self._command_listed(e[0])]
         if not visible:
             return None
 
@@ -3616,20 +3877,29 @@ class NorwegianSupport(commands.Cog):
             color=self.bot.error_color,
         )
 
-    def _command_visible(self, name: str) -> bool:
-        """Whether a command is listed — and, for dev tools, whether it runs.
+    def _command_listed(self, name: str) -> bool:
+        """Whether a command appears in the menu and in Modmail's help.
 
-        Developer commands are listed only while devmode is on, with one
-        exception: a tool that is currently *running* stays listed however
-        devmode is set. Otherwise `verbose` could sit there writing message
-        content to the log with nothing on screen admitting it — and, since this
-        also governs execution, with no way to reach the command to turn it off.
+        Purely devmode. Nothing else may put a developer command on screen —
+        an earlier version kept a *running* one listed as a safety net, which
+        meant the Developer heading appeared with one entry under it whenever
+        verbose happened to be on. A category that exists sometimes is worse
+        than one that is honestly absent; the "verbose is on" warning belongs in
+        `.ai status`, where it now is, not in the command menu.
         """
-        if name not in DEV_COMMANDS:
+        return name not in DEV_COMMANDS or bool(self.setting("devmode"))
+
+    def _command_runnable(self, name: str) -> bool:
+        """Whether a command may execute.
+
+        Looser than `_command_listed` in two places, both about not stranding
+        somebody. `devmode` is how you turn devmode back on. And a developer
+        toggle that is currently *on* stays runnable however devmode is set,
+        because otherwise turning verbose off would need devmode turned on
+        first, purely to reach a command that is already running.
+        """
+        if name in ALWAYS_RUNNABLE or self._command_listed(name):
             return True
-        if self.setting("devmode"):
-            return True
-        # A dev command that is also a stored toggle, and is currently on.
         return bool(name in SETTINGS and self._settings.get(name))
 
     @ai.command(name="status")
@@ -3706,10 +3976,8 @@ class NorwegianSupport(commands.Cog):
         )
 
         # What it is doing for users, in the same words `.ai features` uses.
-        on_now = [f.key for f in FEATURE_SETTINGS if self.setting(f.key) and self._command_visible(f.key)]
-        off_now = [
-            f.key for f in FEATURE_SETTINGS if not self.setting(f.key) and self._command_visible(f.key)
-        ]
+        on_now = [f.key for f in FEATURE_SETTINGS if self.setting(f.key) and self._command_listed(f.key)]
+        off_now = [f.key for f in FEATURE_SETTINGS if not self.setting(f.key) and self._command_listed(f.key)]
         embed.add_field(
             name="Features",
             value=(
@@ -3761,6 +4029,16 @@ class NorwegianSupport(commands.Cog):
     def _plain_problems(self) -> typing.List[str]:
         """Everything wrong that an admin can actually fix, in plain words."""
         problems = []
+
+        # Verbose is hidden from the menu while devmode is off, so this is the
+        # only place it can admit to being on. It writes message content to the
+        # bot log, which is not on the deletion path the privacy policy
+        # describes, so leaving it running by accident matters.
+        if self.setting("verbose"):
+            problems.append(
+                "Developer logging is on, and is writing the contents of people's messages "
+                f"to the bot log. Turn it off with `{self._cmd('verbose')} off`."
+            )
 
         if self._home_guild() is None:
             problems.append(
@@ -4549,6 +4827,8 @@ class NorwegianSupport(commands.Cog):
 
         if value.strip().lower() in ("default", "reset", "clear"):
             await self.clear_setting(key)
+            if key in ("commandname", "legacyaliases"):
+                self._apply_command_name()
             logger.info("%s reset setting %s to its default.", ctx.author, key)
             return await ctx.send(
                 embed=self._embed(
@@ -4569,6 +4849,8 @@ class NorwegianSupport(commands.Cog):
             )
 
         await self.set_setting(key, parsed)
+        if key in ("commandname", "legacyaliases"):
+            self._apply_command_name()
         logger.info("%s set %s to %r.", ctx.author, key, parsed)
 
         embed = self._embed(
@@ -4747,7 +5029,7 @@ class NorwegianSupport(commands.Cog):
         for setting in FEATURE_SETTINGS:
             # A developer tool is hidden here on the same rule as in the command
             # list, so the two never disagree about what exists.
-            if not self._command_visible(setting.key):
+            if not self._command_listed(setting.key):
                 continue
             enabled = bool(self.setting(setting.key))
             embed.add_field(
@@ -4756,6 +5038,160 @@ class NorwegianSupport(commands.Cog):
                 inline=False,
             )
         return embed
+
+    @ai.command(name="setup", hidden=True)
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_setup(self, ctx):
+        """Walk through first-run configuration, one step at a time."""
+        embed = self._embed(
+            title="Set up your assistant",
+            description=SETUP_INTRO,
+        )
+        embed.add_field(
+            name="Step 1 — who you are",
+            value=(
+                "The command name, your organisation's name, what the assistant calls "
+                "itself, your privacy policy link, and an icon."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Step 2 — where staff are told things",
+            value="The channels for alerts, the weekly summary, and partnership applications.",
+            inline=False,
+        )
+        embed.add_field(
+            name="Afterwards",
+            value=(
+                f"Everything here, and more besides, stays changeable with "
+                f"`{self._cmd('set')}`. Optional behaviour is in `{self._cmd('features')}`.\n\n"
+                f"The one thing this cannot do for you is the API key: that belongs in "
+                f"`.env` as `GROQ_API_KEY`, because it is a secret rather than a setting."
+            ),
+            inline=False,
+        )
+        await ctx.send(embed=embed, view=SetupStartView(self, ctx.author.id))
+
+    async def apply_setup(
+        self,
+        interaction: discord.Interaction,
+        inputs: typing.List[typing.Tuple[str, discord.ui.TextInput]],
+    ) -> None:
+        """Save step one, then offer step two.
+
+        Each field is validated on its own and a bad one is reported by name.
+        Rejecting the whole form because one link was mistyped would make
+        somebody re-enter four things they got right.
+        """
+        saved: typing.List[str] = []
+        problems: typing.List[str] = []
+        rename = False
+
+        for key, field in inputs:
+            setting = SETTINGS[key]
+            raw = (field.value or "").strip()
+
+            if not raw:
+                # Blank on an optional field means "back to the default" — for
+                # the icon that is the bot's own avatar, which is a real answer
+                # rather than an omission.
+                if self._setting_source(key) == "set":
+                    await self.clear_setting(key)
+                    saved.append(f"`{key}` — back to the default")
+                    rename = rename or key == "commandname"
+                continue
+
+            try:
+                parsed = setting.parse(raw, interaction.guild)
+            except ValueError as e:
+                problems.append(f"**{key}** — {e}")
+                continue
+
+            if parsed == self.setting(key):
+                continue
+
+            await self.set_setting(key, parsed)
+            saved.append(f"`{key}` → {setting.render(parsed)}")
+            rename = rename or key == "commandname"
+
+        if rename:
+            self._apply_command_name()
+
+        embed = self._embed(
+            title="Step 1 saved" if not problems else "Step 1 — mostly saved",
+            description=(
+                "\n".join(saved) if saved else "Nothing changed — everything was already set that way."
+            ),
+            color=self.bot.error_color if problems else None,
+        )
+        if problems:
+            embed.add_field(
+                name="Not saved",
+                value="\n".join(problems) + f"\n\nFix these with `{self._cmd('set')}`, or run setup again.",
+                inline=False,
+            )
+        embed.add_field(name="Step 2 — staff channels", value=SETUP_CHANNEL_PROMPT, inline=False)
+
+        logger.info("Setup step 1 by %s: %s saved, %s rejected.", interaction.user, len(saved), len(problems))
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_message(
+                embed=embed, view=SetupChannelView(self, interaction.user.id)
+            )
+
+    async def finish_setup(
+        self,
+        interaction: discord.Interaction,
+        chosen: typing.Dict[str, int],
+        view: discord.ui.View,
+    ) -> None:
+        """Save step two and show what is left to do."""
+        saved = []
+        for key, channel_id in chosen.items():
+            await self.set_setting(key, channel_id)
+            saved.append(f"`{key}` → <#{channel_id}>")
+
+        view.stop()
+        # Clearing the pickers is cosmetic, and `interaction.message` is only
+        # populated for component interactions — an AttributeError here would
+        # take the completion message down with it, which is the one part of
+        # this the user actually needs.
+        if interaction.message is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.message.edit(view=None)
+
+        embed = self._embed(
+            title="Setup complete",
+            description=(
+                "\n".join(saved)
+                if saved
+                else "No channels changed — the features that use them stay quiet until you set one."
+            ),
+        )
+
+        problems = self._plain_problems()
+        embed.add_field(
+            name="Still to do" if problems else "Nothing left to do",
+            value=(
+                "\n".join(f"\N{WARNING SIGN} {p}" for p in problems[:5])
+                if problems
+                else f"Run `{self._cmd('status')}` any time to check on it."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Where things live now",
+            value=(
+                f"`{self._cmd()}` — everything, by category\n"
+                f"`{self._cmd('set')}` — settings with a value\n"
+                f"`{self._cmd('features')}` — optional behaviour on and off\n"
+                f"`{self._cmd('status')}` — is it working"
+            ),
+            inline=False,
+        )
+
+        logger.info("Setup finished by %s; %s channel(s) set.", interaction.user, len(saved))
+        with contextlib.suppress(discord.HTTPException):
+            await interaction.response.send_message(embed=embed)
 
     @ai.command(name="devmode", hidden=True)
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
@@ -4817,7 +5253,7 @@ class NorwegianSupport(commands.Cog):
 
         for command in group.commands:
             if command.name in DEV_COMMANDS:
-                command.hidden = not self._command_visible(command.name)
+                command.hidden = not self._command_listed(command.name)
 
     def _check_catalogue(self) -> None:
         """Warn if the menu and the real commands have drifted apart.
@@ -4861,14 +5297,17 @@ class NorwegianSupport(commands.Cog):
         return await self._devmode_allowed(ctx)
 
     async def _alias_allowed(self, ctx) -> bool:
-        """Refuse a legacy alias when this install has turned them off."""
+        """Refuse a non-primary name when this install has turned them off."""
         if self.setting("legacyaliases"):
             return True
 
-        # For `.vlg set`, the alias is in invoked_parents; for a bare `.vlg` it
-        # is invoked_with. Either way it is the name the group was reached by.
+        group = self._registered_group()
+        primary = group.name if group is not None else str(self.setting("commandname"))
+
+        # For `.vlg set`, the name used is in invoked_parents; for a bare `.vlg`
+        # it is invoked_with. Either way it is how the group was reached.
         used = (ctx.invoked_parents[0] if ctx.invoked_parents else ctx.invoked_with) or ""
-        if used.lower() not in {a.lower() for a in LEGACY_ALIASES}:
+        if used.lower() == primary.lower():
             return True
 
         with contextlib.suppress(discord.HTTPException):
@@ -4893,7 +5332,7 @@ class NorwegianSupport(commands.Cog):
         much of a gate; this is the part that means anything.
         """
         name = getattr(ctx.command, "name", "")
-        if name in ALWAYS_RUNNABLE or self._command_visible(name):
+        if self._command_runnable(name):
             return True
 
         with contextlib.suppress(discord.HTTPException):
