@@ -130,8 +130,40 @@ Three sections, all set in `.ai setup` and editable afterwards:
 .ai knowledge pricing clear                empty a section
 ```
 
-Each section caps at 1900 characters (900 for `neveranswer`) so a whole section
-fits in one Discord message; `add` is how it grows past a single sitting.
+### How much it can hold
+
+**30,000 characters in total**, shared across all three sections. That is a
+budget, not a cap on each — what costs anything is the whole lot going into the
+prompt on every request, so limiting each section separately would be three
+times the number it looks like.
+
+For scale, 30,000 characters is a substantial FAQ: several hundred facts, or
+roughly fifteen pages of plain text. It is about 7,500 tokens, which leaves the
+model plenty of room for the conversation and its reply.
+
+`.ai knowledge` shows what you have used in its footer, and the setup wizard
+shows it as you type.
+
+Going over is refused, not truncated, and the message says how much is used and
+by which section — because "too long" is unhelpful when the section that filled
+the budget is a different one from the one you are editing.
+
+```
+.ai knowledge pricing clear     free up a section
+.ai knowledge                   see what is used
+```
+
+### Entering more than one message will hold
+
+A single Discord message stops at 2000 characters, so `.ai setup` collects each
+knowledge section across **as many messages as you want** — send them one after
+another and say **done** when you have finished. `.ai knowledge add` appends a
+line at a time afterwards.
+
+Reading it back: `.ai knowledge` shows the start of each section inline, and
+attaches any long section as a `.txt` file so you can check the whole thing.
+Knowledge you cannot read back is knowledge you cannot check, which matters more
+here than anywhere else — every line of it gets stated to a user as fact.
 
 ### Why this is not raw prompt editing
 
