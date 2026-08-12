@@ -130,36 +130,40 @@ Three sections, all set in `.ai setup` and editable afterwards:
 .ai knowledge pricing clear                empty a section
 ```
 
-### There is no length limit
+### How much it can hold
 
-Sections are unbounded. Put in as much as your business actually needs.
+**30,000 characters in total**, shared across all three sections. That is a
+budget, not a cap on each — what costs anything is the whole lot going into the
+prompt on every request, so limiting each section separately would be three
+times the number it looks like.
 
-`.ai setup` collects a section across **as many messages as you want** — send
-them one after another and say **done** when you have finished — because a
-single Discord message stops at 2000 characters and an FAQ does not. `.ai
-knowledge add` appends a line at a time afterwards.
+For scale, 30,000 characters is a substantial FAQ: several hundred facts, or
+roughly fifteen pages of plain text. It is about 7,500 tokens, which leaves the
+model plenty of room for the conversation and its reply.
+
+`.ai knowledge` shows what you have used in its footer, and the setup wizard
+shows it as you type.
+
+Going over is refused, not truncated, and the message says how much is used and
+by which section — because "too long" is unhelpful when the section that filled
+the budget is a different one from the one you are editing.
+
+```
+.ai knowledge pricing clear     free up a section
+.ai knowledge                   see what is used
+```
+
+### Entering more than one message will hold
+
+A single Discord message stops at 2000 characters, so `.ai setup` collects each
+knowledge section across **as many messages as you want** — send them one after
+another and say **done** when you have finished. `.ai knowledge add` appends a
+line at a time afterwards.
 
 Reading it back: `.ai knowledge` shows the start of each section inline, and
 attaches any long section as a `.txt` file so you can check the whole thing.
 Knowledge you cannot read back is knowledge you cannot check, which matters more
 here than anywhere else — every line of it gets stated to a user as fact.
-
-**What is real, and reported rather than enforced:** all of it is sent to the
-model on *every single request*. So more knowledge means every reply costs a
-little more and takes a little longer, and past a point it will not fit in the
-model's context at all — at which point requests fail and every message goes to
-a human.
-
-The plugin tells you where you stand rather than picking a limit for you:
-
-| Roughly | What happens |
-|---|---|
-| under a quarter of the context window | nothing said |
-| a quarter to 60% | `.ai knowledge` notes the size and suggests trimming |
-| over 60% | listed under *Needs attention* in `.ai status` |
-
-Nothing is ever refused for being too long. If you want 100,000 characters of
-knowledge, you can have it — you will just be told what it costs.
 
 ### Why this is not raw prompt editing
 

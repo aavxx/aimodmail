@@ -19,7 +19,7 @@ normal ticket.
 - **Answers from your knowledge, and nothing else.** Anything not covered goes
   to a human. A missing fact costs you one handoff; an invented one gets stated
   to a customer as though it were true, so the assistant is built to prefer the
-  former. There is no limit on how much you can give it.
+  former. You can give it up to 30,000 characters of knowledge.
 - **Asks before handing over.** The user is offered a human rather than being
   transferred silently, and the assistant's own reply goes out first.
 - **Summarises the conversation** for whoever picks up the ticket, and gives the
