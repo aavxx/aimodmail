@@ -66,6 +66,7 @@ it:
 | Settings | `.ai set` | Administrator | Names, channels, timings, anything with a value |
 | Settings | `.ai features` | Administrator | Turn optional parts on and off |
 | Reports | `.ai stats` | Supporter | How often it answers, and what it gets stuck on |
+| Reports | `.ai stats reset` | Administrator | Wipe those numbers and start counting again |
 | Reports | `.ai digest` | Supporter | Send the weekly summary to staff now |
 | User data | `.ai forget @user` | Supporter | Delete everything stored about one person |
 | User data | `.ai training [n]` | Supporter | Chats people agreed could be kept |
@@ -187,18 +188,43 @@ things guard it:
 None of that makes a wrong fact safe. It makes a wrong fact *yours*, entered
 deliberately, and visible in `.ai knowledge`.
 
-### The built-in example
+### It ships empty
 
-The plugin ships with the original install's airline facts as the default. On any
-other install those are confidently wrong answers waiting to happen, so as soon
-as `brandname` says this is a different organisation, `.ai status` reports it as
-the first thing needing attention, and `.ai knowledge` says so at the top.
+There is deliberately no sample knowledge. A plausible-looking example that
+somebody forgot to replace would be stated to their users as fact, which is
+worse than an assistant that starts out knowing nothing and says so.
 
-The first `.ai knowledge add` on an unconfigured install **replaces** the example
-rather than appending to it — adding your own fact to somebody else's airline is
-worse than either alone.
+Empty means every question goes to a human — safe, but not the job it was
+installed for — so `.ai status` lists it under *Needs attention* and
+`.ai knowledge` says so at the top until `.ai setup` fills it in.
 
-### Developer mode### Developer mode
+### Resetting the numbers
+
+```
+.ai stats reset
+```
+
+Deletes the records `.ai stats` and the weekly digest are counted from, so both
+start again from zero. It asks first, shows exactly what will go, and cannot be
+undone.
+
+**Administrator**, where `.ai stats` itself is Supporter — reading the numbers
+and destroying them are different acts.
+
+Deliberately narrow. It removes finished conversations and survey answers, and
+nothing else:
+
+| Kept | Why |
+|---|---|
+| Conversations kept for training | Not a statistic — somebody was asked and said yes |
+| Ticket references | How a real ticket is found again later |
+| Conversations happening right now | Deleting one restarts that person's chat mid-sentence |
+| Settings and knowledge | Nothing to do with the numbers |
+
+If you want the training set gone too, that is `.ai forget` per user, which is
+also what an erasure request needs.
+
+### Developer mode
 
 `.ai devmode` toggles. It takes no arguments — run it again to turn it back off.
 
@@ -608,7 +634,7 @@ boolean:
 | status | what happens |
 |---|---|
 | `answered` | Reply sent, conversation continues, no thread. |
-| `chat` | Thanks, greetings, small talk. Answered warmly, no airline fact involved, no agent offered. |
+| `chat` | Thanks, greetings, small talk. Answered warmly, no reference fact involved, no agent offered. |
 | `unclear` | It did not understand. The reply asks them to rephrase. Only after `MAX_CONSECUTIVE_UNCLEAR` (2) in a row is an agent offered. |
 | `escalate` | It understood and needs a person. |
 

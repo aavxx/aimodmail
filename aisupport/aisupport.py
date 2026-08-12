@@ -1283,6 +1283,7 @@ COMMAND_CATEGORIES = (
         "How well it is doing.",
         (
             ("stats", "How often the assistant answers, and what it keeps getting stuck on.", False),
+            ("stats reset", "Wipe those numbers and start counting again.", False),
             ("digest", "Send the weekly summary to your staff channel right now.", False),
         ),
     ),
@@ -4761,7 +4762,7 @@ class AISupport(commands.Cog):
         embed.set_footer(text="No history replayed, so this is a first message. Nothing was stored.")
         await ctx.send(embed=embed)
 
-    @ai.command(name="stats")
+    @ai.group(name="stats", invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def ai_stats(self, ctx):
         """How the assistant is doing, and what it keeps failing to answer."""
@@ -4822,6 +4823,142 @@ class AISupport(commands.Cog):
 
         embed.set_footer(text="Add FAQ entries for what shows up here; each one removes a handoff.")
         await ctx.send(embed=embed)
+
+    @ai_stats.command(name="reset", aliases=["clear"])
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_stats_reset(self, ctx):
+        """Delete the records the numbers are counted from. Cannot be undone.
+
+        ADMINISTRATOR rather than the SUPPORTER that `stats` itself takes:
+        reading the numbers and destroying them are different acts.
+        """
+        counts = await self._stats_record_counts()
+        if counts is None:
+            return await ctx.send(
+                embed=self._embed(
+                    description="Could not read the stored records, so nothing was changed.",
+                    color=self.bot.error_color,
+                )
+            )
+        if not sum(counts.values()):
+            return await ctx.send(
+                embed=self._embed(description="There are no stats to reset.", color=self.bot.error_color)
+            )
+
+        embed = self._embed(
+            title="Reset all stats?",
+            description=(
+                "This permanently deletes the records `stats` and the weekly digest are "
+                "counted from. **It cannot be undone.**"
+            ),
+            color=self.bot.error_color,
+        )
+        embed.add_field(
+            name="Will be deleted",
+            value=(
+                f"**{counts['transcripts']:,}** finished conversation(s)\n"
+                f"**{counts['surveys']:,}** survey answer(s)"
+            ),
+            inline=False,
+        )
+        # Named explicitly, because "reset all stats" sounds like it might take
+        # these too, and finding out afterwards would be too late.
+        embed.add_field(
+            name="Will be kept",
+            value=(
+                "Conversations people agreed could be kept to improve the assistant\n"
+                "Ticket references, so `ticket` still resolves them\n"
+                "Conversations happening right now\n"
+                "Every setting, and everything the assistant knows"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="This choice times out after 60 seconds and does nothing")
+
+        yes_emoji, no_emoji = self._button_emoji()
+        view = YesNoView(timeout=60).with_choices(yes_emoji, no_emoji)
+        prompt = await ctx.send(embed=embed, view=view)
+        await view.wait()
+
+        with contextlib.suppress(discord.HTTPException):
+            await prompt.edit(view=None)
+
+        if not view.value:
+            return await ctx.send(
+                embed=self._embed(
+                    description=(
+                        "Timed out, nothing deleted." if view.value is None else "Cancelled, nothing deleted."
+                    ),
+                )
+            )
+
+        try:
+            deleted = await self._reset_stats()
+        except Exception as e:
+            logger.error("Resetting stats failed.", exc_info=True)
+            return await ctx.send(
+                embed=self._embed(
+                    title="Reset failed",
+                    description=f"Nothing may have been deleted, or only some of it: `{e}`",
+                    color=self.bot.error_color,
+                )
+            )
+
+        logger.info(
+            "%s reset stats: %s transcript(s), %s survey answer(s).",
+            ctx.author,
+            deleted["transcripts"],
+            deleted["surveys"],
+        )
+        await ctx.send(
+            embed=self._embed(
+                title="Stats reset",
+                description=(
+                    f"Deleted **{deleted['transcripts']:,}** conversation(s) and "
+                    f"**{deleted['surveys']:,}** survey answer(s).\n\n"
+                    f"`{self._cmd('stats')}` now counts from here."
+                ),
+            )
+        )
+
+    async def _stats_record_counts(self) -> typing.Optional[typing.Dict[str, int]]:
+        """How many records a reset would remove. None if they cannot be read."""
+        try:
+            return {
+                "transcripts": await self.db.count_documents(self._finished_transcript_filter()),
+                "surveys": await self.db.count_documents({"_type": TYPE_SURVEY}),
+            }
+        except Exception:
+            logger.error("Could not count the records behind stats.", exc_info=True)
+            return None
+
+    @staticmethod
+    def _finished_transcript_filter() -> dict:
+        """Transcripts a reset may delete: everything except live conversations.
+
+        A chat happening right now has its transcript open, and deleting it
+        underneath the user would silently restart their conversation — they
+        would be greeted again mid-sentence. The handful still open barely move
+        the numbers, so they are left alone.
+        """
+        return {
+            "_type": TYPE_TRANSCRIPT,
+            "$or": [{"closed_at": {"$ne": None}}, {"handed_off_at": {"$ne": None}}],
+        }
+
+    async def _reset_stats(self) -> typing.Dict[str, int]:
+        """Delete the records stats are counted from.
+
+        Deliberately narrow. The consented training set is not a statistic — it
+        was kept because somebody was asked and said yes — and ticket references
+        are how a real ticket is found later. Neither is touched.
+        """
+        transcripts = await self.db.delete_many(self._finished_transcript_filter())
+        surveys = await self.db.delete_many({"_type": TYPE_SURVEY})
+        return {
+            "transcripts": getattr(transcripts, "deleted_count", 0),
+            "surveys": getattr(surveys, "deleted_count", 0),
+        }
 
     @staticmethod
     def _faq_gaps(transcripts: typing.List[dict]) -> dict:
@@ -5833,7 +5970,13 @@ class AISupport(commands.Cog):
         if group is None or not hasattr(group, "commands"):
             return
 
-        real = {c.name for c in group.commands}
+        # Nested groups matter: `stats reset` lives under `stats`, so a flat
+        # sweep of the top level would report it as advertised but missing.
+        real = set()
+        for command in group.commands:
+            real.add(command.name)
+            for nested in getattr(command, "commands", ()):
+                real.add(f"{command.name} {nested.name}")
         advertised = set(ALL_LISTED_COMMANDS)
 
         missing = advertised - real
