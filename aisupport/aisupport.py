@@ -18,6 +18,7 @@ per plugin, so two installs of this plugin never share anything.
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import hmac
 import io
@@ -487,6 +488,12 @@ BUTTON_NO_FALLBACK = "\N{CROSS MARK}"
 # something behind for the edit to keep.
 BUTTON_SPACER = "\N{ZERO WIDTH SPACE}"
 
+# Discord's own caps on one embed, minus a margin. Going over is not a
+# truncated message but a rejected one, so anything that builds a list of
+# unknown length pages against these rather than trusting it will fit.
+EMBED_FIELD_LIMIT = 24
+EMBED_SIZE_LIMIT = 5500
+
 # Matches the id out of "<:name:1234>" / "<a:name:1234>".
 _CUSTOM_EMOJI_RE = re.compile(r"^<a?:\w+:(\d+)>$")
 
@@ -643,7 +650,17 @@ PARTNERSHIP_BUTTON_ID = "aisupport-partnership"
 PARTNERSHIP_BUTTON_LABEL = "Request a partnership"
 PARTNERSHIP_MODAL_TITLE = "Partnership request"
 
+# The title on a posted application. Also how the reaction listener recognises
+# one: a claim or a decision must never act on some other embed that happens to
+# be in the same channel, which is a real possibility on an install that points
+# `partnershipchannel` and `staffchannel` at the same place. Unchanged from the
+# first version, so posts made before this check still match it.
+PARTNERSHIP_POST_TITLE = "Partnership request"
+
 # (label, paragraph?, max length). Labels are capped at 45 characters by Discord.
+# The standard application, used until `.ai setup` replaces it with a list of
+# your own. Five questions because that is Discord's cap on a modal, and because
+# these are what a human would ask anyway.
 PARTNERSHIP_QUESTIONS = [
     ("Your group's name", False, 100),
     ("Your group's invite", False, 200),
@@ -651,6 +668,97 @@ PARTNERSHIP_QUESTIONS = [
     ("What benefits do you see in this partnership?", True, 1000),
     ("What are your expectations from us?", True, 1000),
 ]
+
+# A modal holds five components and no more, so five is a hard ceiling rather
+# than a preference: a sixth question could not be shown at all.
+PARTNERSHIP_MAX_QUESTIONS = 5
+
+# How long one custom question may be. Discord caps a field *label* at 45, which
+# is shorter than a real question often is, so the full text is kept and the
+# label is shortened — see `_partnership_fields`.
+PARTNERSHIP_QUESTION_MAX = 200
+PARTNERSHIP_LABEL_MAX = 45
+
+# How much a custom question may be answered with. Every custom question is a
+# paragraph box, because nothing here knows which ones want a one-liner.
+PARTNERSHIP_ANSWER_MAX = 1000
+
+# Leading "1.", "2)", "-", "*" and similar. Stripped so the numbered list
+# somebody types in setup is stored as the questions themselves rather than as
+# questions with their own numbering baked in — the form renumbers them.
+_QUESTION_NUMBER_RE = re.compile(r"^\s*(?:\d{1,2}\s*[.):\]-]|[-*\u2022])\s*")
+
+# Finds the markers in a numbered list that arrived on a single line, e.g.
+# "1. A 2. B". Tried only when there are no line breaks to split on, and only
+# accepted when the markers run 1, 2, 3… from the very start of the line — see
+# `_split_inline_questions`.
+_QUESTION_INLINE_RE = re.compile(r"(?:^|\s)(\d{1,2})\s*[.)]\s+")
+
+
+def _split_inline_questions(line: str) -> typing.Optional[typing.List[str]]:
+    """A single line read as a numbered list, or None if it is not one.
+
+    A question can perfectly well contain "2." in the middle of it — "how many
+    members do you have? Over 2. Say so" — so splitting on every number would
+    tear real questions in half. The guard is that a genuine list starts at the
+    beginning of the line with 1 and counts up without gaps; anything else is
+    treated as one question, which is the safe way to be wrong.
+    """
+    marks = list(_QUESTION_INLINE_RE.finditer(line))
+    if len(marks) < 2 or marks[0].start() != 0:
+        return None
+    if [int(m.group(1)) for m in marks] != list(range(1, len(marks) + 1)):
+        return None
+
+    parts = []
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(line)
+        parts.append(line[mark.end() : end].strip())
+    return [p for p in parts if p] or None
+
+
+def parse_partnership_questions(raw: str) -> typing.List[str]:
+    """Read a numbered list of questions, or raise ValueError.
+
+    Accepts what a person actually types: one per line, numbered or not, with
+    or without bullets, and — when there are no line breaks — a single line of
+    "1. ... 2. ..." as well. The ValueError text is shown to whoever typed it,
+    so it says what a good answer looks like.
+    """
+    lines = [line for line in (raw or "").splitlines() if line.strip()]
+    if len(lines) == 1:
+        inline = _split_inline_questions(lines[0].strip())
+        if inline is not None:
+            lines = inline
+
+    questions = []
+    for line in lines:
+        question = _QUESTION_NUMBER_RE.sub("", line).strip()
+        if question:
+            questions.append(question)
+
+    if not questions:
+        raise ValueError(
+            "write at least one question, numbered one per line like `1. What is your group called?`."
+        )
+    if len(questions) > PARTNERSHIP_MAX_QUESTIONS:
+        raise ValueError(
+            f"that is {len(questions)} questions, and Discord only shows "
+            f"{PARTNERSHIP_MAX_QUESTIONS} on a form. Pick the {PARTNERSHIP_MAX_QUESTIONS} that matter most."
+        )
+    too_long = next((q for q in questions if len(q) > PARTNERSHIP_QUESTION_MAX), None)
+    if too_long is not None:
+        raise ValueError(
+            f"keep each question under {PARTNERSHIP_QUESTION_MAX} characters — "
+            f"`{truncate(too_long, 60)}` is {len(too_long)}."
+        )
+    return questions
+
+
+def render_partnership_questions(questions: typing.Sequence[str]) -> str:
+    """The numbered list, written back the way it was asked for."""
+    return "\n".join(f"{index}. {question}" for index, question in enumerate(questions, start=1))
+
 
 PARTNERSHIP_THANKS = (
     "Thank you! Your application has been sent to the team. Someone will get back "
@@ -665,6 +773,30 @@ PARTNERSHIP_FAILED = (
 # Unset until `.ai setup` picks a channel. Zero resolves to nothing, which the
 # status check reports rather than letting it fail silently.
 PARTNERSHIP_CHANNEL_ID = 0
+
+# What staff react with on a posted application to accept or decline it. Both
+# are settings (`partnershipyesemoji` / `partnershipnoemoji`), because a server
+# that already has its own accept and decline marks should be able to use them.
+PARTNERSHIP_YES_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
+PARTNERSHIP_NO_EMOJI = "\N{CROSS MARK}"
+
+# DMed to the applicant when staff accept or decline. Both are settings
+# (`partnershipaccept` / `partnershipdecline`) and `.ai setup` asks for them, so
+# the wording is the server's rather than this file's. `{user}` is replaced with
+# a mention of the applicant.
+PARTNERSHIP_ACCEPTED_TEXT = (
+    "Good news, {user} — your partnership application has been **accepted**! "
+    "\N{PARTY POPPER}\n\nSomeone from the team will be in touch shortly to sort out "
+    "the details."
+)
+PARTNERSHIP_DECLINED_TEXT = (
+    "Thank you for applying, {user}. After reviewing it, we have decided not to go "
+    "ahead with a partnership at this time.\n\nThis is not a reflection on your "
+    "community, and you are welcome to apply again in the future."
+)
+
+# Written into the DM in place of `{user}` when the message uses it.
+PARTNERSHIP_USER_TOKEN = "{user}"
 
 
 # Where staff notifications land: the low-rating alert and the weekly digest.
@@ -692,9 +824,28 @@ CLAIM_EMOJI = "\N{RAISED HAND}"
 
 # The claim state lives in the post's own footer rather than in the database.
 # It is what staff read, it survives restarts for free, and there is no second
-# copy that can disagree with what the channel shows.
+# copy that can disagree with what the channel shows. The decision — accepted or
+# declined — is kept the same way, in the same footer.
+#
+# Matched by prefix rather than by equality, because the rest of the footer
+# names the current accept and decline emoji, and those are settings that can
+# change between a post going up and somebody reacting to it. The prefixes never
+# change, so a lead posted by an older version still claims and still decides.
+CLAIM_UNCLAIMED_PREFIX = "Unclaimed"
 CLAIM_UNCLAIMED_FOOTER = f"Unclaimed — react with {CLAIM_EMOJI} to take this lead"
 CLAIM_CLAIMED_PREFIX = "Claimed by "
+
+DECISION_ACCEPTED_PREFIX = "Accepted by "
+DECISION_DECLINED_PREFIX = "Declined by "
+
+# Appended to the footer when the decision was recorded but the applicant could
+# not be told — they have DMs closed, or they have left. Staff need to see that,
+# because otherwise the post reads as though the person had been notified.
+DECISION_UNDELIVERED_NOTE = " · could not DM them"
+
+# Pulls the applicant back out of a posted application. The description is
+# written as "From <@id> (`id`)", so the mention is the anchor.
+_APPLICANT_RE = re.compile(r"<@!?(\d+)>")
 
 # Obvious profanity only. Deliberately short and word-boundary anchored: a false
 # positive warns, and then closes the conversation of somebody who did nothing,
@@ -866,6 +1017,15 @@ class Setting:
             # checked here — see `_knowledge_budget_error`.
             return sanitise_knowledge(raw)
 
+        if self.kind == "questions":
+            # Stored as the numbered list it was typed as, so reading the
+            # setting back shows exactly what somebody will be asked. Empty is a
+            # real value here and means "use the standard application", which is
+            # what clearing the setting gives you.
+            if raw.lower() in {"standard", "default", "none"}:
+                return ""
+            return render_partnership_questions(parse_partnership_questions(raw))
+
         if self.kind in ("text", "url", "emoji"):
             if not raw:
                 raise ValueError("that cannot be empty.")
@@ -928,6 +1088,11 @@ class Setting:
                 return "*empty*"
             lines = len([x for x in str(value).splitlines() if x.strip()])
             return f"{len(str(value))} characters, {lines} line(s)"
+        if self.kind == "questions":
+            if not str(value).strip():
+                return f"*the standard application* ({len(PARTNERSHIP_QUESTIONS)} questions)"
+            asked = len([x for x in str(value).splitlines() if x.strip()])
+            return f"{asked} custom question{'s' if asked != 1 else ''}"
         if self.kind in ("text", "url"):
             if not value:
                 return "*unset*"
@@ -1084,6 +1249,47 @@ VALUE_SETTINGS = (
         lambda: PARTNERSHIP_CHANNEL_ID,
         "Where submitted partnership applications are posted for staff to claim.",
         example="#partnership-leads",
+    ),
+    Setting(
+        "partnershipquestions",
+        "questions",
+        lambda: "",
+        "The questions the partnership form asks, as a numbered list, one per "
+        f"line. Up to {PARTNERSHIP_MAX_QUESTIONS} — Discord shows no more on a "
+        "form. Leave unset for the standard application.",
+        example="1. What is your group called?\n2. What is your invite link?",
+    ),
+    Setting(
+        "partnershipyesemoji",
+        "emoji",
+        lambda: PARTNERSHIP_YES_EMOJI,
+        "The emoji staff react with on a posted application to accept it. The "
+        "applicant is then DMed your accept message.",
+        maximum=60,
+    ),
+    Setting(
+        "partnershipnoemoji",
+        "emoji",
+        lambda: PARTNERSHIP_NO_EMOJI,
+        "The emoji staff react with to decline an application. The applicant is "
+        "then DMed your decline message.",
+        maximum=60,
+    ),
+    Setting(
+        "partnershipaccept",
+        "text",
+        lambda: PARTNERSHIP_ACCEPTED_TEXT,
+        "What the applicant is DMed when staff accept. Write `{user}` where you "
+        "want to mention them.",
+        maximum=1500,
+    ),
+    Setting(
+        "partnershipdecline",
+        "text",
+        lambda: PARTNERSHIP_DECLINED_TEXT,
+        "What the applicant is DMed when staff decline. Same `{user}` "
+        "placeholder as above.",
+        maximum=1500,
     ),
     Setting(
         "retentiondays",
@@ -1313,6 +1519,13 @@ COMMAND_CATEGORIES = (
 DEV_COMMANDS = frozenset(name for _, _, _, entries in COMMAND_CATEGORIES for name, _, dev in entries if dev)
 
 ALL_LISTED_COMMANDS = frozenset(name for _, _, _, entries in COMMAND_CATEGORIES for name, _, _ in entries)
+
+# Real commands that are deliberately absent from the menu. Both are shorthand
+# for a `.ai knowledge <section>` spelling that is already listed, so listing
+# them again would put three entries in front of somebody for one job. They are
+# named here so `_check_catalogue` knows they are meant to be missing rather
+# than warning about them on every startup.
+UNLISTED_COMMANDS = frozenset({"pricing", "neveranswer"})
 
 CATEGORY_KEYS = tuple(key for key, _, _, _ in COMMAND_CATEGORIES)
 
@@ -1576,6 +1789,12 @@ SETUP_SKIP_WORDS = {"skip", "keep", "next", "-"}
 SETUP_CANCEL_WORDS = {"cancel", "stop", "quit", "exit", "abort"}
 SETUP_CLEAR_WORDS = {"clear", "none", "empty", "default"}
 
+# Extra clear words for one question only. "standard" means the standard
+# partnership application, and clearing the setting is exactly how you get it —
+# but it is not added to the set above, because somebody whose organisation is
+# called Standard should be able to type that at the brand name question.
+SETUP_EXTRA_CLEAR_WORDS = {"partnershipquestions": {"standard"}}
+
 # Ends a multi-message knowledge answer.
 SETUP_DONE_WORDS = {"done", "finished", "end", "that's all", "thats all"}
 
@@ -1700,8 +1919,48 @@ SETUP_STEPS = (
     SetupStep(
         "partnershipchannel",
         "Which channel should partnership applications go to?",
-        "Staff claim them there with a reaction.",
+        "Staff claim them there with a reaction, and accept or decline them with two more.",
         example="#partnerships",
+        needs="partnershipform",
+    ),
+    SetupStep(
+        "partnershipquestions",
+        "Which questions should the partnership form ask?",
+        "Write them as a numbered list, one per line. Type **standard** to use the standard "
+        f"application shown below, which is what you get if you skip this. Up to "
+        f"{PARTNERSHIP_MAX_QUESTIONS} questions — Discord shows no more than that on a form.",
+        kind="questions",
+        needs="partnershipform",
+    ),
+    SetupStep(
+        "partnershipyesemoji",
+        "Which emoji should staff react with to accept an application?",
+        "Put it on the post in your partnership channel and the applicant is DMed your accept "
+        "message. A custom emoji only works if this bot is in the server that owns it.",
+        example="\N{WHITE HEAVY CHECK MARK}",
+        needs="partnershipform",
+    ),
+    SetupStep(
+        "partnershipnoemoji",
+        "And which emoji should decline one?",
+        "Same again, but the applicant is DMed your decline message instead.",
+        example="\N{CROSS MARK}",
+        needs="partnershipform",
+    ),
+    SetupStep(
+        "partnershipaccept",
+        "What should an accepted applicant be sent?",
+        "DMed to them the moment staff react to accept, so write it as the answer they have been "
+        "waiting for. Write `{user}` anywhere you want to mention them.",
+        example="Great news, {user} — you're in! Someone will be in touch to set things up.",
+        needs="partnershipform",
+    ),
+    SetupStep(
+        "partnershipdecline",
+        "And what should a declined applicant be sent?",
+        "The one message here that somebody will not want to read, so it is worth writing kindly. "
+        "Same `{user}` placeholder.",
+        example="Thanks for applying, {user}. We won't be going ahead this time.",
         needs="partnershipform",
     ),
     SetupStep(
@@ -1721,24 +1980,35 @@ SETUP_STEPS = (
 
 
 class PartnershipModal(discord.ui.Modal):
-    """The five questions, asked as one form instead of five turns."""
+    """The configured questions, asked as one form instead of one turn each.
+
+    Built from the questions as they are at the moment the button is clicked,
+    and the full text of each is kept on the instance. Both matter: a label is
+    capped at 45 characters and a real question is often longer, and the
+    questions can be changed between a form being opened and submitted — so
+    what the application is posted under has to be what was actually asked, not
+    whatever the setting says by then.
+    """
 
     def __init__(self, cog: "AISupport"):
         super().__init__(title=PARTNERSHIP_MODAL_TITLE, timeout=None)
         self.cog = cog
+        self.questions: typing.List[str] = []
         self.answers: typing.List[discord.ui.TextInput] = []
-        for label, paragraph, max_length in PARTNERSHIP_QUESTIONS:
+        for question, label, placeholder, paragraph, max_length in cog.partnership_fields():
             field = discord.ui.TextInput(
                 label=label,
+                placeholder=placeholder or None,
                 style=discord.TextStyle.paragraph if paragraph else discord.TextStyle.short,
                 required=True,
                 max_length=max_length,
             )
             self.add_item(field)
+            self.questions.append(question)
             self.answers.append(field)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.submit_partnership(interaction, self.answers)
+        await self.cog.submit_partnership(interaction, self.answers, self.questions)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         logger.error("Partnership modal failed for %s.", interaction.user, exc_info=error)
@@ -2994,26 +3264,37 @@ class AISupport(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
-        """First staff member to react owns the lead.
+        """Staff reactions on a posted lead: claim it, accept it, or decline it.
 
         Raw rather than `on_reaction_add` so a post from before the last
-        restart still claims — the cached-message variant silently ignores
+        restart still works — the cached-message variant silently ignores
         anything not in memory, which is most of what this channel holds.
         """
-        if str(payload.emoji) != CLAIM_EMOJI:
-            return
         if payload.channel_id != self.setting("partnershipchannel"):
             return
         if payload.user_id == getattr(self.bot.user, "id", None):
+            return
+
+        emoji = str(payload.emoji)
+        yes, no = self._decision_emoji()
+        # Claiming is checked first, so an install that has set the claim emoji
+        # as its accept emoji claims rather than silently deciding.
+        if emoji == CLAIM_EMOJI:
+            decision = None
+        elif emoji == yes:
+            decision = True
+        elif emoji == no:
+            decision = False
+        else:
             return
 
         channel = self._guild_channel(payload.channel_id)
         if channel is None:
             return
 
-        # Serialised because the check and the edit are separated by awaits, and
-        # two people clicking at the same moment would otherwise both read the
-        # post as unclaimed and both be told they had it.
+        # Serialised because every check below is separated from its edit by an
+        # await, and two people reacting at the same moment would otherwise both
+        # read the post as undecided and both act on it.
         async with self._claim_lock:
             try:
                 message = await channel.fetch_message(payload.message_id)
@@ -3022,36 +3303,213 @@ class AISupport(commands.Cog):
 
             if message.author.id != getattr(self.bot.user, "id", None) or not message.embeds:
                 return
-
-            embed = message.embeds[0]
-            footer = (embed.footer.text or "") if embed.footer else ""
-            if footer != CLAIM_UNCLAIMED_FOOTER:
-                # Already claimed, or not a claimable post. Take the late
-                # reaction back off so the post keeps showing one owner.
-                if footer.startswith(CLAIM_CLAIMED_PREFIX):
-                    with contextlib.suppress(discord.HTTPException):
-                        member = payload.member or await self.bot.fetch_user(payload.user_id)
-                        await message.remove_reaction(payload.emoji, member)
+            if message.embeds[0].title != PARTNERSHIP_POST_TITLE:
+                # Some other embed of this bot's in the same channel — the
+                # weekly digest, a low-rating alert — which an install that
+                # points `staffchannel` here as well will have plenty of. None
+                # of them are leads and none of them may be decided.
                 return
 
-            claimer = payload.member or self.bot.get_user(payload.user_id)
-            if claimer is None:
+            actor = payload.member or self.bot.get_user(payload.user_id)
+            if actor is None:
                 with contextlib.suppress(discord.HTTPException):
-                    claimer = await self.bot.fetch_user(payload.user_id)
-            if claimer is None:
+                    actor = await self.bot.fetch_user(payload.user_id)
+            if actor is None:
                 return
 
-            name = getattr(claimer, "display_name", None) or str(claimer)
-            embed.set_footer(text=f"{CLAIM_CLAIMED_PREFIX}{name}")
-            embed.colour = self.bot.main_color
+            if decision is None:
+                await self._claim_lead(message, payload, actor)
+            else:
+                await self._decide_lead(message, payload, actor, accepted=decision)
 
-            try:
-                await message.edit(embed=embed)
-            except discord.HTTPException:
-                logger.error("Could not mark partnership lead %s claimed.", payload.message_id, exc_info=True)
-                return
+    async def _claim_lead(self, message, payload, claimer) -> None:
+        """Mark a lead as owned by the first person to react. Caller holds the lock."""
+        embed = message.embeds[0]
+        footer = (embed.footer.text or "") if embed.footer else ""
+        if not footer.startswith(CLAIM_UNCLAIMED_PREFIX):
+            # Already claimed, already decided, or not a claimable post. Take the
+            # late reaction back off so the post keeps showing one owner.
+            if footer.startswith(CLAIM_CLAIMED_PREFIX) or self._lead_decided(footer):
+                with contextlib.suppress(discord.HTTPException):
+                    await message.remove_reaction(payload.emoji, claimer)
+            return
+
+        name = getattr(claimer, "display_name", None) or str(claimer)
+        embed.set_footer(text=self._lead_footer(claimed_by=name))
+        embed.colour = self.bot.main_color
+
+        try:
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            logger.error("Could not mark partnership lead %s claimed.", payload.message_id, exc_info=True)
+            return
 
         logger.info("Partnership lead %s claimed by %s (%s).", payload.message_id, name, payload.user_id)
+
+    async def _decide_lead(self, message, payload, decider, *, accepted: bool) -> None:
+        """Accept or decline a lead and tell the applicant. Caller holds the lock.
+
+        The post is marked *before* the DM goes out, not after. That order is
+        what makes a second reaction a no-op rather than a second DM, which
+        matters more here than anywhere else in this plugin: telling somebody
+        twice that they have been declined is the worst version of this bug. A
+        DM that then fails is written back into the footer, so staff can see
+        that the decision stands but the person was not reached.
+        """
+        embed = message.embeds[0]
+        footer = (embed.footer.text or "") if embed.footer else ""
+        if self._lead_decided(footer):
+            with contextlib.suppress(discord.HTTPException):
+                await message.remove_reaction(payload.emoji, decider)
+            return
+
+        applicant_id = self._lead_applicant(embed)
+        if applicant_id is None:
+            logger.error(
+                "Partnership lead %s names no applicant, so it cannot be accepted or declined "
+                "from the post. Reply to them by hand.",
+                payload.message_id,
+            )
+            return
+
+        name = getattr(decider, "display_name", None) or str(decider)
+        prefix = DECISION_ACCEPTED_PREFIX if accepted else DECISION_DECLINED_PREFIX
+        embed.set_footer(text=self._lead_footer(decision=(prefix, name)))
+        embed.colour = self.bot.main_color if accepted else self.bot.error_color
+
+        try:
+            await message.edit(embed=embed)
+        except discord.HTTPException:
+            # Nothing has been sent yet, so stopping here leaves the lead exactly
+            # as it was rather than half-decided.
+            logger.error("Could not mark partnership lead %s decided.", payload.message_id, exc_info=True)
+            return
+
+        sent = await self._send_partnership_decision(applicant_id, accepted=accepted)
+        if not sent:
+            embed.set_footer(text=self._lead_footer(decision=(prefix, name)) + DECISION_UNDELIVERED_NOTE)
+            with contextlib.suppress(discord.HTTPException):
+                await message.edit(embed=embed)
+
+        logger.info(
+            "Partnership lead %s %s by %s (%s); applicant %s %s told.",
+            payload.message_id,
+            "accepted" if accepted else "declined",
+            name,
+            payload.user_id,
+            applicant_id,
+            "was" if sent else "could NOT be",
+        )
+
+    @staticmethod
+    def _lead_applicant(embed: discord.Embed) -> typing.Optional[int]:
+        """Who submitted a posted application, read back off the post itself.
+
+        Kept nowhere else for the same reason the claim state is not: the post
+        is what staff act on, so it is the one copy that cannot go stale or
+        disagree with what they are looking at.
+        """
+        found = _APPLICANT_RE.search(embed.description or "")
+        return int(found.group(1)) if found else None
+
+    async def _send_partnership_decision(self, user_id: int, *, accepted: bool) -> bool:
+        """DM the applicant the configured accept or decline message.
+
+        False when they could not be reached, which is the normal outcome for
+        somebody with DMs closed and is reported on the post rather than logged
+        and forgotten.
+        """
+        key = "partnershipaccept" if accepted else "partnershipdecline"
+        text = str(self.setting(key)).replace(PARTNERSHIP_USER_TOKEN, f"<@{user_id}>")
+
+        channel = await self._dm_channel(user_id)
+        if channel is None:
+            return False
+        try:
+            await self._send_with_typing(channel, self._plain_embed(text))
+        except discord.HTTPException:
+            logger.error("Could not DM %s the partnership decision.", user_id, exc_info=True)
+            return False
+        return True
+
+    def partnership_questions(self) -> typing.List[str]:
+        """The questions the form asks, custom ones or the standard set.
+
+        An unset `partnershipquestions` means the standard application rather
+        than no questions at all — a form with nothing on it is not a thing
+        anybody wants, and clearing the setting has to leave something usable.
+        """
+        configured = str(self.setting("partnershipquestions")).strip()
+        if not configured:
+            return [question for question, _, _ in PARTNERSHIP_QUESTIONS]
+        try:
+            return parse_partnership_questions(configured)
+        except ValueError:
+            # Stored values are validated on the way in, so this only happens if
+            # one was written by hand into the database. Falling back to the
+            # standard application beats a form that cannot be built at all.
+            logger.error(
+                "Stored partnership questions are unusable, so the standard application is "
+                "being asked instead. Fix them with %s.",
+                self._cmd("set partnershipquestions"),
+            )
+            return [question for question, _, _ in PARTNERSHIP_QUESTIONS]
+
+    def partnership_fields(
+        self,
+    ) -> typing.List[typing.Tuple[str, str, str, bool, int]]:
+        """One tuple per form field: (question, label, placeholder, paragraph, max).
+
+        Discord caps a field label at 45 characters, which is shorter than a
+        real question often is. Rather than refusing anything longer, the label
+        is shortened and the whole question goes in the placeholder, where there
+        is room for 100 — and the application is posted under the full text
+        either way, so nothing that was asked is lost.
+        """
+        standard = {question: (paragraph, length) for question, paragraph, length in PARTNERSHIP_QUESTIONS}
+        fields = []
+        for question in self.partnership_questions()[:PARTNERSHIP_MAX_QUESTIONS]:
+            paragraph, max_length = standard.get(question, (True, PARTNERSHIP_ANSWER_MAX))
+            label = truncate(question, PARTNERSHIP_LABEL_MAX)
+            placeholder = truncate(question, 100) if len(question) > PARTNERSHIP_LABEL_MAX else ""
+            fields.append((question, label, placeholder, paragraph, max_length))
+        return fields
+
+    def _decision_emoji(self) -> typing.Tuple[str, str]:
+        """The accept/decline pair, as the strings a reaction compares equal to.
+
+        Unlike the button emoji, an unusable custom emoji here is not fatal to
+        the message — seeding the reaction fails on its own and staff can still
+        add it by hand — so there is no falling back to a usable pair, which
+        would leave staff reacting with one emoji while this listener watched
+        for another. `.ai status` reports an emoji this bot cannot use instead,
+        because a decline emoji nobody can react with is a lead that never gets
+        closed.
+        """
+        return str(self.setting("partnershipyesemoji")), str(self.setting("partnershipnoemoji"))
+
+    def _lead_footer(
+        self,
+        *,
+        claimed_by: typing.Optional[str] = None,
+        decision: typing.Optional[typing.Tuple[str, str]] = None,
+    ) -> str:
+        """The footer for a posted application, which is where its state lives.
+
+        `decision` is (prefix, name) and wins over everything else: once a lead
+        is accepted or declined, who claimed it stopped being the thing staff
+        need to read off the post.
+        """
+        if decision is not None:
+            prefix, name = decision
+            return f"{prefix}{name}"
+        yes, no = self._decision_emoji()
+        head = f"{CLAIM_CLAIMED_PREFIX}{claimed_by}" if claimed_by else f"Unclaimed — {CLAIM_EMOJI} to claim"
+        return f"{head} · {yes} accept · {no} decline"
+
+    @staticmethod
+    def _lead_decided(footer: str) -> bool:
+        return footer.startswith(DECISION_ACCEPTED_PREFIX) or footer.startswith(DECISION_DECLINED_PREFIX)
 
     @staticmethod
     def _partnership_match(text: str) -> typing.Optional[str]:
@@ -3078,23 +3536,34 @@ class AISupport(commands.Cog):
         return sent is not None
 
     async def submit_partnership(
-        self, interaction: discord.Interaction, answers: typing.List[discord.ui.TextInput]
+        self,
+        interaction: discord.Interaction,
+        answers: typing.List[discord.ui.TextInput],
+        questions: typing.Sequence[str],
     ) -> None:
         """Post an application to the staff channel, then confirm to the user.
 
         The user is only told it arrived if it actually did. Saying "sent" for
         something that silently failed is worse than saying nothing.
+
+        `questions` comes from the modal rather than from the setting, so the
+        post is headed by what this person was actually asked even if the
+        questions were changed while they were filling the form in.
         """
         user = interaction.user
         await interaction.response.defer()
 
         embed = self._embed(
-            title="Partnership request",
+            title=PARTNERSHIP_POST_TITLE,
             description=f"From {user.mention} (`{user.id}`)",
             color=self.bot.main_color,
         )
-        for field, (label, _, _) in zip(answers, PARTNERSHIP_QUESTIONS):
-            embed.add_field(name=label, value=truncate(str(field.value).strip() or "—", 1000), inline=False)
+        for field, question in zip(answers, questions):
+            embed.add_field(
+                name=truncate(question, 256),
+                value=truncate(str(field.value).strip() or "—", 1000),
+                inline=False,
+            )
 
         partnership_channel_id = self.setting("partnershipchannel")
         channel = self._guild_channel(partnership_channel_id)
@@ -3110,17 +3579,29 @@ class AISupport(commands.Cog):
             )
         else:
             try:
-                embed.set_footer(text=CLAIM_UNCLAIMED_FOOTER)
+                embed.set_footer(text=self._lead_footer())
                 posted = await channel.send(embed=embed)
                 delivered = True
             except discord.HTTPException:
                 logger.error("Could not post the partnership application.", exc_info=True)
             else:
-                # Seeded by the bot so staff can claim with one click rather
-                # than finding the emoji. Failing here costs the convenience,
-                # not the claim: reacting manually works just as well.
-                with contextlib.suppress(discord.HTTPException):
-                    await posted.add_reaction(CLAIM_EMOJI)
+                # Seeded by the bot so staff can claim or decide with one click
+                # rather than finding the emoji. Suppressed one at a time, so a
+                # custom emoji this bot cannot use costs only its own reaction —
+                # and failing here costs the convenience, not the outcome:
+                # reacting manually works just as well.
+                yes, no = self._decision_emoji()
+                for emoji in (CLAIM_EMOJI, yes, no):
+                    try:
+                        await posted.add_reaction(emoji)
+                    except discord.HTTPException:
+                        logger.error(
+                            "Could not put %s on partnership lead %s, so staff have to add it "
+                            "themselves. If it is a custom emoji, this bot is not in the server "
+                            "that owns it.",
+                            emoji,
+                            posted.id,
+                        )
 
         dm = interaction.channel
         if dm is None:
@@ -4036,15 +4517,58 @@ class AISupport(commands.Cog):
         return embed
 
     def _unknown_category_embed(self, typed: str) -> discord.Embed:
-        """Someone typed something that is neither a command nor a category."""
-        options = "\n".join(
-            f"`{self._cmd(key)}` — {blurb}" for key, _, blurb, _ in self._visible_categories()
-        )
-        return self._embed(
-            title=f"No category called {truncate(typed, 40)!r}",
-            description=f"Pick one of these instead:\n\n{options}",
+        """Someone typed something that is neither a command nor a category.
+
+        This is where every mistyped subcommand lands, because the group runs
+        `invoke_without_command` and anything unrecognised arrives here as text.
+        Answering it with the category list alone told somebody who typed one
+        character wrong that their command did not exist, so the near misses are
+        named first and the categories are the fallback.
+        """
+        first = typed.strip().split(None, 1)[0].lstrip("-").lower() if typed.strip() else ""
+        embed = self._embed(
+            title=f"Nothing here called {truncate(typed, 40)!r}",
             color=self.bot.error_color,
         )
+
+        near = self._closest_commands(first)
+        if near:
+            embed.description = "Did you mean:\n\n" + "\n".join(f"`{self._cmd(name)}`" for name in near)
+        else:
+            embed.description = "That is neither a command nor a category."
+
+        embed.add_field(
+            name="Or pick a category",
+            value="\n".join(
+                f"`{self._cmd(key)}` — {blurb}" for key, _, blurb, _ in self._visible_categories()
+            ),
+            inline=False,
+        )
+        return embed
+
+    def _closest_commands(self, typed: str, limit: int = 3) -> typing.List[str]:
+        """Command and category names close enough to what was typed to suggest.
+
+        Prefix matches come first and are always offered: somebody who typed
+        `.ai know` wants `knowledge`, and no edit-distance cutoff should have to
+        agree. Fuzzy matches fill the rest.
+        """
+        if not typed:
+            return []
+
+        group = self.bot.get_command(GROUP_NAME)
+        names = set(CATEGORY_KEYS) | set(CATEGORY_ALIASES)
+        if group is not None and hasattr(group, "commands"):
+            for command in group.commands:
+                if self._command_listed(command.name) or command.name in UNLISTED_COMMANDS:
+                    names.add(command.name)
+                    names.update(command.aliases)
+
+        found = [name for name in sorted(names) if name.startswith(typed) and name != typed]
+        for name in difflib.get_close_matches(typed, sorted(names), n=limit, cutoff=0.6):
+            if name not in found:
+                found.append(name)
+        return found[:limit]
 
     def _command_listed(self, name: str) -> bool:
         """Whether a command appears in the menu and in Modmail's help.
@@ -4246,6 +4770,25 @@ class AISupport(commands.Cog):
                     "Partnership applications have nowhere to go — that channel is not visible "
                     f"to the bot. Set it with `{self._cmd('set partnershipchannel')} #channel`."
                 )
+            unusable = [
+                key
+                for key in ("partnershipyesemoji", "partnershipnoemoji")
+                if _CUSTOM_EMOJI_RE.match(str(self.setting(key)).strip())
+                and self._resolve_emoji(str(self.setting(key))) is None
+            ]
+            if unusable:
+                problems.append(
+                    "The accept/decline emoji on partnership leads "
+                    f"({', '.join(f'`{k}`' for k in unusable)}) is a custom one from a server this "
+                    "bot is not in, so it cannot put it on the post and staff cannot decide with "
+                    f"one click. Set a plain emoji with `{self._cmd('set ' + unusable[0])}`."
+                )
+            yes, no = self._decision_emoji()
+            if yes == no:
+                problems.append(
+                    "Accept and decline on partnership leads are the same emoji, so every "
+                    f"reaction accepts. Change one with `{self._cmd('set partnershipnoemoji')}`."
+                )
 
         if self.bot.config["confirm_thread_creation"]:
             problems.append(
@@ -4386,6 +4929,23 @@ class AISupport(commands.Cog):
             ),
             inline=False,
         )
+
+        if self.setting("partnershipform"):
+            yes, no = self._decision_emoji()
+            asked = self.partnership_questions()
+            standard = not str(self.setting("partnershipquestions")).strip()
+            embed.add_field(
+                name="Partnership application",
+                value=(
+                    f"Asking {len(asked)} question(s)"
+                    + (" — the standard application" if standard else " — custom")
+                    + f", set with `{self._cmd('set partnershipquestions')}`.\n"
+                    f"Staff react {yes} to accept, {no} to decline; {CLAIM_EMOJI} claims without "
+                    "deciding.\nThe applicant is then DMed `partnershipaccept` or "
+                    "`partnershipdecline`."
+                ),
+                inline=False,
+            )
 
         on, off = "\N{WHITE HEAVY CHECK MARK}", "\N{CROSS MARK}"
         embed.add_field(
@@ -4681,7 +5241,8 @@ class AISupport(commands.Cog):
                         f"> {truncate(question, 200)}\n\n"
                         f"Matches partnership term `{partnership}`, so the form is offered and "
                         "Groq is never called. Submissions go to the channel shown in "
-                        f"`{self._cmd()} status`."
+                        f"`{self._cmd()} status`.\n\n**The form asks:**\n"
+                        + render_partnership_questions(self.partnership_questions())
                     ),
                 )
             )
@@ -4964,7 +5525,9 @@ class AISupport(commands.Cog):
         `.ai set staffchannel default` puts it back to the built-in default.
         """
         if key is None:
-            return await ctx.send(embed=self._settings_overview())
+            for page in self._settings_overview():
+                await ctx.send(embed=page)
+            return
 
         key = key.lower().lstrip("-")
         setting = SETTINGS.get(key)
@@ -5125,27 +5688,49 @@ class AISupport(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    def _settings_overview(self) -> discord.Embed:
-        """Every value setting, its current value, and what it is for."""
-        embed = self._embed(
-            title="Settings",
-            description=(
-                f"Change one with `{self._cmd()} set <name> <value>`, or put it "
-                f"back with `{self._cmd()} set <name> default`.\n"
-                f"On/off features are in `{self._cmd()} features`."
-            ),
-            footer="Stored in the database — these survive reloads and restarts",
-        )
+    def _settings_overview(self) -> typing.List[discord.Embed]:
+        """Every value setting, its current value, and what it is for.
+
+        Returned as a list because there are more settings than one embed can
+        carry: Discord caps an embed at 25 fields and 6,000 characters, and
+        going over is not a truncated message but a rejected one — the whole
+        command answers with nothing. Paged rather than trimmed, because a
+        settings list that quietly stops before the end is how you end up
+        believing a setting does not exist.
+        """
+        pages: typing.List[discord.Embed] = []
+
+        def new_page() -> discord.Embed:
+            first = not pages
+            page = self._embed(
+                title="Settings" if first else "Settings (continued)",
+                description=(
+                    (
+                        f"Change one with `{self._cmd()} set <name> <value>`, or put it "
+                        f"back with `{self._cmd()} set <name> default`.\n"
+                        f"On/off features are in `{self._cmd()} features`."
+                    )
+                    if first
+                    else None
+                ),
+                footer="Stored in the database — these survive reloads and restarts",
+            )
+            pages.append(page)
+            return page
+
+        page = new_page()
         for setting in VALUE_SETTINGS:
             # Developer settings follow the same rule as developer commands.
             if setting.dev and not self.setting("devmode"):
                 continue
-            embed.add_field(
-                name=f"{setting.key} — {setting.render(self.setting(setting.key))}",
-                value=f"{setting.summary} *({self._setting_source(setting.key)})*",
-                inline=False,
-            )
-        return embed
+            name = f"{setting.key} — {setting.render(self.setting(setting.key))}"
+            value = f"{setting.summary} *({self._setting_source(setting.key)})*"
+            # Left of the real caps on both counts, so a longer summary or a
+            # longer stored value cannot take a page over the line.
+            if len(page.fields) >= EMBED_FIELD_LIMIT or len(page) + len(name) + len(value) > EMBED_SIZE_LIMIT:
+                page = new_page()
+            page.add_field(name=truncate(name, 256), value=truncate(value, 1024), inline=False)
+        return pages
 
     def _unknown_setting_embed(self, key: str, pool, command: str) -> discord.Embed:
         visible = [s for s in pool if not s.dev or self.setting("devmode")]
@@ -5353,6 +5938,28 @@ class AISupport(commands.Cog):
             )
             if step.kind == "yesno":
                 embed.add_field(name="Answer", value="**yes** or **no**", inline=False)
+            elif step.kind == "questions":
+                embed.add_field(
+                    name="Write them like this",
+                    value=(
+                        "```\n1. What is your group called?\n2. What is your invite link?\n"
+                        "3. Why do you want to partner with us?\n```"
+                    ),
+                    inline=False,
+                )
+                standard_list = render_partnership_questions([q for q, _, _ in PARTNERSHIP_QUESTIONS])
+                embed.add_field(
+                    name="The standard application",
+                    value=f"```\n{standard_list}\n```",
+                    inline=False,
+                )
+                current_questions = str(self.setting(step.key)).strip()
+                if current_questions:
+                    embed.add_field(
+                        name="Currently asking",
+                        value=f"```\n{truncate(current_questions, 900)}\n```",
+                        inline=False,
+                    )
             elif step.kind == "knowledge":
                 embed.add_field(
                     name="Send as much as you need",
@@ -5400,7 +6007,7 @@ class AISupport(commands.Cog):
                 return None
             if lowered in SETUP_SKIP_WORDS or not answer:
                 return ""
-            if lowered in SETUP_CLEAR_WORDS:
+            if lowered in SETUP_CLEAR_WORDS | SETUP_EXTRA_CLEAR_WORDS.get(step.key, set()):
                 if self._setting_source(step.key) == "set":
                     await self.clear_setting(step.key)
                     if step.key in ("commandname", "legacyaliases"):
@@ -5615,13 +6222,11 @@ class AISupport(commands.Cog):
         `.ai knowledge pricing add <line>` does the same to prices.
         `.ai knowledge clear` empties a section.
         """
-        sections = ("knowledge", "pricing", "neveranswer")
-
         if action is None:
             return await ctx.send(embed=self._knowledge_embed(), files=self._knowledge_files())
 
         chosen = action.lower()
-        if chosen in sections:
+        if chosen in KNOWLEDGE_SECTIONS:
             # `.ai knowledge pricing add <line>` — shift the section off the front.
             parts = (text or "").split(None, 1)
             action = parts[0].lower() if parts else "show"
@@ -5629,6 +6234,40 @@ class AISupport(commands.Cog):
         else:
             chosen, action = "knowledge", chosen
 
+        await self._run_knowledge(ctx, chosen, action, text)
+
+    # The two sections nobody thinks to reach through `knowledge`. `.ai
+    # neveranswer add <topic>` is what everybody types, gets nothing but "no
+    # category called that", and reasonably concludes the command does not
+    # exist — so it is a real command, doing exactly what the longer spelling
+    # does. Unlisted rather than hidden: `.ai knowledge` is still the one way in
+    # that the menu teaches, and three entries for one thing is worse than one.
+    @ai.command(name="pricing")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_pricing(self, ctx, action: str = None, *, text: str = None):
+        """Read or extend the prices the assistant may quote.
+
+        The same thing as `.ai knowledge pricing …`, spelled the short way.
+        """
+        await self._run_knowledge(ctx, "pricing", (action or "show").lower(), text)
+
+    @ai.command(name="neveranswer", aliases=["never", "escalate"])
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def ai_neveranswer(self, ctx, action: str = None, *, text: str = None):
+        """Read or extend the topics that always go to a human.
+
+        The same thing as `.ai knowledge neveranswer …`, spelled the short way.
+        """
+        await self._run_knowledge(ctx, "neveranswer", (action or "show").lower(), text)
+
+    async def _run_knowledge(
+        self, ctx, chosen: str, action: str, text: typing.Optional[str]
+    ) -> None:
+        """`show`, `add` or `clear` against one section.
+
+        Shared by `.ai knowledge`, `.ai pricing` and `.ai neveranswer` so the
+        three spellings cannot drift into behaving differently.
+        """
         if action == "show":
             return await ctx.send(embed=self._knowledge_embed(chosen), files=self._knowledge_files(chosen))
 
@@ -5656,9 +6295,12 @@ class AISupport(commands.Cog):
                     description=(
                         f"`{self._cmd('knowledge')}` — show everything\n"
                         f"`{self._cmd('knowledge add')} <fact>` — append one line\n"
-                        f"`{self._cmd('knowledge pricing add')} <fact>` — append to prices\n"
-                        f"`{self._cmd('knowledge neveranswer add')} <topic>` — always escalate it\n"
+                        f"`{self._cmd('pricing add')} <fact>` — append to prices\n"
+                        f"`{self._cmd('neveranswer add')} <topic>` — always escalate it\n"
                         f"`{self._cmd('knowledge')} <section> clear` — empty a section\n\n"
+                        "The last two are also `"
+                        f"{self._cmd('knowledge pricing add')}` and `"
+                        f"{self._cmd('knowledge neveranswer add')}`; they do the same thing.\n\n"
                         f"To replace a whole section, use `{self._cmd('setup')}`.\n\n"
                         f"*{self._knowledge_budget_line()}.*"
                     ),
@@ -5839,7 +6481,7 @@ class AISupport(commands.Cog):
         missing = advertised - real
         if missing:
             logger.error("%s lists commands that do not exist: %s", GROUP_NAME, ", ".join(sorted(missing)))
-        unlisted = real - advertised
+        unlisted = real - advertised - UNLISTED_COMMANDS
         if unlisted:
             logger.warning(
                 "%s has commands missing from its menu: %s", GROUP_NAME, ", ".join(sorted(unlisted))

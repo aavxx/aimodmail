@@ -65,6 +65,8 @@ it:
 | General | `.ai ask <question>` | Supporter | Ask it something yourself, to see how it answers |
 | Settings | `.ai set` | Administrator | Names, channels, timings, anything with a value |
 | Settings | `.ai features` | Administrator | Turn optional parts on and off |
+| Settings | `.ai knowledge` | Administrator | Read or extend what it may answer from |
+| Settings | `.ai pricing` / `.ai neveranswer` | Administrator | Shorthand for the two other knowledge sections |
 | Reports | `.ai stats` | Supporter | How often it answers, and what it gets stuck on |
 | Reports | `.ai digest` | Supporter | Send the weekly summary to staff now |
 | User data | `.ai forget @user` | Supporter | Delete everything stored about one person |
@@ -84,9 +86,10 @@ already set up.
 .ai setup
 ```
 
-It asks **14 questions, one at a time, in the channel**. You answer by sending
-an ordinary message. At any question you can type **skip** to leave a setting
-alone, **clear** to put it back to its default, or **cancel** to stop.
+It asks its questions **one at a time, in the channel** — 14, or 19 if you turn
+the partnership form on. You answer by sending an ordinary message. At any
+question you can type **skip** to leave a setting alone, **clear** to put it back
+to its default, or **cancel** to stop.
 
 Every answer is saved as it is given, so cancelling or timing out keeps what you
 already answered — running it again picks up from the top with your answers
@@ -98,8 +101,16 @@ end up believing you configured something you did not.
 What it covers, in order: command name, organisation name, assistant name,
 ticket prefix, privacy policy link, retention days, **what the assistant knows**,
 prices, what to always escalate, staff channel, whether to offer the partnership
-form (and its channel, only if yes), whether to ask users about keeping chats
-for training, and an icon.
+form, whether to ask users about keeping chats for training, and an icon.
+
+Answering **yes** to the partnership form adds five more questions right after
+it, and answering no removes them again — the wizard rebuilds its own list after
+every answer, so the questions you are asked always match the settings that are
+actually in use. The five are: which channel applications go to, **which
+questions the form should ask**, the emoji staff react with to accept and to
+decline, and the messages the applicant is DMed in each case. All five are
+skippable and all five have working defaults, so turning the form on and
+skipping the rest gives you the standard application with ✅ and ❌.
 
 The one thing it cannot do is the API key. `GROQ_API_KEY` belongs in `.env`
 because it is a credential, not a setting.
@@ -125,10 +136,22 @@ Three sections, all set in `.ai setup` and editable afterwards:
 ```
 .ai knowledge                              show all three
 .ai knowledge add <fact>                   append one line
-.ai knowledge pricing add <fact>           append to prices
-.ai knowledge neveranswer add <topic>      always escalate it
-.ai knowledge pricing clear                empty a section
+.ai pricing add <fact>                     append to prices
+.ai neveranswer add <topic>                always escalate it
+.ai pricing clear                          empty a section
 ```
+
+`pricing` and `neveranswer` are also reachable the long way, as
+`.ai knowledge pricing add …` and `.ai knowledge neveranswer add …`. Both
+spellings run the same code, so they cannot drift into behaving differently.
+They are not in the command menu — `.ai knowledge` is the one way in that it
+teaches, and three entries for one job is worse than one — but they are real
+commands rather than aliases of the menu entry, because `.ai neveranswer add …`
+is what people type and answering it with "no category called that" reads as the
+command not existing.
+
+A mistyped subcommand now answers with the closest real ones rather than only
+the category list, so `.ai neveranswe add …` points at `.ai neveranswer`.
 
 ### How much it can hold
 
@@ -442,6 +465,11 @@ send — `.ai status` tells you when that has happened.
 |---|---|---|
 | `staffchannel` | the partnership channel | Where the weekly digest and low-rating alerts are posted |
 | `partnershipchannel` | the built-in id | Where partnership applications are posted for staff to claim |
+| `partnershipquestions` | the standard application | The questions the partnership form asks, as a numbered list |
+| `partnershipyesemoji` | ✅ | What staff react with to accept an application |
+| `partnershipnoemoji` | ❌ | What staff react with to decline one |
+| `partnershipaccept` | built-in copy | DMed to the applicant when staff accept |
+| `partnershipdecline` | built-in copy | DMed to the applicant when staff decline |
 | `retentiondays` | 7 | Days a conversation is kept before automatic deletion |
 | `typingdelay` | 1.5s | How long the typing indicator runs before each composed message |
 | `lowratingthreshold` | 2 | A survey score at or below this raises an alert |
@@ -456,6 +484,29 @@ send — `.ai status` tells you when that has happened.
 .ai set retentiondays 14
 .ai set staffchannel default
 ```
+
+`.ai set` with no arguments answers in more than one message. There are more
+settings than one Discord embed can carry — the cap is 25 fields — and going
+over is not a shortened message but a rejected one, so the list is paged rather
+than trimmed.
+
+`partnershipquestions` takes a numbered list, one per line, and is the same
+thing `.ai setup` asks for:
+
+```
+.ai set partnershipquestions 1. What is your group called?
+2. What is your invite link?
+3. Why do you want to partner with us?
+```
+
+Up to five, because a Discord form shows no more than five fields. `.ai set
+partnershipquestions default` puts the standard application back. A question
+longer than Discord's 45-character field label is not refused — the label is
+shortened and the whole question is shown as the field's placeholder, and the
+application posted to staff is headed by the full text either way.
+
+`partnershipaccept` and `partnershipdecline` may contain `{user}`, which is
+replaced with a mention of the applicant.
 
 A channel can be a mention, a raw id, or a plain name in the server you run the
 command in. Numbers are range-checked and a bad value is refused with a message
@@ -635,21 +686,71 @@ to a form rather than a conversation, **before** the escalation check. The stems
 are open-ended (`\bpartner\w*`), so "partnered" and "collaborating" match as well
 as "partnership"; the one exception is the bare noun after a possessive — "my
 partner is on the flight" is a passenger, not a proposal, and is left to the
-assistant. `.ai ask "…"` reports the partnership route, so any wording can be
-checked without DMing the bot. The five
-questions are what a human would ask anyway, so collecting them up front beats a
-ticket that opens by asking them one at a time — even when the request is phrased
-as wanting to speak to someone.
+assistant. `.ai ask "…"` reports the partnership route — including the questions
+the form currently asks — so any wording can be checked without DMing the bot.
+Collecting the answers up front beats a ticket that opens by asking them one at a
+time, even when the request is phrased as wanting to speak to someone.
 
 The reply offers a button, the button opens a Discord modal, and the submission
-is posted to the configured staff channel. `PARTNERSHIP_GUILD_ID` and
-`PARTNERSHIP_CHANNEL_ID` are where it lands; if the bot cannot see that channel
-the user is told the submission failed and offered a human, rather than being
-thanked for something that never arrived. `.ai status` resolves that channel and
-names it, so a form that would fail on submission is visible before anyone uses
-it.
+is posted to the configured staff channel. `partnershipchannel` is where it
+lands; if the bot cannot see that channel the user is told the submission failed
+and offered a human, rather than being thanked for something that never arrived.
+`.ai status` resolves that channel and names it, so a form that would fail on
+submission is visible before anyone uses it.
 
 The button view is persistent, so a form offered overnight still opens.
+
+#### The questions
+
+`.ai setup` asks which questions the form should carry, as a numbered list:
+
+```
+1. What is your group called?
+2. What is your invite link?
+3. Why do you want to partner with us?
+```
+
+Answering **standard** — or skipping the question — keeps the built-in
+application, which is the five a human would have asked anyway. Numbering,
+bullets or neither are all accepted, and the numbering is stripped on the way in
+because the form renumbers them itself. A list typed on one line is read as a
+list only when it starts at `1.` and counts up without gaps; anything else is
+one question, so "how many members do you have? Over 2. Say so" is not torn in
+half.
+
+Five is a hard ceiling rather than a preference: a Discord modal holds five
+components and a sixth question could not be shown at all, so a longer list is
+refused at the point of entry rather than silently cut.
+
+The questions are read at the moment somebody clicks the button, and the full
+text of each is carried on the form itself — so changing them while an applicant
+has the form open posts their answers under the questions they were actually
+asked, not under the new ones.
+
+#### Accepting and declining
+
+A posted application carries three reactions: ✋ to claim it without deciding,
+and the configured accept and decline emoji (`partnershipyesemoji` /
+`partnershipnoemoji`, ✅ and ❌ out of the box). Reacting with either DMs the
+applicant `partnershipaccept` or `partnershipdecline` — both set in `.ai setup`,
+both able to contain `{user}` for a mention of them — and stamps the decision
+into the post's footer.
+
+The post is marked **before** the DM goes out. That order is what makes a second
+reaction a no-op rather than a second DM, which matters more here than anywhere
+else in this plugin: telling somebody twice that they have been declined is the
+worst version of this bug. If the DM then fails — DMs closed, or they have left
+— the footer says *could not DM them*, because a post that reads as though the
+person was notified when they were not is worse than no post at all.
+
+A decision is final: later reactions are removed rather than acted on. Who
+claimed it is replaced in the footer by who decided, since that is what staff
+need to read off a closed lead.
+
+Both emoji are settings, so a server with its own accept and decline marks can
+use them. A custom one only works if the bot is in the server that owns it;
+`.ai status` says so if it is not, because a decline emoji nobody can react with
+is a lead that never gets closed.
 
 ### The follow-up question
 
@@ -909,21 +1010,36 @@ The urgency check never changes what the user is told, so a false positive costs
 nothing beyond a misleading tag. That is why it can afford to be broad where the
 profanity list cannot.
 
-### Claiming a partnership lead
+### Claiming and deciding a partnership lead
 
-Each submission is posted with a 🤚 reaction already on it and an *Unclaimed*
-footer. The first staff member to react owns it: the footer becomes *Claimed by
-…* and any later reaction is removed, so the post always shows one owner.
+Each submission is posted with three reactions already on it — ✋ to claim, and
+the accept and decline emoji — and an *Unclaimed* footer naming all three. The
+first staff member to react with ✋ owns it: the footer becomes *Claimed by …*
+and any later claim reaction is removed, so the post always shows one owner.
+Reacting with the accept or decline emoji closes the lead and DMs the applicant;
+see **Accepting and declining** above.
 
-The claim state lives in the post's own footer rather than in the database. It is
-what staff read, it survives restarts for free, and there is no second copy that
-can disagree with the channel. The listener is `on_raw_reaction_add`, not
-`on_reaction_add`, because the cached-message variant silently ignores anything
-not in memory — which is most of that channel after a restart.
+Both the claim and the decision live in the post's own footer rather than in the
+database. It is what staff read, it survives restarts for free, and there is no
+second copy that can disagree with the channel. The applicant is read back off
+the post too, from the mention in its description, for the same reason.
 
-Two people reacting at the same moment are serialised behind a lock, since the
-check and the edit are separated by awaits and both would otherwise be told they
-had it. Removing the losing reaction needs *Manage Messages*; without it the
+The footer is matched by prefix — *Unclaimed*, *Claimed by*, *Accepted by*,
+*Declined by* — rather than by its exact text, because the rest of it names the
+current accept and decline emoji and those are settings that can change between
+a post going up and somebody reacting to it. A lead posted by an older version
+of this plugin still claims and still decides.
+
+The listener is `on_raw_reaction_add`, not `on_reaction_add`, because the
+cached-message variant silently ignores anything not in memory — which is most
+of that channel after a restart. It acts only on an embed titled *Partnership
+request*, so an install that points `staffchannel` at the same channel cannot
+have a reaction on the weekly digest read as a decision on somebody's
+application.
+
+Two people reacting at the same moment are serialised behind a lock, since every
+check is separated from its edit by an await and both would otherwise be told
+they had it. Removing the losing reaction needs *Manage Messages*; without it the
 claim still works and the extra reaction just stays.
 
 ### `.ai ask`
